@@ -246,3 +246,58 @@ def test_reconcile_does_not_mutate_when_container_listing_fails(tmp_path):
     assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == "pending"
     assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 1
     connection.close()
+
+
+def test_pending_mismatched_container_label_is_not_removed(tmp_path):
+    connection = _connection(tmp_path)
+    old = NOW - timedelta(minutes=10)
+    allocation_id = _allocation(connection, created_at=old, expires_at=old + timedelta(hours=12))
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="container-1",
+            name="not-ours",
+            image="old:latest",
+            status="running",
+            labels={"udc.allocation": allocation_id},
+        )
+    )
+    summary = reconcile(connection, fake, now=NOW)
+    assert summary["unsafe_skipped"] == 1
+    assert summary["pending_failed"] == 0
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == "pending"
+    assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 1
+    assert "container-1" in fake.containers
+    assert fake.removed == []
+    connection.close()
+
+
+def test_active_expired_identity_mismatch_is_not_removed(tmp_path):
+    connection = _connection(tmp_path)
+    old = NOW - timedelta(hours=2)
+    allocation_id = _allocation(connection, created_at=old, expires_at=NOW - timedelta(minutes=1))
+    store.activate_allocation(
+        connection,
+        allocation_id,
+        container_id="container-1",
+        container_name="udc-alice-test",
+        now=old,
+    )
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="container-1",
+            name="not-ours",
+            image="old:latest",
+            status="running",
+            labels={"udc.allocation": allocation_id},
+        )
+    )
+    summary = reconcile(connection, fake, now=NOW)
+    assert summary["unsafe_skipped"] == 1
+    assert summary["expired"] == 0
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == "active"
+    assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 1
+    assert "container-1" in fake.containers
+    assert fake.removed == []
+    connection.close()

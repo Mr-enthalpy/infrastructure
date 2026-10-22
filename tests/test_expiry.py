@@ -109,3 +109,24 @@ def test_expire_once_retries_when_container_removal_fails(tmp_path):
     assert allocation["status"] == "active"
     assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 1
     connection.close()
+
+
+def test_expire_once_skips_mismatched_container_identity(tmp_path):
+    connection = _connection(tmp_path)
+    allocation_id = _active_allocation(connection, expires_at=NOW - timedelta(minutes=1))
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="container-1",
+            name="not-ours",
+            image="old:latest",
+            status="running",
+            labels={"udc.allocation": allocation_id},
+        )
+    )
+    assert expire_once(connection, fake, now=NOW) == []
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == "active"
+    assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 1
+    assert fake.removed == []
+    assert "container-1" in fake.containers
+    connection.close()

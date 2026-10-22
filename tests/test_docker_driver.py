@@ -244,3 +244,28 @@ def test_logs_reads_container_output(active_config):
     container.logs = lambda **kwargs: b"line one\nline two\n"
     client.containers.items[container.id] = container
     assert driver.logs(container.id, 20) == "line one\nline two\n"
+
+
+def test_container_info_extracts_gpu_refs(active_config):
+    driver = DockerDriver(active_config)
+    container = FakeContainer()
+    container.attrs["HostConfig"] = {
+        "DeviceRequests": [
+            {"DeviceIDs": ["GPU-3"], "Count": 0, "Capabilities": [["gpu"]]},
+        ],
+        "Devices": [{"PathOnHost": "/dev/nvidia7", "PathInContainer": "/dev/nvidia7"}],
+    }
+    container.attrs["Config"]["Env"] = ["NVIDIA_VISIBLE_DEVICES=5"]
+    info = driver._container_info(container)
+    assert set(info.gpu_refs) == {"GPU-3", "7", "5"}
+
+
+def test_container_info_treats_count_minus_one_as_all(active_config):
+    driver = DockerDriver(active_config)
+    container = FakeContainer()
+    container.attrs["HostConfig"] = {
+        "DeviceRequests": [{"DeviceIDs": [], "Count": -1, "Capabilities": [["gpu"]]}],
+    }
+    container.attrs["Config"]["Env"] = []
+    info = driver._container_info(container)
+    assert info.gpu_refs == ("all",)

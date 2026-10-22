@@ -80,13 +80,15 @@ def list_gpus(
                 0,
                 int((datetime.fromisoformat(str(expires_at)) - current).total_seconds()),
             )
+        db_state = "allocated" if row["allocation_id"] else "free"
         result.append(
             {
                 "index": int(row["idx"]),
                 "uuid": str(row["uuid"]),
                 "name": str(row["name"]),
                 "memory_mib": int(row["memory_mib"]),
-                "state": "allocated" if row["allocation_id"] else "idle",
+                "state": "unknown",
+                "db_state": db_state,
                 "allocation_id": row["allocation_id"],
                 "owner": row["owner_name"],
                 "status": row["status"],

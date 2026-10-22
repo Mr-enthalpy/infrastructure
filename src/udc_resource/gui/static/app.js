@@ -142,13 +142,17 @@
     if (!state.overview) return;
     const data = state.overview;
     const gpus = data.gpus || [];
-    const idle = gpus.filter((gpu) => !gpu.allocation_id).length;
-    const allocated = gpus.length - idle;
+    const free = gpus.filter((gpu) => gpu.state === "free").length;
+    const allocated = gpus.filter((gpu) => gpu.state === "allocated").length;
+    const unmanaged = gpus.filter((gpu) => gpu.state === "unmanaged").length;
+    const unknown = gpus.filter((gpu) => gpu.state === "unknown").length;
     const processes = data.unmanaged?.processes?.length || 0;
     $("#summary").innerHTML = `
       <div class="stat"><strong>${gpus.length}</strong><span>GPUs</span></div>
-      <div class="stat"><strong>${idle}</strong><span>idle</span></div>
+      <div class="stat"><strong>${free}</strong><span>free</span></div>
       <div class="stat"><strong>${allocated}</strong><span>allocated</span></div>
+      <div class="stat"><strong>${unmanaged}</strong><span>unmanaged</span></div>
+      <div class="stat"><strong>${unknown}</strong><span>unknown</span></div>
       <div class="stat"><strong>${processes}</strong><span>unmanaged processes</span></div>
     `;
     renderGpuGrid(gpus);
@@ -164,25 +168,30 @@
       return;
     }
     grid.innerHTML = gpus.map((gpu) => {
-      const allocations = gpu.allocation_id;
-      const css = allocations ? "allocated" : "idle";
+      const gpuState = String(gpu.state || "unknown");
+      const isFree = gpuState === "free";
       const stale = state.offline ? "stale" : "";
-      const clickable = allocations ? "" : "clickable";
+      const clickable = isFree ? "clickable" : "";
       const deadline = gpu.remaining_seconds !== null && gpu.remaining_seconds !== undefined
         ? Date.now() + Number(gpu.remaining_seconds) * 1000
         : null;
+      let detail = '<span>available for apply</span>';
+      if (gpuState === "allocated") {
+        detail = `<span>owner <b>${esc(gpu.owner || "?")}</b></span>
+                  <span>alloc <b>${esc((gpu.allocation_id || "").slice(0, 12))}</b></span>`;
+      } else if (!isFree) {
+        detail = `<span>${esc(gpu.state_reason || gpuState)}</span>`;
+      }
       return `
-        <article class="gpu-card ${css} ${stale} ${clickable}" data-gpu-index="${gpu.index}">
+        <article class="gpu-card ${gpuState} ${stale} ${clickable}" data-gpu-index="${gpu.index}">
           <div class="gpu-head">
             <span class="gpu-index">GPU ${gpu.index}</span>
-            <span class="gpu-state ${css}">${css}</span>
+            <span class="gpu-state ${gpuState}">${esc(gpuState)}</span>
           </div>
           <div class="gpu-meta">
             <span>${esc(gpu.name || "")} · ${esc(gpu.memory_mib || "")} MiB</span>
-            ${allocations
-              ? `<span>owner <b>${esc(gpu.owner || "?")}</b></span>
-                 <span>alloc <b>${esc((gpu.allocation_id || "").slice(0, 12))}</b></span>`
-              : '<span>available for apply</span>'}
+            ${detail}
+            ${gpu.compute_pids?.length ? `<span>compute PIDs: <b>${esc(gpu.compute_pids.join(","))}</b></span>` : ""}
           </div>
           ${deadline !== null
             ? `<div class="gpu-remaining" data-deadline="${deadline}">${formatRemaining(gpu.remaining_seconds)}</div>`
@@ -205,7 +214,7 @@
 
   function renderApplyChoices(gpus) {
     const container = $("#gpu-choices");
-    const idle = gpus.filter((gpu) => !gpu.allocation_id);
+    const idle = gpus.filter((gpu) => gpu.state === "free");
     if (!idle.length) {
       container.innerHTML = '<span class="muted">没有空闲 GPU；留空将申请 CPU-only。</span>';
       return;
@@ -320,7 +329,7 @@
           <div><div class="id">${esc(container.name)}</div><div class="muted">${esc(container.id)}</div></div>
           <div class="muted">${esc(container.image)}</div>
           <div class="muted">${esc(container.status)}</div>
-          <div class="muted">${container.owner ? `owner ${esc(container.owner)}` : "unmanaged"}</div>
+          <div class="muted">${container.gpus?.length ? `GPU ${esc(container.gpus.join(","))}` : "no GPU"} · ${container.owner ? `owner ${esc(container.owner)}` : "unmanaged"}</div>
         </div>
       `).join("");
     }

@@ -36,8 +36,8 @@ re-query `nvidia-smi` before launching.
 
 ## Deployment gate
 
-- Run `bash deploy/preflight.sh` first; it is read-only and must pass before
-  installing anything.
+- Run `bash deploy/preflight.sh` and `bash deploy/audit_legacy.sh` first; both are
+  read-only and must pass before installing or switching to active mode.
 - Use `deploy/install_server.sh --dry-run` before a real `--yes` install; it
   never starts allocations and forces monitor mode.
 - Use `deploy/create_user.sh` for member/admin accounts; admins must not be in

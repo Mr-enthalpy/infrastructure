@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime
 
 from .. import store
-from .docker_driver import DockerBackend
+from .docker_driver import DockerBackend, matches_managed_allocation
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,29 @@ def expire_once(
     expired_ids: list[str] = []
     for allocation in store.list_expired_active(connection, now=now):
         allocation_id = str(allocation["id"])
-        try:
-            docker.remove_container(str(allocation["container_id"]))
-        except Exception:
-            logger.exception("could not remove expired container for %s", allocation_id)
-            continue
+        container_id = str(allocation["container_id"])
+        if container_id:
+            try:
+                container = docker.get_container(container_id)
+            except Exception:
+                logger.exception("could not inspect expired container for %s", allocation_id)
+                continue
+            if container is not None and not matches_managed_allocation(
+                container,
+                allocation_id,
+                container_id,
+            ):
+                logger.critical(
+                    "refusing to touch expired allocation %s: container %s identity mismatch",
+                    allocation_id,
+                    container.id,
+                )
+                continue
+            try:
+                docker.remove_container(container_id)
+            except Exception:
+                logger.exception("could not remove expired container for %s", allocation_id)
+                continue
         try:
             store.expire_allocation(connection, allocation_id, now=now)
         except Exception:

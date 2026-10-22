@@ -82,7 +82,7 @@ uv.lock              # 锁定依赖版本
 - P2 已完成：真实 Docker driver、GPU/CPU/RAM 限制、workspace 创建、release、到期 worker、重启对账、未纳管资源展示。
 - P3 已完成：幂等安装脚本、成员/管理员账号脚本、udev/sshd/systemd 模板、只读 monitor-only 安全验收脚本。
 - P4 已完成：本地 Web GUI、GPU 总览/申请/release/logs、管理员页、未纳管只读页、内嵌 xterm.js 终端。
-- P5 待实现：训练结束后的实机 monitor-only → CPU → 单 GPU 验收。
+- P5 待实现：训练结束后的实机 monitor-only → CPU → 单 GPU 验收；四项 active 验收脚本见 `docs/acceptance.md`。
 - Linux-only 的 UDS/`SO_PEERCRED` 集成测试在 Windows 本地跳过，由 Ubuntu CI 执行。
 - 真实 Docker 集成测试需 `UDC_RUN_DOCKER_TESTS=1`，默认跳过。
 - amax 仍在训练，**禁止部署**。
@@ -125,6 +125,7 @@ udc-resource gui --server amax --admin-server amax-admin
 
 ```bash
 bash deploy/preflight.sh
+bash deploy/audit_legacy.sh
 bash deploy/install_server.sh --dry-run --skip-preflight
 bash deploy/install_server.sh --yes
 bash deploy/create_user.sh --yes --ssh-key /path/to/key.pub udc-alice

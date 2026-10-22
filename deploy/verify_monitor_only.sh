@@ -6,6 +6,7 @@
 set -u
 set -o pipefail
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MEMBER=""
 DURATION=600
 SKIP_SNAPSHOT=0
@@ -118,6 +119,13 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
+section "legacy access audit"
+if bash "$SCRIPT_DIR/audit_legacy.sh"; then
+    ok "legacy audit passed"
+else
+    fail "legacy audit found critical findings"
+fi
+
 section "member groups"
 MEMBER_GROUPS=$(id -nG "$MEMBER")
 for required in udc-members udc-cli; do
@@ -184,6 +192,22 @@ if [ -e "$SOCKET" ]; then
     else
         fail "socket permissions are $SOCKET_META (expected 660 root udc-cli)"
     fi
+fi
+SOCKET_DIR=$(dirname "$SOCKET")
+if [ -d "$SOCKET_DIR" ]; then
+    DIR_META=$(stat -c '%a %U %G' "$SOCKET_DIR" 2>/dev/null || true)
+    if [ "$DIR_META" = "711 root root" ]; then
+        ok "socket parent permissions: $DIR_META"
+    else
+        fail "socket parent permissions are $DIR_META (expected 711 root root)"
+    fi
+    if member_run "test -x $(printf '%q' "$SOCKET_DIR")"; then
+        ok "member can traverse socket parent"
+    else
+        fail "member cannot traverse socket parent: $SOCKET_DIR"
+    fi
+else
+    fail "socket parent directory is missing: $SOCKET_DIR"
 fi
 if [ -f "$DB_PATH" ]; then
     DB_META=$(stat -c '%a %U %G' "$DB_PATH" 2>/dev/null || true)

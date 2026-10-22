@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 from .. import store
-from .docker_driver import ContainerInfo, DockerBackend
+from .docker_driver import ContainerInfo, DockerBackend, matches_managed_allocation
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ def reconcile(
         "unmanaged": 0,
         "orphaned": 0,
         "list_failed": 0,
+        "unsafe_skipped": 0,
     }
     try:
         containers = docker.list_containers()
@@ -59,6 +60,23 @@ def reconcile(
             direct = by_id.get(str(allocation["container_id"]))
             if direct is not None and direct not in candidates:
                 candidates.append(direct)
+        unsafe = [
+            container
+            for container in candidates
+            if not matches_managed_allocation(
+                container,
+                str(allocation["id"]),
+                str(allocation["container_id"]) or None,
+            )
+        ]
+        if unsafe:
+            summary["unsafe_skipped"] += 1
+            logger.critical(
+                "refusing to clean pending allocation %s: container identity mismatch: %s",
+                allocation["id"],
+                ", ".join(container.id for container in unsafe),
+            )
+            continue
         removed_ok = True
         for container in candidates:
             try:
@@ -100,6 +118,18 @@ def reconcile(
                 summary["lost"] += 1
             except Exception:
                 logger.exception("could not fail missing allocation %s", allocation_id)
+            continue
+        if not matches_managed_allocation(
+            active_container,
+            allocation_id,
+            str(allocation["container_id"]),
+        ):
+            summary["unsafe_skipped"] += 1
+            logger.critical(
+                "refusing to touch allocation %s: container %s identity mismatch",
+                allocation_id,
+                active_container.id,
+            )
             continue
         if active_container.status != "running":
             try:

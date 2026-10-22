@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ["preflight.sh", "install_server.sh", "create_user.sh", "verify_monitor_only.sh"]
+SCRIPTS = [
+    "preflight.sh",
+    "audit_legacy.sh",
+    "install_server.sh",
+    "create_user.sh",
+    "verify_monitor_only.sh",
+]
 
 
 def _bash() -> str | None:
@@ -66,3 +72,26 @@ def test_install_server_dry_run_does_not_require_root():
     )
     assert result.returncode == 0, result.stderr
     assert "[dry-run]" in result.stdout
+
+
+def test_broker_runtime_directory_allows_member_traversal():
+    unit = (ROOT / "deploy/systemd/udc-resource-broker.service").read_text(encoding="utf-8")
+    assert "RuntimeDirectoryMode=0711" in unit
+    assert "RuntimeDirectoryMode=0750" not in unit
+
+
+def test_active_acceptance_python_syntax():
+    path = ROOT / "deploy/acceptance_active.py"
+    source = path.read_text(encoding="utf-8")
+    compile(source, str(path), "exec")
+
+
+def test_active_acceptance_help():
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/acceptance_active.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage" in (result.stdout + result.stderr).lower()

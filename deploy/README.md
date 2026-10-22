@@ -9,8 +9,9 @@ administrator approval.
 
 ## Order
 
-1. Run `bash deploy/preflight.sh` (read-only): Docker, systemd, NVIDIA runtime,
-   udev, sshd, groups, cgroup, disk, `/dev/nvidia*` permissions.
+1. Run `bash deploy/preflight.sh` and `bash deploy/audit_legacy.sh` (both read-only):
+   Docker, systemd, NVIDIA runtime, udev, sshd, groups, cgroup, disk,
+   `/dev/nvidia*` permissions, legacy root/sudo/SSH/privileged-container access.
 2. Install Python 3.12 (uv or deadsnakes), then run:
 
    ```bash
@@ -52,9 +53,11 @@ administrator approval.
 ## Files
 
 - `preflight.sh` (read-only checks; run before installing anything)
+- `audit_legacy.sh` (read-only legacy root/sudo/SSH/privileged-container audit)
 - `install_server.sh` (idempotent installer; `--dry-run`, `--yes`, `--start`)
 - `create_user.sh` (member/admin account and optional SSH key setup)
 - `verify_monitor_only.sh` (read-only monitor-only security acceptance)
+- `acceptance_active.py` (destructive active-mode acceptance; see `docs/acceptance.md`)
 - `systemd/udc-resource-broker.service`
 - `udev/99-udc-gpu.rules`
 - `sshd/60-udc-resource.conf`

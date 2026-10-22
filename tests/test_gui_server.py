@@ -7,6 +7,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from udc_resource.gui import server as gui_server
+from udc_resource.login_wrapper import parse_command
 
 
 class FakeRunner:
@@ -195,7 +196,8 @@ def test_ssh_runner_builds_json_cli_command(monitor_config, monkeypatch):
     runner = gui_server.SSHRunner(monitor_config, "member-alias", None)
     argv = runner._argv("member-alias", ["list"])
     assert argv is not None
-    assert argv[-4:] == ["member-alias", "udc-resource", "list", "--json"]
+    assert argv[-2] == "member-alias"
+    assert argv[-1] == "udc-resource list --json"
     assert "BatchMode=yes" in argv
 
 
@@ -214,3 +216,32 @@ async def test_vendored_xterm_assets_are_served(monitor_config):
             assert response.status == 200, path
     finally:
         await client.close()
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "train new model",
+        "quote ' and \" inside",
+        "train; rm -rf /tmp/x",
+        "a && b | c",
+        "模型 训练",
+        "$(whoami)",
+    ],
+)
+def test_ssh_runner_preserves_note_through_forcecommand(monitor_config, monkeypatch, note):
+    monkeypatch.setattr(gui_server.shutil, "which", lambda name: "ssh")
+    runner = gui_server.SSHRunner(monitor_config, "member-alias", None)
+    argv = runner._argv("member-alias", ["apply", "--gpus", "3", "--note", note])
+    assert argv is not None
+    remote = argv[-1]
+    assert isinstance(remote, str)
+    assert parse_command(remote) == [
+        "udc-resource",
+        "apply",
+        "--gpus",
+        "3",
+        "--note",
+        note,
+        "--json",
+    ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -38,6 +39,7 @@ class ContainerInfo:
     image: str
     status: str
     labels: dict[str, str]
+    gpu_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,20 @@ class DockerBackend(Protocol):
     def open_shell(self, container_id: str, cols: int, rows: int) -> ShellSession: ...
 
     def logs(self, container_id: str, tail: int) -> str: ...
+
+
+def matches_managed_allocation(
+    container: ContainerInfo,
+    allocation_id: str,
+    expected_container_id: str | None = None,
+) -> bool:
+    if container.labels.get("udc.managed") != "true":
+        return False
+    if container.labels.get("udc.allocation") != allocation_id:
+        return False
+    if expected_container_id is not None and container.id != expected_container_id:
+        return False
+    return True
 
 
 class DockerShellSession:
@@ -210,15 +226,43 @@ class DockerDriver:
     def _container_info(container: Any) -> ContainerInfo:
         attrs = getattr(container, "attrs", {}) or {}
         config = attrs.get("Config", {}) or {}
+        host_config = attrs.get("HostConfig", {}) or {}
         raw_labels = config.get("Labels") or {}
         labels = {str(key): str(value) for key, value in raw_labels.items()}
         state = attrs.get("State", {}) or {}
+        refs: list[str] = []
+        for request in host_config.get("DeviceRequests") or []:
+            if not isinstance(request, dict):
+                continue
+            device_ids = request.get("DeviceIDs") or request.get("DeviceIds") or []
+            if device_ids:
+                refs.extend(str(item) for item in device_ids)
+                continue
+            count = request.get("Count")
+            if count == -1 or (isinstance(count, int) and count < 0):
+                refs.append("all")
+            elif isinstance(count, int) and count > 0:
+                refs.append("any")
+        for device in host_config.get("Devices") or []:
+            if not isinstance(device, dict):
+                continue
+            path = str(device.get("PathOnHost", ""))
+            match = re.search(r"/dev/nvidia(\d+)$", path)
+            if match:
+                refs.append(match.group(1))
+        for item in config.get("Env") or []:
+            text = str(item)
+            if not text.startswith("NVIDIA_VISIBLE_DEVICES="):
+                continue
+            value = text.split("=", 1)[1]
+            refs.extend(part.strip() for part in value.split(",") if part.strip())
         return ContainerInfo(
             id=str(container.id),
             name=str(container.name),
             image=str(config.get("Image", "")),
             status=str(getattr(container, "status", "") or state.get("Status", "")),
             labels=labels,
+            gpu_refs=tuple(dict.fromkeys(refs)),
         )
 
     def list_containers(self) -> list[ContainerInfo]:

@@ -143,18 +143,20 @@ main { max-width: 1224px; margin: 0 auto; padding: 20px 28px 60px; }
   width: 4px;
   background: var(--muted);
 }
-.gpu-card.idle::before { background: var(--ok); }
+.gpu-card.free::before { background: var(--ok); }
 .gpu-card.allocated::before { background: var(--warn); }
 .gpu-card.unmanaged::before { background: var(--offline); }
+.gpu-card.unknown::before { background: var(--danger); }
 .gpu-card.stale { opacity: 0.65; }
 .gpu-card.clickable { cursor: pointer; }
 .gpu-card.clickable:hover { border-color: rgba(94, 234, 212, 0.55); transform: translateY(-1px); }
 .gpu-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .gpu-index { font-size: 18px; font-weight: 750; }
 .gpu-state { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
-.gpu-state.idle { color: var(--ok); }
+.gpu-state.free { color: var(--ok); }
 .gpu-state.allocated { color: var(--warn); }
 .gpu-state.unmanaged { color: var(--offline); }
+.gpu-state.unknown { color: var(--danger); }
 .gpu-meta { margin-top: 10px; display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
 .gpu-meta b { color: var(--text); font-weight: 600; }
 .gpu-remaining { margin-top: 10px; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 650; }

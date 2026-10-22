@@ -59,7 +59,8 @@ class SSHRunner:
         known_hosts = self.config.server.known_hosts.strip()
         if known_hosts:
             argv.extend(["-o", f"UserKnownHostsFile={os.path.expanduser(known_hosts)}"])
-        argv.extend([alias, "udc-resource", *args, "--json"])
+        remote_command = shlex.join(["udc-resource", *args, "--json"])
+        argv.extend([alias, remote_command])
         return argv
 
     async def run(self, alias: str, args: list[str]) -> dict[str, Any]:

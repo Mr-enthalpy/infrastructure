@@ -28,6 +28,7 @@ SKIP_PREFLIGHT=0
 START=0
 ALLOW_ACTIVE=0
 FORCE_CONFIG=0
+AUDIT_FAILED=0
 CONFIG_SOURCE=""
 PYTHON_BIN=${PYTHON_BIN:-}
 
@@ -126,6 +127,17 @@ if [ "$SKIP_PREFLIGHT" -eq 0 ]; then
     fi
 else
     warn "preflight skipped by explicit request"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    note "would run $SCRIPT_DIR/audit_legacy.sh"
+else
+    if bash "$SCRIPT_DIR/audit_legacy.sh"; then
+        ok "legacy audit passed"
+    else
+        AUDIT_FAILED=1
+        warn "legacy audit found critical findings; install may continue, but --start is blocked"
+    fi
 fi
 
 if [ -z "$CONFIG_SOURCE" ]; then
@@ -311,6 +323,9 @@ ok "udev rule installed"
 
 run install -o root -g root -m 0644 \
     "$SCRIPT_DIR/systemd/udc-resource-broker.service" "$SYSTEMD_UNIT"
+if [ -d /run/udc-resource ]; then
+    run chmod 0711 /run/udc-resource
+fi
 run systemctl daemon-reload
 run systemctl enable udc-resource-broker.service
 ok "systemd unit installed and enabled"
@@ -345,6 +360,9 @@ else
     warn "keep an existing admin SSH session open until a new member login is verified"
 fi
 
+if [ "$START" -eq 1 ] && [ "$AUDIT_FAILED" -eq 1 ]; then
+    fail "legacy audit failed; resolve critical findings before starting the broker"
+fi
 if [ "$START" -eq 1 ]; then
     run systemctl restart udc-resource-broker.service
     if [ "$DRY_RUN" -eq 0 ]; then

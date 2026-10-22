@@ -65,7 +65,7 @@ async def test_list_has_gpu_inventory(tmp_path, active_config):
     response = await _call(broker, "list", {}, ALICE)
     assert response["ok"] is True
     assert len(response["data"]["gpus"]) == 8
-    assert response["data"]["gpus"][0]["state"] == "idle"
+    assert response["data"]["gpus"][0]["state"] == "free"
 
 
 async def test_apply_creates_active_allocation(tmp_path, active_config):
@@ -552,3 +552,108 @@ async def test_logs_are_owner_or_admin_only(tmp_path, active_config):
     assert denied["error"]["code"] == "forbidden"
     admin = await _call(broker, "logs", {"id": allocation_id}, ADMIN)
     assert admin["ok"] is True
+
+
+async def test_list_marks_compute_process_as_unmanaged(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_process(GPUProcess(gpu_uuid="GPU-3", pid=4242, used_mib=1024, process_name="python"))
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    response = await _call(broker, "list", {}, ALICE)
+    gpu = next(item for item in response["data"]["gpus"] if item["index"] == 3)
+    assert gpu["state"] == "unmanaged"
+    assert gpu["compute_pids"] == [4242]
+
+
+async def test_list_marks_container_gpu_holder_as_unmanaged(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="old-container",
+            name="old-training",
+            image="old:latest",
+            status="running",
+            labels={},
+            gpu_refs=("GPU-4",),
+        )
+    )
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    response = await _call(broker, "list", {}, ALICE)
+    gpu = next(item for item in response["data"]["gpus"] if item["index"] == 4)
+    assert gpu["state"] == "unmanaged"
+    assert gpu["unmanaged_container_ids"] == ["old-container"]
+    unmanaged = response["data"]["unmanaged"]["containers"][0]
+    assert unmanaged["gpus"] == [4]
+
+
+async def test_list_marks_unknown_when_live_detection_fails(tmp_path, active_config, monkeypatch):
+    fake = FakeDocker()
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+
+    def fail():
+        raise RuntimeError("nvidia-smi failed")
+
+    monkeypatch.setattr(fake, "list_gpus", fail)
+    response = await _call(broker, "list", {}, ALICE)
+    assert response["ok"] is True
+    assert response["data"]["detection_error"]
+    assert {gpu["state"] for gpu in response["data"]["gpus"]} == {"unknown"}
+
+
+async def test_apply_rejects_container_gpu_holder_without_compute(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="old-container",
+            name="old-training",
+            image="old:latest",
+            status="running",
+            labels={},
+            gpu_refs=("GPU-3",),
+        )
+    )
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    response = await _call(
+        broker,
+        "apply",
+        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "gpu_busy"
+
+
+async def test_admin_active_blocked_by_unmanaged_gpu_holder(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="old-container",
+            name="old-training",
+            image="old:latest",
+            status="running",
+            labels={},
+            gpu_refs=("GPU-5",),
+        )
+    )
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    response = await _call(broker, "admin_mode", {"mode": "active"}, ADMIN)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    assert "unmanaged" in response["error"]["message"]
+
+
+async def test_apply_fails_closed_when_live_detection_fails(tmp_path, active_config, monkeypatch):
+    fake = FakeDocker()
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+
+    def fail():
+        raise RuntimeError("nvidia-smi failed")
+
+    monkeypatch.setattr(fake, "list_gpus", fail)
+    response = await _call(
+        broker,
+        "apply",
+        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "docker_error"

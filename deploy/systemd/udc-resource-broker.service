@@ -10,7 +10,7 @@ Environment=UDC_RESOURCE_CONFIG=/etc/udc-resource/config.toml
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 RuntimeDirectory=udc-resource
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0711
 StateDirectory=udc-resource
 StateDirectoryMode=0750
 UMask=0077
