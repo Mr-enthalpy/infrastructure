@@ -1,16 +1,32 @@
-# udc-resource
+# UDC Lab Infrastructure
 
-实验室共享 GPU 服务器的动态资源管理器初始化项目。
+本仓库是 UDC 实验室共享 GPU 服务器的独立基础设施仓库，核心实现为 `udc-resource`：受限 SSH CLI、root Broker、SQLite 状态、Docker 生命周期、monitor-only 对账和本地 Web GUI。
 
-当前只完成项目骨架、配置模型和实验室本地资源清单；**没有部署、没有启动 Broker、没有操作 amax 上的训练容器**。
+`infrastructure` 不依附于研究仓库，不是 `reconstruction` / `optic_system` 的 submodule；不修改 Meta pin、不读取测试集、不操作实验机。
 
-完整实现规格见 [server-resource-manager-vibe.md](server-resource-manager-vibe.md)。
+## 当前状态
 
-## 设计摘要
+- 代码阶段 P0–P4 已完成；P5 实机验收待训练结束和管理员批准。
+- **尚未在 amax 部署**，未启动 Broker，未创建或停止任何训练容器。
+- amax 当前仍在训练；禁止部署或重启 Docker。
+- `lab/resources.local.toml` 保存本地资源清单，不进入 Git。
+- 生产基线 Python 3.12；本机开发可使用 Python 3.13。
+
+完整规格见 [server-resource-manager-vibe.md](server-resource-manager-vibe.md)。
+
+## 系统组成
+
+- **CLI `udc-resource`**：成员和 admin 的唯一入口；业务结果使用稳定 `--json` envelope。
+- **Broker**：root systemd 服务，只监听 Unix socket，通过 `SO_PEERCRED` 识别 UID。
+- **SQLite**：allocation、GPU claim、settings 和审计事件；WAL + 显式事务。
+- **Docker driver**：整卡 GPU、CPU/RAM 限制、workspace 挂载、到期/释放/重启对账。
+- **GUI**：本地 `127.0.0.1` Web UI + xterm.js；只通过 SSH 调用 CLI，不直连 Broker。
+
+## 设计约束
 
 - 成员使用独立 Linux 账号；SSH 通过 `ForceCommand` 只允许 `udc-resource` 白名单命令。
 - Broker 以 root systemd 运行，只开 Unix socket，通过 `SO_PEERCRED` 识别用户。
-- CLI 是唯一业务实现；GUI 只调用 CLI 的 `--json`，不另做 API client。
+- CLI 是唯一用户业务入口；GUI 的数据请求只调用 CLI `--json`，交互终端只调用 CLI `shell`。
 - GPU 整卡、12h 默认 / 36h 上限；到期停止容器，保留 workspace，不自动续租。
 - 容器内 root，但不 privileged、不挂 host Docker socket、只挂个人 workspace。
 - 先 `monitor-only`，只显示现有占用，不碰未知容器。
@@ -41,13 +57,17 @@ src/udc_resource/
   store.py           # 用户/GPU/claim/allocation/event 事务
   identity.py        # UID/组身份解析与 SO_PEERCRED
   errors.py          # Broker/CLI 共享错误码与退出码
-  cli.py             # CLI：list/status/apply/release/admin/config
+  stream.py          # shell 长度前缀帧协议
+  cli.py             # CLI：list/status/apply/release/logs/shell/gui/admin
   client.py          # Unix socket 客户端（超时/协议错误）
   login_wrapper.py   # SSH ForceCommand 白名单包装器
   broker/            # UDS Broker、Docker driver、到期 worker、重启对账
   gui/               # 本地 Web GUI、静态资源与 vendored xterm.js
 deploy/
   preflight.sh       # 只读部署预检，不修改主机
+  install_server.sh  # 幂等安装器；--dry-run / --yes / --start
+  create_user.sh     # 成员/管理员账号与 SSH key
+  verify_monitor_only.sh  # 只读 monitor-only 安全验收
   systemd/udev/sshd/docker/  # 部署模板
 tests/               # 配置、数据库与安全规则测试
 lab/                 # 本地资源清单与说明
@@ -55,7 +75,7 @@ lab/                 # 本地资源清单与说明
 uv.lock              # 锁定依赖版本
 ```
 
-## 当前状态
+## 阶段状态
 
 - P0 已完成：Python 3.11+ 基线、依赖锁定、SQLite schema、配置上限、login wrapper 绝对路径、只读 preflight、CI。
 - P1 已完成：Unix socket Broker、`SO_PEERCRED`、SQLite 事务、多 GPU claim、用户/管理员权限、审计事件、CLI `list/status/apply/admin/config`。

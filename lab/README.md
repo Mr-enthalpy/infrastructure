@@ -1,5 +1,7 @@
 # Lab resource inventory
 
+Static resource inventory for the `infrastructure` repository.
+
 This directory records static lab resources. Live GPU/container occupancy is
 discovered by the broker and must never be written into Git.
 

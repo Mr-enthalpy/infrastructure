@@ -1,8 +1,11 @@
-# Deployment templates
+# UDC infrastructure deployment
 
-**Do not run these files on amax while training is active.** P2 provides the
-real Docker lifecycle, expiry, and reconciliation. P3 adds the installer and
-monitor-only security acceptance; deployment still requires explicit approval.
+Deployment scripts for the `infrastructure` repository. They install and verify
+the `udc-resource` broker, CLI, SSH restrictions, udev rule, and systemd unit.
+
+**Do not run these files on amax while training is active.** The code is
+implemented, but deployment still requires training completion and explicit
+administrator approval.
 
 ## Order
 
