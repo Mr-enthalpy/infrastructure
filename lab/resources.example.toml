@@ -1,0 +1,47 @@
+[server]
+name = "amax"
+ssh_alias = "amax"
+address = "server.example.invalid"
+ssh_port = 22
+ssh_user = "admin"
+known_hosts = "~/.ssh/known_hosts"
+data_root = "/data1"
+workspace_root = "/data1/udc-users"
+broker_socket = "/run/udc-resource/broker.sock"
+state_db = "/var/lib/udc-resource/state.db"
+
+[hardware]
+gpu_count = 8
+gpu_model = "NVIDIA GeForce RTX 4090"
+gpu_memory_mib = 49140
+cpu_logical = 128
+ram_gib = 251
+docker_version = "28.1.1"
+python_version = "3.10.12"
+
+[policy]
+default_hours = 12
+max_hours = 36
+mode = "monitor"
+deployment_allowed = false
+max_cpus = 32
+max_memory_gb = 128
+reserve_cpus = 8
+reserve_memory_gb = 32
+
+[groups]
+members = "udc-members"
+cli = "udc-cli"
+admins = "udc-admins"
+gpu = "udc-gpu"
+
+[image]
+base = "udc-base:2026.10"
+
+[deployment]
+reason = "amax is still training; deploy only after explicit approval"
+monitor_only_until = ""
+
+[gui]
+admin_ssh = ""
+connect_timeout = 15

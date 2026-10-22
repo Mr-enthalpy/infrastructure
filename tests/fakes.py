@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+from udc_resource.broker.docker_driver import (
+    ContainerInfo,
+    ContainerRef,
+    GPUProcess,
+)
+from udc_resource.identity import Identity
+from udc_resource.models import GPU, Allocation
+
+
+class FakeShellSession:
+    def __init__(self, output: bytes = b"") -> None:
+        self.chunks = [output] if output else []
+        self.written = bytearray()
+        self.sizes: list[tuple[int, int]] = []
+        self.closed = False
+
+    def read(self, size: int = 65536) -> bytes:
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if len(chunk) > size:
+            self.chunks.insert(0, chunk[size:])
+            return chunk[:size]
+        return chunk
+
+    def write(self, data: bytes) -> None:
+        self.written.extend(data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self.sizes.append((cols, rows))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeDocker:
+    def __init__(
+        self,
+        gpu_count: int = 8,
+        fail_create: bool = False,
+        fail_remove: bool = False,
+    ) -> None:
+        self.gpus = [
+            GPU(
+                index=index,
+                uuid=f"GPU-{index}",
+                name="NVIDIA GeForce RTX 4090",
+                memory_mib=49140,
+            )
+            for index in range(gpu_count)
+        ]
+        self.created: list[Allocation] = []
+        self.removed: list[str] = []
+        self.containers: dict[str, ContainerInfo] = {}
+        self.processes: list[GPUProcess] = []
+        self.container_logs: dict[str, str] = {}
+        self.shell_output = b"fake shell output\n"
+        self.shells: list[FakeShellSession] = []
+        self.fail_create = fail_create
+        self.fail_remove = fail_remove
+        self._next_id = 1
+
+    def list_gpus(self) -> list[GPU]:
+        return list(self.gpus)
+
+    def list_compute_processes(self) -> list[GPUProcess]:
+        return list(self.processes)
+
+    def list_containers(self) -> list[ContainerInfo]:
+        return list(self.containers.values())
+
+    def get_container(self, container_id: str) -> ContainerInfo | None:
+        return self.containers.get(container_id)
+
+    def add_container(self, container: ContainerInfo) -> None:
+        self.containers[container.id] = container
+
+    def add_process(self, process: GPUProcess) -> None:
+        self.processes.append(process)
+
+    def create_container(self, allocation: Allocation) -> ContainerRef:
+        if self.fail_create:
+            raise RuntimeError("simulated docker failure")
+        container_id = f"container-{self._next_id}"
+        name = f"udc-{allocation.owner_name}-{self._next_id}"
+        self._next_id += 1
+        self.created.append(allocation)
+        self.containers[container_id] = ContainerInfo(
+            id=container_id,
+            name=name,
+            image=allocation.image,
+            status="running",
+            labels={
+                "udc.managed": "true",
+                "udc.owner": allocation.owner_name,
+                "udc.allocation": allocation.id,
+                "udc.gpus": ",".join(allocation.gpus),
+            },
+        )
+        return ContainerRef(id=container_id, name=name)
+
+    def remove_container(self, container_id: str) -> None:
+        if self.fail_remove:
+            raise RuntimeError("simulated docker remove failure")
+        self.removed.append(container_id)
+        self.containers.pop(container_id, None)
+
+    def open_shell(self, container_id: str, cols: int, rows: int) -> FakeShellSession:
+        session = FakeShellSession(self.shell_output)
+        session.sizes.append((cols, rows))
+        self.shells.append(session)
+        return session
+
+    def logs(self, container_id: str, tail: int) -> str:
+        return self.container_logs.get(container_id, "fake log line\n")
+
+
+class FakeIdentityResolver:
+    def __init__(self, identities: dict[int, Identity] | None = None) -> None:
+        self.identities = identities or {}
+
+    def resolve(self, uid: int, gid: int) -> Identity:
+        if uid in self.identities:
+            return self.identities[uid]
+        return Identity(
+            uid=uid,
+            gid=gid,
+            username=f"user{uid}",
+            role="member",
+            is_admin=False,
+        )

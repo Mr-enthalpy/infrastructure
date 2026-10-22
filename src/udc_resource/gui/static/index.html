@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="udc-token" content="__UDC_TOKEN__">
+  <title>UDC Resource · __SERVER_NAME__</title>
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">UDC</span>
+      <div>
+        <h1>Resource Manager</h1>
+        <p class="muted"><span id="server-name">__SERVER_NAME__</span> · local GUI</p>
+      </div>
+    </div>
+    <div class="top-status">
+      <span id="mode-pill" class="pill unknown">mode ?</span>
+      <span id="connection-pill" class="pill online">online</span>
+    </div>
+  </header>
+
+  <div id="offline-banner" class="banner error" hidden>
+    Broker/SSH is offline. Showing the last known state; treat it as stale.
+  </div>
+  <div id="flash" class="banner" hidden></div>
+
+  <nav class="tabs" aria-label="Sections">
+    <button class="tab active" data-tab="overview">总览</button>
+    <button class="tab" data-tab="apply">申请</button>
+    <button class="tab" data-tab="allocations">我的 allocation</button>
+    <button class="tab" data-tab="unmanaged">未纳管</button>
+    <button class="tab" data-tab="admin" id="admin-tab" hidden>管理员</button>
+  </nav>
+
+  <main>
+    <section id="tab-overview" class="tab-panel active">
+      <div class="summary" id="summary"></div>
+      <div id="gpu-grid" class="gpu-grid"></div>
+      <h2>All allocations</h2>
+      <div id="all-allocations" class="allocation-list empty">No data yet.</div>
+    </section>
+
+    <section id="tab-apply" class="tab-panel">
+      <div class="panel">
+        <h2>申请资源</h2>
+        <form id="apply-form">
+          <fieldset>
+            <legend>GPU（不选则为 CPU-only）</legend>
+            <div id="gpu-choices" class="gpu-choices"></div>
+          </fieldset>
+          <div class="form-grid">
+            <label>CPU 核数
+              <input name="cpus" type="number" min="0.5" step="0.5" value="8" required>
+            </label>
+            <label>内存 GiB
+              <input name="memory_gb" type="number" min="1" step="1" value="32" required>
+            </label>
+            <label>时长（小时）
+              <input name="hours" type="number" min="1" max="36" step="1" value="12" required>
+            </label>
+            <label>镜像
+              <input name="image" type="text" placeholder="默认基础镜像">
+            </label>
+          </div>
+          <label>备注
+            <input name="note" type="text" maxlength="500" placeholder="可选">
+          </label>
+          <div class="actions">
+            <button type="submit" class="primary">提交申请</button>
+            <span id="apply-error" class="error-text"></span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="tab-allocations" class="tab-panel">
+      <div class="section-head">
+        <h2>我的 allocation</h2>
+        <button id="refresh-my" class="ghost">刷新</button>
+      </div>
+      <div id="my-allocations" class="allocation-list empty">No allocations.</div>
+    </section>
+
+    <section id="tab-unmanaged" class="tab-panel">
+      <div class="notice">
+        只读视图。未纳管容器/进程不会被本系统停止或删除。
+      </div>
+      <h2>Containers</h2>
+      <div id="unmanaged-containers" class="allocation-list empty">None.</div>
+      <h2>GPU processes</h2>
+      <div id="unmanaged-processes" class="allocation-list empty">None.</div>
+    </section>
+
+    <section id="tab-admin" class="tab-panel">
+      <div id="admin-content">
+        <div class="panel">
+          <h2>Broker mode</h2>
+          <p class="muted">active 需要配置中 deployment_allowed=true，并应由管理员明确批准。</p>
+          <div class="actions">
+            <button id="mode-monitor" class="ghost">切到 monitor</button>
+            <button id="mode-active" class="danger">切到 active</button>
+            <span id="mode-error" class="error-text"></span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>强制释放</h2>
+          <form id="admin-release-form" class="inline-form">
+            <input name="id" placeholder="allocation id" required>
+            <input name="reason" placeholder="原因（必填）" required>
+            <button type="submit" class="danger">强制释放</button>
+          </form>
+          <span id="admin-release-error" class="error-text"></span>
+        </div>
+        <div class="panel">
+          <div class="section-head">
+            <h2>审计</h2>
+            <div class="actions">
+              <button id="admin-reconcile" class="ghost">对账</button>
+              <button id="admin-audit" class="ghost">刷新审计</button>
+            </div>
+          </div>
+          <div id="admin-audit-list" class="allocation-list empty">No data.</div>
+        </div>
+        <div class="panel">
+          <h2>用户</h2>
+          <div id="admin-users" class="allocation-list empty">No data.</div>
+          <h2>资源</h2>
+          <div id="admin-resources" class="allocation-list empty">No data.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="modal-backdrop" class="modal-backdrop" hidden>
+    <div id="logs-modal" class="modal" hidden>
+      <div class="modal-head">
+        <h2>Logs</h2>
+        <button class="icon-button" data-close-modal>×</button>
+      </div>
+      <pre id="logs-content"></pre>
+    </div>
+    <div id="terminal-modal" class="modal terminal-modal" hidden>
+      <div class="modal-head">
+        <h2>Container shell</h2>
+        <button class="icon-button" data-close-modal>×</button>
+      </div>
+      <div id="terminal"></div>
+      <p id="terminal-status" class="muted"></p>
+    </div>
+  </div>
+
+  <script src="/static/vendor/xterm.js"></script>
+  <script src="/static/vendor/addon-fit.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

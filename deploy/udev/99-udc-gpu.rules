@@ -1,0 +1,2 @@
+# Restrict NVIDIA device nodes to the broker/root. Members must not be in udc-gpu.
+SUBSYSTEM=="nvidia", KERNEL=="nvidia*", GROUP="udc-gpu", MODE="0660"

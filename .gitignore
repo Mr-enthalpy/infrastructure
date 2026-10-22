@@ -1,0 +1,24 @@
+# Local-only lab inventory and deployment state
+lab/resources.local.toml
+lab/*.local.*
+!lab/resources.example.toml
+
+# Local tool configuration may contain API keys
+opencode.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Runtime data
+*.db
+*.db-wal
+*.db-shm
+*.log

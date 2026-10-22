@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "udc-resource"
+version = "0.1.0"
+description = "Timed, non-preemptive shared GPU resource broker for the UDC lab"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "docker>=7,<8",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+gui = [
+  "aiohttp>=3.10,<4",
+  "asyncssh>=2.16,<3",
+]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+udc-resource = "udc_resource.cli:app"
+udc-resource-login = "udc_resource.login_wrapper:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["udc_resource*"]
+
+[tool.setuptools.package-data]
+udc_resource = ["gui/static/**/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+asyncio_mode = "auto"
+markers = [
+  "linux: requires Linux-only features such as SO_PEERCRED or Unix sockets",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/udc_resource/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+platform = "linux"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+files = ["src"]

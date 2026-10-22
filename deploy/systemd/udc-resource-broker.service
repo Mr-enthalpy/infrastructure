@@ -1,0 +1,32 @@
+[Unit]
+Description=UDC shared GPU resource broker
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Environment=UDC_RESOURCE_CONFIG=/etc/udc-resource/config.toml
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=udc-resource
+RuntimeDirectoryMode=0750
+StateDirectory=udc-resource
+StateDirectoryMode=0750
+UMask=0077
+ExecStart=/opt/udc-resource/.venv/bin/python -m udc_resource.broker
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/udc-resource /run/udc-resource
+ReadWritePaths=-/data1/udc-users
+
+[Install]
+WantedBy=multi-user.target
