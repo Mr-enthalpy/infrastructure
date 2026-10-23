@@ -27,6 +27,19 @@
       .replaceAll("'", "&#39;");
   }
 
+  function ownerLabel(item) {
+    const display = String(item?.owner_display || item?.owner || "");
+    const nickname = String(item?.owner_nickname || "");
+    if (nickname && nickname !== display) {
+      return display ? `${display} (${nickname})` : nickname;
+    }
+    return display;
+  }
+
+  function ownerContact(item) {
+    return String(item?.owner_public_contact || "");
+  }
+
   function formatRemaining(seconds) {
     if (seconds === null || seconds === undefined) return "—";
     const total = Math.max(0, Math.floor(Number(seconds)));
@@ -177,8 +190,9 @@
         : null;
       let detail = '<span>available for apply</span>';
       if (gpuState === "allocated") {
-        detail = `<span>owner <b>${esc(gpu.owner || "?")}</b></span>
-                  <span>alloc <b>${esc((gpu.allocation_id || "").slice(0, 12))}</b></span>`;
+        detail = `<span>owner <b>${esc(ownerLabel(gpu) || "?")}</b></span>
+                  <span>alloc <b>${esc((gpu.allocation_id || "").slice(0, 12))}</b></span>
+                  ${ownerContact(gpu) ? `<span>contact ${esc(ownerContact(gpu))}</span>` : ""}`;
       } else if (!isFree) {
         detail = `<span>${esc(gpu.state_reason || gpuState)}</span>`;
       }
@@ -241,6 +255,7 @@
   function allocationItem(allocation, actions) {
     const gpus = (allocation.gpus || []).length ? allocation.gpus.join(",") : "CPU-only";
     const remainingId = `remaining-${allocation.id}`;
+    const contact = ownerContact(allocation);
     const deadline = allocation.remaining_seconds !== null && allocation.remaining_seconds !== undefined
       ? Date.now() + Number(allocation.remaining_seconds) * 1000
       : null;
@@ -248,7 +263,8 @@
       <div class="allocation-item" data-allocation="${esc(allocation.id)}">
         <div>
           <div class="id">${esc(allocation.id)}</div>
-          <div class="muted">${esc(allocation.owner || "")} · ${statusBadge(allocation.status || "")}</div>
+          <div class="muted">${esc(ownerLabel(allocation))} · ${statusBadge(allocation.status || "")}
+            ${contact ? `<br>contact: ${esc(contact)}` : ""}</div>
         </div>
         <div class="muted">GPU: <b>${esc(gpus)}</b><br>CPU/RAM: ${esc(allocation.cpus)} / ${esc(allocation.memory_gb)} GiB</div>
         <div class="muted">
@@ -256,6 +272,7 @@
             ? `剩余 <span class="gpu-remaining" id="${esc(remainingId)}" data-deadline="${deadline}">${formatRemaining(allocation.remaining_seconds)}</span>`
             : "—"}
           ${allocation.container_name ? `<br>${esc(allocation.container_name)}` : ""}
+          ${allocation.note ? `<br>note: ${esc(allocation.note)}` : ""}
         </div>
         <div class="row-actions">${actions || ""}</div>
       </div>
@@ -329,7 +346,7 @@
           <div><div class="id">${esc(container.name)}</div><div class="muted">${esc(container.id)}</div></div>
           <div class="muted">${esc(container.image)}</div>
           <div class="muted">${esc(container.status)}</div>
-          <div class="muted">${container.gpus?.length ? `GPU ${esc(container.gpus.join(","))}` : "no GPU"} · ${container.owner ? `owner ${esc(container.owner)}` : "unmanaged"}</div>
+          <div class="muted">${container.gpus?.length ? `GPU ${esc(container.gpus.join(","))}` : "no GPU"} · ${container.owner ? `owner ${esc(ownerLabel(container))}` : "unmanaged"}</div>
         </div>
       `).join("");
     }
@@ -343,8 +360,8 @@
         <div class="allocation-item">
           <div><div class="id">PID ${esc(process.pid)}</div><div class="muted">GPU ${esc(process.gpu_index ?? "?")}</div></div>
           <div class="muted">${esc(process.process_name || "?")}</div>
-          <div class="muted">${esc(process.used_mib)} MiB<br>${esc(process.username || process.uid || "unknown")}</div>
-          <div class="muted">${process.container_name ? `container ${esc(process.container_name)}` : "read-only"}${process.container_owner ? `<br>owner ${esc(process.container_owner)}` : ""}</div>
+          <div class="muted">${esc(process.used_mib)} MiB<br>${esc(process.owner_display || process.username || process.uid || "unknown")}${process.owner_public_contact ? `<br>contact ${esc(process.owner_public_contact)}` : ""}</div>
+          <div class="muted">${process.container_name ? `container ${esc(process.container_name)}` : "read-only"}${process.container_owner ? `<br>owner ${esc(process.container_owner_display || process.container_owner)}` : ""}</div>
         </div>
       `).join("");
     }
@@ -526,10 +543,10 @@
     const allocations = data.allocations || [];
     target.className = "allocation-list";
     const gpuLines = gpus.map((gpu) =>
-      `<div class="allocation-item"><div>GPU ${esc(gpu.index)}</div><div class="muted">${esc(gpu.state)}</div><div class="muted">${esc(gpu.owner || "—")}</div><div class="muted">${esc(gpu.allocation_id || "")}</div></div>`
+      `<div class="allocation-item"><div>GPU ${esc(gpu.index)}</div><div class="muted">${esc(gpu.state)}</div><div class="muted">${esc(ownerLabel(gpu) || "—")}</div><div class="muted">${esc(gpu.allocation_id || "")}</div></div>`
     ).join("");
     const allocLines = allocations.map((allocation) =>
-      `<div class="allocation-item"><div class="id">${esc(allocation.id)}</div><div class="muted">${esc(allocation.status)}</div><div class="muted">${esc(allocation.owner)}</div><div class="muted">${esc(allocation.gpus)}</div></div>`
+      `<div class="allocation-item"><div class="id">${esc(allocation.id)}</div><div class="muted">${esc(allocation.status)}</div><div class="muted">${esc(ownerLabel(allocation))}</div><div class="muted">${esc(allocation.gpus)}</div>${allocation.note ? `<div class="muted">${esc(allocation.note)}</div>` : ""}</div>`
     ).join("");
     target.innerHTML = gpuLines + allocLines || '<div class="allocation-list empty">No data.</div>';
   }

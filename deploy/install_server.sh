@@ -3,7 +3,8 @@
 #
 # This script never starts GPU allocations and never touches existing
 # containers. It installs the package, groups, udev rule, systemd unit, sshd
-# drop-in, configuration, and SQLite state in monitor mode.
+# drop-in, configuration, and SQLite state. A fresh database starts in monitor
+# mode; existing active leases are preserved only after explicit approval.
 set -u
 set -o pipefail
 
@@ -18,6 +19,13 @@ STATE_DIR=/var/lib/udc-resource
 SYSTEMD_UNIT=/etc/systemd/system/udc-resource-broker.service
 UDEV_RULE=/etc/udev/rules.d/99-udc-gpu.rules
 SSHD_DROPIN=/etc/ssh/sshd_config.d/60-udc-resource.conf
+ROTATE_SCRIPT=/usr/local/sbin/udc-rotate-job-logs
+ROTATE_UNIT=/etc/systemd/system/udc-resource-logrotate.service
+ROTATE_TIMER=/etc/systemd/system/udc-resource-logrotate.timer
+DISK_SCRIPT=/usr/local/sbin/udc-check-disk
+DISK_UNIT=/etc/systemd/system/udc-resource-disk-check.service
+DISK_TIMER=/etc/systemd/system/udc-resource-disk-check.timer
+LEGACY_LOGROTATE=/etc/logrotate.d/udc-resource
 LOGIN_WRAPPER=/usr/local/bin/udc-resource-login
 CLI_LINK=/usr/local/bin/udc-resource
 UDC_GROUPS=(udc-members udc-cli udc-admins udc-gpu)
@@ -31,6 +39,17 @@ FORCE_CONFIG=0
 AUDIT_FAILED=0
 CONFIG_SOURCE=""
 PYTHON_BIN=${PYTHON_BIN:-}
+BACKUP_ROOT=/var/backups/udc-resource
+BACKUP_DIR=""
+ROLLBACK_ARMED=0
+INSTALL_COMPLETE=0
+BROKER_WAS_ACTIVE=0
+BROKER_WAS_ENABLED=0
+BROKER_START_ATTEMPTED=0
+BACKED_UP=()
+STATE_DB=""
+STATE_DB_BACKUP=""
+STATE_DB_EXISTED=0
 
 usage() {
     cat <<'EOF'
@@ -41,7 +60,9 @@ Options:
   --yes                 Required for a real (non-dry-run) installation.
   --skip-preflight      Skip deploy/preflight.sh (not recommended).
   --start               Start the broker after installation (default: install only).
-  --allow-active        Allow an active-mode config; the broker is still set to monitor.
+  --allow-active        Allow an active-mode config after training and approval.
+                        A fresh database still starts in monitor; existing active
+                        leases are preserved only when deployment_allowed=true.
   --force-config        Overwrite an existing /etc/udc-resource/config.toml.
   --config-source PATH  TOML config to install (default: lab/resources.local.toml
                         if present, otherwise lab/resources.example.toml).
@@ -77,6 +98,102 @@ run_shell() {
     if ! bash -c "$*"; then
         fail "command failed: $*"
     fi
+}
+
+backup_file() {
+    local path=$1
+    local rel
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    [ "$ROLLBACK_ARMED" -eq 1 ] || return 0
+    case " ${BACKED_UP[*]} " in
+        *" $path "*) return 0 ;;
+    esac
+    rel=${path#/}
+    mkdir -p "$BACKUP_DIR/$(dirname "$rel")" || fail "could not create backup directory"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        cp -a -- "$path" "$BACKUP_DIR/$rel" || fail "could not back up $path"
+    else
+        : > "$BACKUP_DIR/$rel.absent" || fail "could not record absent file $path"
+    fi
+    BACKED_UP+=("$path")
+}
+
+install_file() {
+    local mode=$1
+    local source=$2
+    local destination=$3
+    backup_file "$destination"
+    if [ "$DRY_RUN" -eq 0 ] && [ -L "$destination" ]; then
+        # install(1) follows a destination symlink; remove the link first so
+        # rollback restores the link without having modified its target.
+        run rm -f -- "$destination"
+    fi
+    run install -o root -g root -m "$mode" "$source" "$destination"
+}
+
+reload_sshd() {
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
+        systemctl reload ssh 2>/dev/null || true
+    else
+        systemctl reload sshd 2>/dev/null || true
+    fi
+}
+
+rollback() {
+    local code=${1:-$?}
+    local path
+    local rel
+    if [ "$INSTALL_COMPLETE" -eq 1 ] || [ "$ROLLBACK_ARMED" -eq 0 ]; then
+        return "$code"
+    fi
+    trap - EXIT
+    printf '\n[rollback] installation failed (exit %s); restoring previous files\n' "$code" >&2
+    if [ "$BROKER_START_ATTEMPTED" -eq 1 ]; then
+        systemctl stop udc-resource-broker.service 2>/dev/null || true
+    fi
+    for path in "${BACKED_UP[@]}"; do
+        rel=${path#/}
+        if [ -f "$BACKUP_DIR/$rel.absent" ]; then
+            rm -f -- "$path" || true
+        elif [ -e "$BACKUP_DIR/$rel" ] || [ -L "$BACKUP_DIR/$rel" ]; then
+            mkdir -p -- "$(dirname "$path")" || true
+            cp -a -- "$BACKUP_DIR/$rel" "$path" || true
+        fi
+    done
+    BROKER_ACTIVE_NOW=0
+    if systemctl is-active --quiet udc-resource-broker.service 2>/dev/null; then
+        BROKER_ACTIVE_NOW=1
+    fi
+    if [ -n "$STATE_DB" ] && [ "$BROKER_ACTIVE_NOW" -eq 0 ]; then
+        if [ "$STATE_DB_EXISTED" -eq 1 ] && [ -f "$STATE_DB_BACKUP" ]; then
+            rm -f -- "$STATE_DB-wal" "$STATE_DB-shm" || true
+            cp -a -- "$STATE_DB_BACKUP" "$STATE_DB" || true
+        elif [ "$STATE_DB_EXISTED" -eq 0 ]; then
+            rm -f -- "$STATE_DB" "$STATE_DB-wal" "$STATE_DB-shm" || true
+        fi
+    elif [ -n "$STATE_DB" ]; then
+        warn "broker is still running; leaving SQLite state in place during rollback"
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=nvidia 2>/dev/null || true
+    reload_sshd
+    if [ "$BROKER_WAS_ENABLED" -eq 0 ]; then
+        systemctl disable udc-resource-broker.service 2>/dev/null || true
+    fi
+    if [ "$START" -eq 1 ] && [ "$BROKER_WAS_ACTIVE" -eq 1 ]; then
+        systemctl restart udc-resource-broker.service 2>/dev/null || true
+    fi
+    printf '[rollback] restored %s path(s); backup: %s\n' "${#BACKED_UP[@]}" "$BACKUP_DIR" >&2
+    exit "$code"
+}
+
+on_exit() {
+    local code=$?
+    if [ "$code" -ne 0 ]; then
+        rollback "$code"
+    fi
+    exit "$code"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -189,7 +306,24 @@ if [ "$CONFIG_MODE" = "active" ] && [ "$ALLOW_ACTIVE" -ne 1 ]; then
     fail "config is in active mode; pass --allow-active only after training and approval"
 fi
 if [ "$CONFIG_DEPLOYMENT_ALLOWED" = "true" ] && [ "$DRY_RUN" -eq 0 ]; then
-    warn "config has deployment_allowed=true; broker mode will still be forced to monitor"
+    warn "config has deployment_allowed=true; starting the broker still requires training completion and explicit approval"
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    if systemctl is-active --quiet udc-resource-broker.service 2>/dev/null; then
+        BROKER_WAS_ACTIVE=1
+    fi
+    if systemctl is-enabled --quiet udc-resource-broker.service 2>/dev/null; then
+        BROKER_WAS_ENABLED=1
+    fi
+    BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -p "$BACKUP_DIR" || fail "could not create backup directory: $BACKUP_DIR"
+    chmod 0700 "$BACKUP_DIR" || fail "could not secure backup directory: $BACKUP_DIR"
+    ROLLBACK_ARMED=1
+    trap on_exit EXIT
+    note "transactional backup: $BACKUP_DIR"
+else
+    note "dry-run: no rollback backup is created"
 fi
 
 note "repo: $REPO_ROOT"
@@ -258,7 +392,7 @@ run install -d -o root -g root -m 0755 "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ] && [ "$FORCE_CONFIG" -ne 1 ]; then
     note "keeping existing config: $CONFIG_FILE (use --force-config to replace)"
 else
-    run install -o root -g root -m 0644 "$CONFIG_SOURCE" "$CONFIG_FILE"
+    install_file 0644 "$CONFIG_SOURCE" "$CONFIG_FILE"
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -287,6 +421,26 @@ run install -d -o root -g root -m 0750 "$STATE_DIR"
 if [ "$DRY_RUN" -eq 1 ]; then
     note "would initialize SQLite; fresh install uses monitor, active leases keep management"
 else
+    STATE_DB=$(UDC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
+        'import os; from udc_resource.config import load_config; print(load_config(os.environ["UDC_RESOURCE_CONFIG"]).server.state_db)') \
+        || fail "could not read state_db from config"
+    if [ -f "$STATE_DB" ]; then
+        STATE_DB_EXISTED=1
+        STATE_DB_BACKUP="$BACKUP_DIR/state.db"
+        "$VENV/bin/python" - "$STATE_DB" "$STATE_DB_BACKUP" <<'PY' || fail "could not back up SQLite state"
+import sqlite3
+import sys
+
+source = sqlite3.connect(sys.argv[1])
+destination = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(destination)
+finally:
+    destination.close()
+    source.close()
+PY
+        chmod 0600 "$STATE_DB_BACKUP" || fail "could not secure SQLite backup"
+    fi
     MODE=$(umask 077; UDC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" - <<'PY'
 import os
 
@@ -310,9 +464,6 @@ connection.close()
 print(target)
 PY
     ) || fail "SQLite initialization failed"
-    STATE_DB=$(UDC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
-        'import os; from udc_resource.config import load_config; print(load_config(os.environ["UDC_RESOURCE_CONFIG"]).server.state_db)') \
-        || fail "could not read state_db from config"
     [ -f "$STATE_DB" ] || fail "state database was not created: $STATE_DB"
     chmod 0600 "$STATE_DB" || fail "could not chmod $STATE_DB"
     case "$STATE_DB" in
@@ -325,13 +476,21 @@ fi
 if [ "$DRY_RUN" -eq 0 ]; then
     have udevadm || fail "udevadm is required"
 fi
-run install -o root -g root -m 0644 "$SCRIPT_DIR/udev/99-udc-gpu.rules" "$UDEV_RULE"
+install_file 0644 "$SCRIPT_DIR/udev/99-udc-gpu.rules" "$UDEV_RULE"
+if [ "$DRY_RUN" -eq 0 ] && udevadm verify --help >/dev/null 2>&1; then
+    udevadm verify "$UDEV_RULE" || fail "udev rule validation failed"
+    ok "udev rule validated"
+fi
 run udevadm control --reload-rules
 run udevadm trigger --subsystem-match=nvidia
 ok "udev rule installed"
 
-run install -o root -g root -m 0644 \
+install_file 0644 \
     "$SCRIPT_DIR/systemd/udc-resource-broker.service" "$SYSTEMD_UNIT"
+if [ "$DRY_RUN" -eq 0 ] && have systemd-analyze; then
+    systemd-analyze verify "$SYSTEMD_UNIT" || fail "systemd unit validation failed"
+    ok "systemd unit validated"
+fi
 if [ -d /run/udc-resource ]; then
     run chmod 0711 /run/udc-resource
 fi
@@ -340,9 +499,31 @@ run systemctl enable udc-resource-broker.service
 ok "systemd unit installed and enabled"
 
 run install -d -m 0755 /usr/local/bin
+backup_file "$LOGIN_WRAPPER"
+backup_file "$CLI_LINK"
 run ln -sfn "$VENV/bin/udc-resource-login" "$LOGIN_WRAPPER"
 run ln -sfn "$VENV/bin/udc-resource" "$CLI_LINK"
 ok "CLI links installed"
+
+install_file 0755 "$SCRIPT_DIR/rotate_job_logs.py" "$ROTATE_SCRIPT"
+install_file 0644 "$SCRIPT_DIR/systemd/udc-resource-logrotate.service" "$ROTATE_UNIT"
+install_file 0644 "$SCRIPT_DIR/systemd/udc-resource-logrotate.timer" "$ROTATE_TIMER"
+install_file 0755 "$SCRIPT_DIR/check_disk.sh" "$DISK_SCRIPT"
+install_file 0644 "$SCRIPT_DIR/systemd/udc-resource-disk-check.service" "$DISK_UNIT"
+install_file 0644 "$SCRIPT_DIR/systemd/udc-resource-disk-check.timer" "$DISK_TIMER"
+if [ "$DRY_RUN" -eq 0 ] && have systemd-analyze; then
+    systemd-analyze verify "$ROTATE_UNIT" "$ROTATE_TIMER" "$DISK_UNIT" "$DISK_TIMER" \
+        || fail "log rotation/disk unit validation failed"
+fi
+if [ -e "$LEGACY_LOGROTATE" ]; then
+    backup_file "$LEGACY_LOGROTATE"
+    run rm -f -- "$LEGACY_LOGROTATE"
+    warn "removed legacy copytruncate rule: $LEGACY_LOGROTATE"
+fi
+run systemctl daemon-reload
+note "enable job-log rotation with: systemctl enable --now udc-resource-logrotate.timer"
+note "enable disk alerts with: systemctl enable --now udc-resource-disk-check.timer"
+ok "symlink-safe job-log rotation and disk-alert units installed (timers not enabled)"
 
 if [ ! -r /etc/ssh/sshd_config ]; then
     warn "/etc/ssh/sshd_config is not readable; skipping sshd drop-in"
@@ -351,7 +532,7 @@ else
         fail "sshd_config does not include /etc/ssh/sshd_config.d/*.conf"
     fi
     run install -d -m 0755 /etc/ssh/sshd_config.d
-    run install -o root -g root -m 0644 "$SCRIPT_DIR/sshd/60-udc-resource.conf" "$SSHD_DROPIN"
+    install_file 0644 "$SCRIPT_DIR/sshd/60-udc-resource.conf" "$SSHD_DROPIN"
     if [ "$DRY_RUN" -eq 0 ]; then
         SSHD_BIN=$(command -v sshd 2>/dev/null || true)
         [ -n "$SSHD_BIN" ] || SSHD_BIN=/usr/sbin/sshd
@@ -373,6 +554,7 @@ if [ "$START" -eq 1 ] && [ "$AUDIT_FAILED" -eq 1 ]; then
     fail "legacy audit failed; resolve critical findings before starting the broker"
 fi
 if [ "$START" -eq 1 ]; then
+    BROKER_START_ATTEMPTED=1
     run systemctl restart udc-resource-broker.service
     if [ "$DRY_RUN" -eq 0 ]; then
         sleep 1
@@ -385,6 +567,11 @@ else
     if [ "$DRY_RUN" -eq 0 ] && systemctl is-active --quiet udc-resource-broker.service; then
         warn "broker is already running; restart it to apply the installed files"
     fi
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    INSTALL_COMPLETE=1
+    ok "installation committed; backup retained at $BACKUP_DIR"
 fi
 
 printf '\nInstallation complete. Next steps:\n'

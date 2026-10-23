@@ -1,7 +1,9 @@
 # Local-only lab inventory and deployment state
 lab/resources.local.toml
 lab/*.local.*
+lab/members.local.toml
 !lab/resources.example.toml
+!lab/members.example.toml
 
 # Local tool configuration may contain API keys
 opencode.json

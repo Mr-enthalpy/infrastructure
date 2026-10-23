@@ -8,8 +8,8 @@ import logging
 import math
 import os
 import re
+import shutil
 import stat
-import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -38,6 +38,7 @@ from ..identity import (
     IdentityResolverProtocol,
     peer_credentials,
 )
+from ..members import load_members, public_member_data
 from ..models import GPU, Allocation
 from ..stream import (
     FRAME_DATA,
@@ -48,6 +49,7 @@ from ..stream import (
     read_frame,
     write_frame,
 )
+from . import workspace_io
 from .docker_driver import (
     ContainerInfo,
     DockerBackend,
@@ -463,35 +465,6 @@ class Broker:
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def _workspace_target(
-        self,
-        allocation: dict[str, Any],
-        raw_path: Any,
-    ) -> tuple[str, Path]:
-        if not isinstance(raw_path, str) or not raw_path:
-            raise BadRequest("path must be a non-empty relative path")
-        if raw_path == "/workspace":
-            raise BadRequest("path must name a file below /workspace")
-        if raw_path.startswith("/workspace/"):
-            raw_path = raw_path[len("/workspace/") :]
-        relative = PurePosixPath(raw_path)
-        if (
-            relative.is_absolute()
-            or not relative.parts
-            or any(part in {"", ".", ".."} for part in relative.parts)
-        ):
-            raise Forbidden("path must stay inside the allocation workspace")
-        workspace = Path(str(allocation["workspace"])).resolve()
-        candidate = workspace
-        for part in relative.parts:
-            candidate = candidate / part
-            if candidate.is_symlink():
-                raise Forbidden("refusing to transfer through a symlink")
-        target = candidate.resolve()
-        if target != workspace and workspace not in target.parents:
-            raise Forbidden("path must stay inside the allocation workspace")
-        return relative.as_posix(), target
-
     async def _handle_file(
         self,
         payload: Any,
@@ -501,6 +474,9 @@ class Broker:
         uid: int,
         gid: int,
     ) -> None:
+        upload: workspace_io.UploadHandle | None = None
+        download_fd: int | None = None
+        committed = False
         try:
             identity = self.identity_resolver.resolve(uid, gid)
             with self._connection() as connection:
@@ -515,6 +491,8 @@ class Broker:
             if command not in {"file_put", "file_get"}:
                 raise BadRequest("expected file transfer command")
             self._check_args(args, {"id", "path"})
+            if not self.config.policy.file_transfer_enabled:
+                raise Forbidden("file transfer is disabled by policy")
             allocation_id = args.get("id")
             if not isinstance(allocation_id, str) or not allocation_id:
                 raise BadRequest("id must be a non-empty string")
@@ -524,33 +502,65 @@ class Broker:
                 raise Forbidden("only the owner or an admin may transfer files")
             if allocation["status"] != "active":
                 raise Conflict(f"allocation is {allocation['status']}, not active")
-            relative, target = self._workspace_target(allocation, args.get("path"))
-            if target.is_symlink():
-                raise Forbidden("refusing to transfer through a symlink")
-            if command == "file_get" and not target.is_file():
-                raise NotFound(f"file not found: {relative}")
-            if command == "file_put" and target.exists() and target.is_dir():
-                raise Conflict(f"target is a directory: {relative}")
+            parts = workspace_io.relative_parts(args.get("path"))
+            relative = PurePosixPath(*parts).as_posix()
+            workspace = str(allocation["workspace"])
+            if not workspace_io.supported():
+                raise InternalError("descriptor-relative file access is unavailable")
+            if command == "file_get":
+                download_fd = await asyncio.to_thread(
+                    workspace_io.open_read_file,
+                    workspace,
+                    parts,
+                )
+            else:
+                owner_uid, owner_gid = self._allocation_owner_ids(allocation)
+                upload = await asyncio.to_thread(
+                    workspace_io.open_upload,
+                    workspace,
+                    parts,
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                )
         except (KeyError, RuntimeError) as exc:
+            if upload is not None:
+                upload.abort()
+            if download_fd is not None:
+                os.close(download_fd)
             await self._send(writer, _error("forbidden", f"peer identity failed: {exc}"))
             return
         except UdcError as exc:
+            if upload is not None:
+                upload.abort()
+            if download_fd is not None:
+                os.close(download_fd)
             await self._send(writer, _error(exc.code, exc.message))
             return
         except Exception:
+            if upload is not None:
+                upload.abort()
+            if download_fd is not None:
+                os.close(download_fd)
             logger.exception("could not prepare file transfer")
             await self._send(writer, _error("internal", "could not prepare file transfer"))
             return
 
-        await self._send(
-            writer,
-            _ok({"id": allocation_id, "path": relative}),
-        )
+        try:
+            await self._send(
+                writer,
+                _ok({"id": allocation_id, "path": relative}),
+            )
+        except Exception:
+            if upload is not None:
+                upload.abort()
+            if download_fd is not None:
+                os.close(download_fd)
+            raise
         if command == "file_get":
             try:
-                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(target, flags)
-                with os.fdopen(fd, "rb") as handle:
+                assert download_fd is not None
+                with os.fdopen(download_fd, "rb") as handle:
+                    download_fd = None
                     while chunk := handle.read(65536):
                         await write_frame(writer, FRAME_DATA, chunk)
                 await write_frame(
@@ -590,33 +600,39 @@ class Broker:
                     )
                 except Exception:
                     pass
+            finally:
+                if download_fd is not None:
+                    os.close(download_fd)
             return
 
         written = 0
-        temp: Path | None = None
+        assert upload is not None
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(
-                prefix=".udc-upload-",
-                dir=str(target.parent),
-            )
-            temp = Path(temp_name)
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                while True:
-                    frame = await read_frame(reader)
-                    if frame is None:
-                        raise BadRequest("file upload ended without an exit frame")
-                    kind, data = frame
-                    if kind == FRAME_DATA:
-                        handle.write(data)
-                        written += len(data)
-                    elif kind == FRAME_EXIT:
-                        break
-                    else:
-                        raise BadRequest("unexpected file transfer frame")
-            os.replace(temp, target)
-            temp = None
+            while True:
+                frame = await read_frame(reader)
+                if frame is None:
+                    raise BadRequest("file upload ended without an exit frame")
+                kind, data = frame
+                if kind == FRAME_DATA:
+                    if written + len(data) > self.config.policy.max_upload_bytes:
+                        raise BadRequest(
+                            "upload exceeds policy.max_upload_bytes "
+                            f"({self.config.policy.max_upload_bytes})"
+                        )
+                    view = memoryview(data)
+                    while view:
+                        piece = view[:65536]
+                        count = os.write(upload.fd, piece)
+                        if count <= 0:
+                            raise InternalError("short write while uploading")
+                        written += count
+                        view = view[count:]
+                elif kind == FRAME_EXIT:
+                    break
+                else:
+                    raise BadRequest("unexpected file transfer frame")
+            upload.commit()
+            committed = True
             with self._connection() as connection:
                 store.record_event(
                     connection,
@@ -639,20 +655,24 @@ class Broker:
                 ).encode("utf-8"),
             )
         except Exception as exc:
-            if temp is not None:
-                temp.unlink(missing_ok=True)
+            if not committed:
+                upload.abort()
             logger.exception("file put failed")
-            await write_frame(
-                writer,
-                FRAME_EXIT,
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": {"code": "internal", "message": str(exc)},
-                    },
-                    sort_keys=True,
-                ).encode("utf-8"),
-            )
+            error = exc if isinstance(exc, UdcError) else InternalError(str(exc))
+            try:
+                await write_frame(
+                    writer,
+                    FRAME_EXIT,
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": {"code": error.code, "message": error.message},
+                        },
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+            except Exception:
+                pass
 
     async def _handle_shell(
         self,
@@ -919,7 +939,7 @@ class Broker:
                     now=now,
                 )
             }
-        return {
+        data: dict[str, Any] = {
             "server": self.config.server.name,
             "mode": self._mode,
             "now": now.isoformat(),
@@ -928,6 +948,55 @@ class Broker:
             "allocations": allocations,
             "unmanaged": self._unmanaged(db_gpus, active_ids, live),
         }
+        self._add_member_identity(data)
+        return data
+
+    def _load_member_directory(self) -> dict[str, Any]:
+        try:
+            return load_members(self.config.server.members_file)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "could not load member directory %s: %s",
+                self.config.server.members_file,
+                exc,
+            )
+            return {}
+
+    def _add_member_identity(self, data: dict[str, Any]) -> None:
+        members = self._load_member_directory()
+        if not members:
+            return
+        public = {username: public_member_data(members, username) for username in members}
+        data["members"] = public
+
+        def enrich(
+            item: dict[str, Any],
+            username: Any,
+            *,
+            prefix: str = "owner",
+        ) -> None:
+            if not isinstance(username, str):
+                return
+            profile = public.get(username)
+            if not profile:
+                return
+            if profile.get("display_name"):
+                item[f"{prefix}_display"] = profile["display_name"]
+            if profile.get("nickname"):
+                item[f"{prefix}_nickname"] = profile["nickname"]
+            if profile.get("public_contact"):
+                item[f"{prefix}_public_contact"] = profile["public_contact"]
+
+        for allocation in data.get("allocations", []):
+            enrich(allocation, allocation.get("owner"))
+        for gpu in data.get("gpus", []):
+            enrich(gpu, gpu.get("owner"))
+        unmanaged = data.get("unmanaged") or {}
+        for container in unmanaged.get("containers", []):
+            enrich(container, container.get("owner"))
+        for process in unmanaged.get("processes", []):
+            enrich(process, process.get("username"))
+            enrich(process, process.get("container_owner"), prefix="container_owner")
 
     def _unmanaged(
         self,
@@ -1095,8 +1164,22 @@ class Broker:
             gpu_uuids = [str(row["uuid"]) for row in gpu_rows]
         else:
             gpu_uuids = []
+        if self.config.policy.min_free_gb:
+            disk_path = Path(self.config.server.workspace_root)
+            while not disk_path.exists() and disk_path != disk_path.parent:
+                disk_path = disk_path.parent
+            try:
+                usage = shutil.disk_usage(disk_path)
+            except OSError as exc:
+                raise InternalError(f"could not inspect workspace disk: {exc}") from exc
+            free_gb = usage.free // (1024**3)
+            if free_gb < self.config.policy.min_free_gb:
+                raise InsufficientResources(
+                    f"workspace disk has only {free_gb} GiB free; "
+                    f"policy.min_free_gb is {self.config.policy.min_free_gb}"
+                )
         try:
-            await asyncio.to_thread(self._ensure_workspace, workspace)
+            await asyncio.to_thread(self._ensure_workspace, workspace, identity)
         except UdcError:
             raise
         except Exception as exc:
@@ -1238,26 +1321,36 @@ class Broker:
             raise NotFound("allocation has no container")
         return allocation
 
-    def _job_log_path(self, allocation: dict[str, Any], name: str) -> Path:
-        workspace = Path(str(allocation["workspace"]))
-        path = workspace / ".udc-logs" / f"{name}.log"
-        try:
-            path.resolve().relative_to(workspace.resolve())
-        except ValueError as exc:
-            raise Forbidden("job log path escapes the workspace") from exc
-        return path
+    @staticmethod
+    def _job_log_path(allocation: dict[str, Any], name: str) -> Path:
+        # Display path only.  Reads and writes use workspace_io so this path
+        # cannot become a check/use race.
+        return Path(str(allocation["workspace"])) / ".udc-logs" / f"{name}.log"
 
     @staticmethod
-    def _tail_file(path: Path, tail: int) -> str:
-        if tail <= 0:
-            return ""
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - 2 * 1024 * 1024))
-            data = handle.read()
-        lines = data.decode("utf-8", errors="replace").splitlines(keepends=True)
-        return "".join(lines[-tail:])
+    def _allocation_owner_ids(allocation: dict[str, Any]) -> tuple[int, int]:
+        owner_uid = int(allocation["owner_uid"])
+        owner_gid = owner_uid
+        if os.name == "posix":
+            try:
+                import pwd
+
+                owner_gid = pwd.getpwuid(owner_uid).pw_gid
+            except (ImportError, KeyError):
+                pass
+        return owner_uid, owner_gid
+
+    @staticmethod
+    def _ensure_job_log(allocation: dict[str, Any], name: str) -> None:
+        if not workspace_io.supported():
+            raise InternalError("descriptor-relative job-log access is unavailable")
+        owner_uid, owner_gid = Broker._allocation_owner_ids(allocation)
+        workspace_io.ensure_job_log(
+            str(allocation["workspace"]),
+            name,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
 
     async def _job_start(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
         allocation = self._job_allocation(identity, args)
@@ -1271,6 +1364,7 @@ class Broker:
             raise BadRequest("command must be a non-empty list of strings")
         container_id = str(allocation["container_id"])
         log_path = self._job_log_path(allocation, name)
+        await asyncio.to_thread(self._ensure_job_log, allocation, name)
         await asyncio.to_thread(self.docker.start_job, container_id, name, command)
         with self._connection() as connection:
             store.record_event(
@@ -1295,10 +1389,18 @@ class Broker:
         jobs = await asyncio.to_thread(self.docker.list_jobs, container_id)
         enriched: list[dict[str, Any]] = []
         for job in jobs:
-            path = self._job_log_path(allocation, str(job["name"]))
+            name = str(job["name"])
+            path = self._job_log_path(allocation, name)
             item: dict[str, Any] = dict(job)
             item["log"] = str(path)
-            item["log_bytes"] = path.stat().st_size if path.is_file() else 0
+            if not workspace_io.supported():
+                raise InternalError("descriptor-relative job-log access is unavailable")
+            size = await asyncio.to_thread(
+                workspace_io.regular_file_size,
+                str(allocation["workspace"]),
+                (".udc-logs", f"{name}.log"),
+            )
+            item["log_bytes"] = size or 0
             enriched.append(item)
         return {"id": allocation["id"], "jobs": enriched}
 
@@ -1309,9 +1411,14 @@ class Broker:
         if tail > 10000:
             raise BadRequest("tail must not exceed 10000")
         path = self._job_log_path(allocation, name)
-        if not path.is_file():
-            raise NotFound(f"job log not found: {name}")
-        content = await asyncio.to_thread(self._tail_file, path, tail)
+        if not workspace_io.supported():
+            raise InternalError("descriptor-relative job-log access is unavailable")
+        content = await asyncio.to_thread(
+            workspace_io.tail_file,
+            str(allocation["workspace"]),
+            (".udc-logs", f"{name}.log"),
+            tail,
+        )
         return {
             "id": allocation["id"],
             "name": name,
@@ -1357,14 +1464,12 @@ class Broker:
             "logs": content,
         }
 
-    def _ensure_workspace(self, path: str) -> None:
-        workspace = Path(path)
-        if workspace.is_symlink():
-            raise Forbidden(f"workspace path is a symlink: {workspace}")
-        workspace.mkdir(parents=True, exist_ok=True)
-        if not workspace.is_dir():
-            raise Forbidden(f"workspace path is not a directory: {workspace}")
-        workspace.chmod(0o700)
+    def _ensure_workspace(self, path: str, identity: Identity) -> None:
+        workspace_io.ensure_workspace(
+            path,
+            owner_uid=identity.uid,
+            owner_gid=identity.gid,
+        )
 
     def _admin_users(self) -> dict[str, Any]:
         with self._connection() as connection:

@@ -9,6 +9,7 @@ data_root = "/data1"
 workspace_root = "/data1/udc-users"
 broker_socket = "/run/udc-resource/broker.sock"
 state_db = "/var/lib/udc-resource/state.db"
+members_file = "/etc/udc-resource/members.toml"
 
 [hardware]
 gpu_count = 8
@@ -30,6 +31,14 @@ reserve_cpus = 8
 reserve_memory_gb = 32
 max_gpus_per_user = 4
 max_active_allocations_per_user = 4
+file_transfer_enabled = false
+max_upload_bytes = 21474836480
+min_free_gb = 50
+max_workspace_gb = 0
+pids_limit = 4096
+container_user = "member"
+container_read_only = true
+userns_mode = ""
 
 [groups]
 members = "udc-members"

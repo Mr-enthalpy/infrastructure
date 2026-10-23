@@ -1,7 +1,9 @@
 # Long-running jobs and restricted file transfer
 
 Both features are available through the member CLI and the broker socket. They
-do not expose a host shell, Docker socket, SFTP, or SCP.
+do not expose a host shell, Docker socket, SFTP, or SCP. File transfer is
+disabled by default (`policy.file_transfer_enabled = false`); enable it only
+after the TOCTOU, quota, and target-host tests in the acceptance checklist pass.
 
 ## Prerequisites
 
@@ -42,13 +44,17 @@ remains readable in its log even though it no longer appears in `job list`.
 
 Notes:
 
-- Jobs run as root inside the allocation container, with access to the
-  allocation's GPU devices.
+- Jobs run as the configured `policy.container_user` (default `member`, mapped
+  to the allocation owner's host UID/GID), with access to the allocation's GPU
+  devices. Workspace files and `.udc-logs` are owned by that member.
 - `job stop` kills the tmux session and its process. Prefer application-level
   checkpointing; stopping a training process is not graceful.
 - `docker logs` only shows the container entrypoint. Use `job logs` for job
   output.
 - The broker records `job_started`/`job_stopped` audit events.
+- Job logs are rotated by `deploy/rotate_job_logs.py`, which opens every
+  directory with `O_NOFOLLOW` and refuses symlinks. Do not use a generic
+  `copytruncate` logrotate rule for the member-writable `.udc-logs` directory.
 
 ## Restricted file transfer
 
@@ -69,8 +75,12 @@ udc-resource pull <allocation-id> /workspace/checkpoints/best.pt ./best.pt
 The third argument is a path relative to the workspace. A leading `/workspace/`
 is accepted for convenience and normalized to a relative path. Uploads
 overwrite an existing regular file atomically; uploads use a unique temporary
-file and `0600` permissions. Directories, symlinks, and recursive transfers are
-not supported. Use a tar archive for directory trees.
+file and `0600` permissions. Uploads are limited by
+`policy.max_upload_bytes` (default 20 GiB). Directories, symlinks, FIFOs,
+devices, and recursive transfers are not supported. Use a tar archive for
+directory trees. Apply a filesystem project quota to each member workspace
+before enabling uploads; the broker's byte limit is not a replacement for a
+host quota because a member can also write through the mounted workspace.
 
 The remote-side primitives are also available for diagnostics:
 

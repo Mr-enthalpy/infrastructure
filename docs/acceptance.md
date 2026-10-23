@@ -11,6 +11,8 @@ The script refuses to run without:
 - `--allow-test-container`
 - `--allow-db-time-travel`
 - two distinct SSH aliases for member accounts
+- public member-directory entries for the supplied local member usernames
+- `policy.file_transfer_enabled = true` only after quotas and TOCTOU tests pass
 - an explicit `--gpu` index that is currently `free`
 - an empty active/pending allocation set
 - a passing legacy access audit
@@ -51,6 +53,9 @@ container on exit. It does not delete workspaces or other users' containers.
    - if local users are supplied, direct `docker ps`, `nvidia-smi`, and read/write
      access to every `/dev/nvidia*` node fail for those accounts;
      `verify_gpu_permissions.sh` checks all eight visible GPUs.
+   - `list` exposes only the public member-directory fields (`display_name`,
+     `nickname`, `public_contact`), and each supplied local member has a
+     profile. Private contact fields must not appear in the response.
 
 2. **Concurrent same-GPU apply**
    - two members apply for the same test GPU at the same time;

@@ -1,0 +1,14 @@
+[Unit]
+Description=Rotate UDC per-allocation job logs safely
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/udc-rotate-job-logs --workspace-root /data1/udc-users --max-bytes 104857600 --keep 3
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data1/udc-users

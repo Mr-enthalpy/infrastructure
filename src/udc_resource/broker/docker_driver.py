@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -331,6 +332,29 @@ class DockerDriver:
         except DockerException as exc:
             raise DockerError(f"cannot inspect container {container_id}: {exc}") from exc
 
+    def _container_user(self, allocation: Allocation) -> str:
+        if self.config.policy.container_user == "root":
+            return "0:0"
+        if os.name != "posix":
+            return "0:0"
+        try:
+            import pwd
+
+            gid = pwd.getpwuid(allocation.owner_uid).pw_gid
+        except (ImportError, KeyError):
+            gid = allocation.owner_uid
+        return f"{allocation.owner_uid}:{gid}"
+
+    def _gpu_group_id(self) -> int | None:
+        if self.config.policy.container_user != "member" or os.name != "posix":
+            return None
+        try:
+            import grp
+
+            return grp.getgrnam(self.config.groups.gpu).gr_gid
+        except (ImportError, KeyError):
+            return None
+
     def create_container(self, allocation: Allocation) -> ContainerRef:
         labels = {
             LABEL_MANAGED: "true",
@@ -339,6 +363,7 @@ class DockerDriver:
             LABEL_GPUS: ",".join(allocation.gpus),
         }
         name = f"udc-{allocation.owner_name}-{allocation.id[:12]}"
+        container_user = self._container_user(allocation)
         kwargs: dict[str, Any] = {
             "command": ["sleep", "infinity"],
             "detach": True,
@@ -347,6 +372,7 @@ class DockerDriver:
             "nano_cpus": int(allocation.cpus * 1_000_000_000),
             "mem_limit": f"{allocation.memory_gb}g",
             "memswap_limit": f"{allocation.memory_gb}g",
+            "pids_limit": self.config.policy.pids_limit,
             "volumes": {
                 allocation.workspace: {
                     "bind": "/workspace",
@@ -354,13 +380,26 @@ class DockerDriver:
                 }
             },
             "working_dir": "/workspace",
-            "environment": {"NVIDIA_DRIVER_CAPABILITIES": "compute,utility"},
+            "environment": {
+                "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+                "HOME": "/workspace",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
             "security_opt": ["no-new-privileges"],
+            "cap_drop": ["ALL"],
+            "read_only": self.config.policy.container_read_only,
+            "tmpfs": {
+                "/tmp": "rw,nosuid,nodev,size=1g",
+                "/run": "rw,nosuid,nodev,size=64m",
+                "/var/tmp": "rw,nosuid,nodev,size=256m",
+            },
             "init": True,
             "privileged": False,
             "network_mode": "bridge",
-            "user": "0:0",
+            "user": container_user,
         }
+        if self.config.policy.userns_mode:
+            kwargs["userns_mode"] = self.config.policy.userns_mode
         if allocation.gpus:
             kwargs["device_requests"] = [
                 docker.types.DeviceRequest(
@@ -368,6 +407,9 @@ class DockerDriver:
                     capabilities=[["gpu"]],
                 )
             ]
+            gpu_group = self._gpu_group_id()
+            if container_user != "0:0" and gpu_group is not None:
+                kwargs["group_add"] = [str(gpu_group)]
         try:
             container = self.client.containers.run(allocation.image, **kwargs)
         except DockerException as exc:
@@ -413,7 +455,6 @@ class DockerDriver:
                 stderr=True,
                 tty=True,
                 workdir="/workspace",
-                user="0",
             )["Id"]
             sock = self.client.api.exec_start(exec_id, tty=True, socket=True)
             self.client.api.exec_resize(exec_id, height=rows, width=cols)

@@ -3,6 +3,8 @@ import getpass
 import json
 import os
 import socket
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -175,9 +177,8 @@ async def test_uds_file_transfer_stays_in_workspace(tmp_path, active_config):
         result = json.loads(payload)
         assert result["ok"] is True
         assert result["data"]["bytes"] == 11
-        uploaded = (
-            active_config.server.workspace_root / identity.username / "checkpoints" / "model.bin"
-        )
+        workspace = Path(str(applied["data"]["workspace"]))
+        uploaded = workspace / "checkpoints" / "model.bin"
         assert uploaded.read_bytes() == b"hello world"
         writer.close()
         await writer.wait_closed()
@@ -218,6 +219,66 @@ async def test_uds_file_transfer_stays_in_workspace(tmp_path, active_config):
         assert handshake["ok"] is False
         assert handshake["error"]["code"] == "forbidden"
 
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await broker.stop()
+
+
+async def test_uds_upload_limit_aborts_without_partial_file(tmp_path, active_config):
+    uid = os.getuid()
+    gid = os.getgid()
+    identity = Identity(
+        uid=uid,
+        gid=gid,
+        username=getpass.getuser(),
+        role="member",
+        is_admin=False,
+    )
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, max_upload_bytes=5),
+    )
+    socket_path = tmp_path / "broker.sock"
+    broker = Broker(
+        config,
+        db_path=tmp_path / "state.db",
+        socket_path=socket_path,
+        docker=FakeDocker(),
+        identity_resolver=FakeIdentityResolver({uid: identity}),
+    )
+    await broker.start()
+    try:
+        applied = await broker.handle_request(
+            {
+                "cmd": "apply",
+                "args": {"gpus": [0], "cpus": 2, "memory_gb": 4, "hours": 1},
+            },
+            uid=uid,
+            gid=gid,
+        )
+        allocation_id = applied["data"]["id"]
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(
+            json.dumps(
+                {
+                    "cmd": "file_put",
+                    "args": {"id": allocation_id, "path": "too-large.bin"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        handshake = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert handshake["ok"] is True
+        await write_frame(writer, FRAME_DATA, b"123456")
+        await write_frame(writer, FRAME_EXIT, b"{}")
+        kind, payload = await asyncio.wait_for(read_frame(reader), timeout=5)
+        assert kind == FRAME_EXIT
+        result = json.loads(payload)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "bad_request"
+        assert not (Path(applied["data"]["workspace"]) / "too-large.bin").exists()
         writer.close()
         await writer.wait_closed()
     finally:

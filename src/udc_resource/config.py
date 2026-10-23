@@ -20,6 +20,7 @@ class ServerConfig:
     workspace_root: str = "/data1/udc-users"
     broker_socket: str = "/run/udc-resource/broker.sock"
     state_db: str = "/var/lib/udc-resource/state.db"
+    members_file: str = "/etc/udc-resource/members.toml"
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,14 @@ class PolicyConfig:
     reserve_memory_gb: int = 32
     max_gpus_per_user: int = 4
     max_active_allocations_per_user: int = 4
+    file_transfer_enabled: bool = False
+    max_upload_bytes: int = 20 * 1024 * 1024 * 1024
+    min_free_gb: int = 0
+    max_workspace_gb: int = 0
+    pids_limit: int = 4096
+    container_user: str = "member"
+    container_read_only: bool = True
+    userns_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -119,6 +128,7 @@ def load_config(path: str | Path) -> LabConfig:
         workspace_root=str(server_raw.get("workspace_root", "/data1/udc-users")),
         broker_socket=str(server_raw.get("broker_socket", "/run/udc-resource/broker.sock")),
         state_db=str(server_raw.get("state_db", "/var/lib/udc-resource/state.db")),
+        members_file=str(server_raw.get("members_file", "/etc/udc-resource/members.toml")),
     )
     hardware = HardwareConfig(
         gpu_count=int(_require(hardware_raw, "gpu_count", "hardware")),
@@ -146,6 +156,14 @@ def load_config(path: str | Path) -> LabConfig:
         reserve_memory_gb=int(policy_raw.get("reserve_memory_gb", 32)),
         max_gpus_per_user=int(policy_raw.get("max_gpus_per_user", 4)),
         max_active_allocations_per_user=int(policy_raw.get("max_active_allocations_per_user", 4)),
+        file_transfer_enabled=bool(policy_raw.get("file_transfer_enabled", False)),
+        max_upload_bytes=int(policy_raw.get("max_upload_bytes", 20 * 1024 * 1024 * 1024)),
+        min_free_gb=int(policy_raw.get("min_free_gb", 0)),
+        max_workspace_gb=int(policy_raw.get("max_workspace_gb", 0)),
+        pids_limit=int(policy_raw.get("pids_limit", 4096)),
+        container_user=str(policy_raw.get("container_user", "member")),
+        container_read_only=bool(policy_raw.get("container_read_only", True)),
+        userns_mode=str(policy_raw.get("userns_mode", "")),
     )
     if not 1 <= policy.default_hours <= policy.max_hours:
         raise ValueError("default_hours must be between 1 and max_hours")
@@ -161,6 +179,16 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("policy reserves must not be negative")
     if policy.max_gpus_per_user <= 0 or policy.max_active_allocations_per_user <= 0:
         raise ValueError("policy per-user limits must be positive")
+    if policy.max_upload_bytes <= 0:
+        raise ValueError("policy.max_upload_bytes must be positive")
+    if policy.min_free_gb < 0 or policy.max_workspace_gb < 0:
+        raise ValueError("policy disk limits must not be negative")
+    if policy.pids_limit <= 0:
+        raise ValueError("policy.pids_limit must be positive")
+    if policy.container_user not in {"root", "member"}:
+        raise ValueError("policy.container_user must be root or member")
+    if policy.userns_mode not in {"", "host"}:
+        raise ValueError("policy.userns_mode must be empty or host")
     if policy.max_cpus + policy.reserve_cpus > hardware.cpu_logical:
         raise ValueError("max_cpus + reserve_cpus exceeds hardware.cpu_logical")
     if policy.max_memory_gb + policy.reserve_memory_gb > hardware.ram_gib:

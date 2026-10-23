@@ -1,3 +1,6 @@
+import asyncio
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -5,10 +8,10 @@ import pytest
 
 from tests.fakes import FakeDocker, FakeIdentityResolver
 from udc_resource import store
+from udc_resource.broker import workspace_io
 from udc_resource.broker.docker_driver import ContainerInfo, GPUProcess
 from udc_resource.broker.server import Broker
 from udc_resource.db import connect, init_db
-from udc_resource.errors import Forbidden
 from udc_resource.identity import Identity
 from udc_resource.models import GPU
 
@@ -799,6 +802,79 @@ async def test_unmanaged_process_reports_owner(tmp_path, active_config):
     assert process["username"] == "bob"
 
 
+async def test_file_transfer_is_disabled_by_default(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, file_transfer_enabled=False),
+    )
+    broker, _ = _broker(tmp_path, config)
+
+    class Writer:
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.data.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+    writer = Writer()
+    await broker._handle_file(
+        {"cmd": "file_put", "args": {"id": "missing", "path": "data.bin"}},
+        reader=asyncio.StreamReader(),
+        writer=writer,  # type: ignore[arg-type]
+        uid=ALICE.uid,
+        gid=ALICE.gid,
+    )
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert response["error"]["code"] == "forbidden"
+    assert "disabled" in response["error"]["message"]
+
+
+async def test_list_enriches_public_member_identity_and_note(tmp_path, active_config):
+    members = tmp_path / "members.toml"
+    members.write_text(
+        """
+[members.alice]
+display_name = "Alice Zhang"
+nickname = "alice"
+public_contact = "alice@example.invalid"
+private_phone = "+1-555-0100"
+""",
+        encoding="utf-8",
+    )
+    config = replace(
+        active_config,
+        server=replace(active_config.server, members_file=str(members)),
+    )
+    broker, _ = _broker(tmp_path, config)
+    applied = await _call(
+        broker,
+        "apply",
+        {"gpus": [0], "cpus": 4, "memory_gb": 8, "note": "needs the large model"},
+        ALICE,
+    )
+    assert applied["ok"] is True
+    listed = await _call(broker, "list", {}, ALICE)
+    allocation = next(
+        item for item in listed["data"]["allocations"] if item["id"] == applied["data"]["id"]
+    )
+    assert allocation["note"] == "needs the large model"
+    assert allocation["owner_display"] == "Alice Zhang"
+    assert allocation["owner_nickname"] == "alice"
+    assert allocation["owner_public_contact"] == "alice@example.invalid"
+    assert allocation["owner"] == "alice"
+    assert "private_phone" not in json.dumps(listed["data"])
+    assert listed["data"]["members"]["alice"]["display_name"] == "Alice Zhang"
+
+
+@pytest.mark.linux
+@pytest.mark.skipif(
+    not workspace_io.supported(),
+    reason="descriptor-relative job logs require Linux",
+)
 async def test_job_lifecycle(tmp_path, active_config):
     fake = FakeDocker()
     broker, _ = _broker(tmp_path, active_config, docker=fake)
@@ -832,24 +908,3 @@ async def test_job_lifecycle(tmp_path, active_config):
     stopped = await _call(broker, "job_stop", {"id": allocation_id, "name": "train"}, ALICE)
     assert stopped["ok"] is True
     assert "train" not in fake.jobs[container_id]
-
-
-async def test_workspace_target_normalizes_workspace_and_rejects_symlinks(tmp_path, active_config):
-    broker, _ = _broker(tmp_path, active_config)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    real = workspace / "real.bin"
-    real.write_bytes(b"data")
-    try:
-        (workspace / "link.bin").symlink_to(real)
-    except OSError:
-        pytest.skip("symlinks are not available in this environment")
-    relative, target = broker._workspace_target(
-        {"workspace": str(workspace)}, "/workspace/real.bin"
-    )
-    assert relative == "real.bin"
-    assert target == real
-    with pytest.raises(Forbidden):
-        broker._workspace_target({"workspace": str(workspace)}, "link.bin")
-    with pytest.raises(Forbidden):
-        broker._workspace_target({"workspace": str(workspace)}, "../real.bin")

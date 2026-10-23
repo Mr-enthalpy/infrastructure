@@ -20,6 +20,12 @@ def test_example_config_is_valid():
     assert cfg.policy.reserve_memory_gb == 32
     assert cfg.policy.max_gpus_per_user == 4
     assert cfg.policy.max_active_allocations_per_user == 4
+    assert cfg.policy.file_transfer_enabled is False
+    assert cfg.policy.max_upload_bytes == 21474836480
+    assert cfg.policy.pids_limit == 4096
+    assert cfg.policy.container_user == "member"
+    assert cfg.policy.container_read_only is True
+    assert cfg.server.members_file.endswith("members.toml")
 
 
 def test_invalid_duration_is_rejected(tmp_path):

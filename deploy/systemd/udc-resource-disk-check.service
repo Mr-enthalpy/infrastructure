@@ -1,0 +1,11 @@
+[Unit]
+Description=Check UDC workspace free disk space
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/udc-check-disk --path /data1/udc-users --warn-percent 85 --crit-percent 95 --min-free-gb 50
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/data1/udc-users

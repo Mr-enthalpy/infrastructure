@@ -207,6 +207,31 @@ class Acceptance:
             )
         print("[pass] real SSH: CLI works; arbitrary commands denied; socket parent 711")
 
+    def test_public_member_directory(self) -> None:
+        data = require_ok(ssh_cli(self.member_a, ["list"]), "public member directory")
+        members = data.get("members")
+        if not members:
+            print("[warn] no public member directory is configured")
+            return
+        allowed = {"display_name", "nickname", "public_contact"}
+        if not isinstance(members, dict):
+            raise AcceptanceError("members field is not an object")
+        for username, profile in members.items():
+            if not isinstance(profile, dict):
+                raise AcceptanceError(f"member profile is not an object: {username}")
+            unexpected = set(profile) - allowed
+            if unexpected:
+                raise AcceptanceError(
+                    f"member {username} exposes unsupported fields: {sorted(unexpected)}"
+                )
+        for username in (self.member_a_user, self.member_b_user):
+            if username and username not in members:
+                raise AcceptanceError(
+                    f"member directory has no public profile for {username}; "
+                    "add it to server.members_file before acceptance"
+                )
+        print("[pass] public member directory exposes only display/contact fields")
+
     def test_concurrent_apply(self) -> None:
         gpu = self.require_free_gpu()
         args = [
@@ -733,6 +758,7 @@ class Acceptance:
                 + ", ".join(str(item.get("id")) for item in existing)
             )
         self.test_real_ssh()
+        self.test_public_member_directory()
         self.test_concurrent_apply()
         self.test_unmanaged_gpu_holder()
         self.test_expiry_restart_disconnect()

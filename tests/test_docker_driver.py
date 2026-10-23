@@ -126,7 +126,13 @@ def test_create_container_uses_expected_isolation(monkeypatch, active_config, tm
     assert kwargs["privileged"] is False
     assert kwargs["network_mode"] == "bridge"
     assert kwargs["security_opt"] == ["no-new-privileges"]
-    assert kwargs["user"] == "0:0"
+    assert kwargs["pids_limit"] == active_config.policy.pids_limit
+    assert kwargs["cap_drop"] == ["ALL"]
+    assert kwargs["read_only"] is True
+    assert kwargs["tmpfs"]["/tmp"].startswith("rw,nosuid,nodev")
+    assert kwargs["environment"]["HOME"] == "/workspace"
+    assert kwargs["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert kwargs["user"]
     device_request = kwargs["device_requests"][0]
     assert device_request.device_ids == ["GPU-3", "GPU-5"]
     assert device_request.capabilities == [["gpu"]]
@@ -166,6 +172,34 @@ def test_nvidia_smi_failure_is_docker_error(monkeypatch, active_config):
     driver = DockerDriver(active_config)
     with pytest.raises(DockerError):
         driver.list_gpus()
+
+
+def test_create_container_supports_root_and_userns(active_config, tmp_path):
+    policy = replace(
+        active_config.policy,
+        container_user="root",
+        userns_mode="host",
+    )
+    config = replace(active_config, policy=policy)
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    driver.create_container(_allocation(tmp_path))
+    kwargs = fake_client.containers.run_kwargs
+    assert kwargs["user"] == "0:0"
+    assert kwargs["userns_mode"] == "host"
+
+
+def test_member_container_adds_gpu_group(monkeypatch, active_config, tmp_path):
+    driver = DockerDriver(active_config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    monkeypatch.setattr(driver, "_container_user", lambda allocation: "1000:1000")
+    monkeypatch.setattr(driver, "_gpu_group_id", lambda: 12345)
+    driver.create_container(_allocation(tmp_path))
+    kwargs = fake_client.containers.run_kwargs
+    assert kwargs["user"] == "1000:1000"
+    assert kwargs["group_add"] == ["12345"]
 
 
 def test_create_cpu_only_container_omits_device_requests(active_config, tmp_path):
@@ -231,6 +265,7 @@ def test_open_shell_uses_docker_exec(active_config):
     session.close()
     assert client.api.create_kwargs["tty"] is True
     assert client.api.create_kwargs["cmd"] == ["/bin/bash", "-l"]
+    assert "user" not in client.api.create_kwargs
     assert client.api.sock.sent == b"ls\n"
     assert client.api.resizes == [(30, 100), (40, 120)]
     assert client.api.sock.closed is True

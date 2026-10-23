@@ -62,6 +62,7 @@ getent passwd "$MEMBER" >/dev/null 2>&1 || { printf '[fail] unknown member: %s\n
 have nvidia-smi || { printf '[fail] nvidia-smi not found\n'; exit 1; }
 have stat || { printf '[fail] stat not found\n'; exit 1; }
 have su || { printf '[fail] su not found\n'; exit 1; }
+have udevadm || { printf '[fail] udevadm not found; cannot verify the nvidia subsystem\n'; exit 1; }
 
 member_run() {
     su -s /bin/bash "$MEMBER" -c "$1"
@@ -69,14 +70,9 @@ member_run() {
 
 section "member"
 MEMBER_GROUPS=$(id -nG "$MEMBER")
-if printf '%s\n' "$MEMBER_GROUPS" | tr ' ' '\n' | grep -qx udc-gpu; then
-    fail "$MEMBER is in udc-gpu"
-else
-    ok "$MEMBER is not in udc-gpu"
-fi
-for forbidden in docker sudo; do
+for forbidden in udc-gpu docker sudo video render udc-admins; do
     if printf '%s\n' "$MEMBER_GROUPS" | tr ' ' '\n' | grep -qx "$forbidden"; then
-        fail "$MEMBER is in $forbidden"
+        fail "$MEMBER is in forbidden group $forbidden"
     else
         ok "$MEMBER is not in $forbidden"
     fi
@@ -100,6 +96,14 @@ for index in $(seq 0 $((EXPECTED_GPUS - 1))); do
         fail "GPU index missing: $index"
     fi
 done
+
+section "GPU group membership"
+GPU_MEMBERS=$(getent group udc-gpu 2>/dev/null | awk -F: '{print $4}')
+if [ -n "$GPU_MEMBERS" ]; then
+    fail "udc-gpu still contains members: $GPU_MEMBERS"
+else
+    ok "udc-gpu has no members"
+fi
 
 section "NVIDIA device nodes"
 mapfile -t DEVICES < <(find /dev -maxdepth 2 -name 'nvidia*' -type c -print 2>/dev/null | sort)
@@ -134,6 +138,22 @@ for device in "${DEVICES[@]}"; do
         ok "$device permissions: $meta"
     else
         fail "$device permissions are $meta (expected 660 root:udc-gpu)"
+    fi
+    subsystem=$(udevadm info --query=property --name="$device" 2>/dev/null | sed -n 's/^SUBSYSTEM=//p')
+    if [ "$subsystem" = "nvidia" ]; then
+        ok "$device udev subsystem: nvidia"
+    else
+        fail "$device udev subsystem is '${subsystem:-unknown}', expected nvidia"
+    fi
+    if have getfacl; then
+        acl=$(getfacl -cp "$device" 2>/dev/null | grep -E '^(user|group):[^:]+:' || true)
+        if [ -n "$acl" ]; then
+            fail "$device has an unexpected ACL: $acl"
+        else
+            ok "$device has no extra user/group ACL"
+        fi
+    else
+        warn "getfacl not installed; cannot inspect $device ACLs"
     fi
     if member_run "test -r $(printf '%q' "$device")"; then
         fail "$MEMBER can read $device"

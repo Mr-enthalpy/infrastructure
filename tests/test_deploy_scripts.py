@@ -13,6 +13,8 @@ SCRIPTS = [
     "create_user.sh",
     "verify_gpu_permissions.sh",
     "verify_monitor_only.sh",
+    "check_disk.sh",
+    "configure_quotas.sh",
 ]
 
 
@@ -31,6 +33,21 @@ def _bash() -> str | None:
 
 BASH = _bash()
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is required")
+
+
+def test_log_rotation_helper_compiles(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "py_compile",
+            str(ROOT / "deploy" / "rotate_job_logs.py"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("script", SCRIPTS)
@@ -73,6 +90,35 @@ def test_install_server_dry_run_does_not_require_root():
     )
     assert result.returncode == 0, result.stderr
     assert "[dry-run]" in result.stdout
+
+
+def test_installer_has_transactional_backup_and_rollback():
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "trap on_exit EXIT" in source
+    assert "BACKUP_DIR" in source and "/var/backups/udc-resource" in source
+    assert "cp -a --" in source
+    assert "rollback" in source
+    assert "systemd-analyze verify" in source
+    assert "sshd" in source and "-t" in source
+    assert "STATE_DB_BACKUP" in source and "source.backup" in source
+    assert "udevadm verify" in source
+
+
+def test_quota_helper_enables_ext4_project_inheritance():
+    source = (ROOT / "deploy/configure_quotas.sh").read_text(encoding="utf-8")
+    assert "chattr -p" in source
+    assert "chattr +P" in source
+    assert "setquota -P" in source
+
+
+def test_gpu_verifier_checks_udev_acl_and_forbidden_groups():
+    source = (ROOT / "deploy/verify_gpu_permissions.sh").read_text(encoding="utf-8")
+    assert "udevadm info" in source
+    assert "SUBSYSTEM=" in source
+    assert "getfacl" in source
+    for group in ("udc-gpu", "video", "render", "docker", "sudo", "udc-admins"):
+        assert group in source
+    assert "nvidia*" in source
 
 
 def test_broker_runtime_directory_allows_member_traversal():
