@@ -26,5 +26,6 @@ def active_config(monitor_config: LabConfig, tmp_path: Path) -> LabConfig:
             mode="active",
             deployment_allowed=True,
             file_transfer_enabled=True,
+            min_free_gb=0,
         ),
     )
