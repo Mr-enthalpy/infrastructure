@@ -43,6 +43,8 @@ class PolicyConfig:
     max_memory_gb: int = 128
     reserve_cpus: float = 8.0
     reserve_memory_gb: int = 32
+    max_gpus_per_user: int = 4
+    max_active_allocations_per_user: int = 4
 
 
 @dataclass(frozen=True)
@@ -142,19 +144,23 @@ def load_config(path: str | Path) -> LabConfig:
         max_memory_gb=int(policy_raw.get("max_memory_gb", 128)),
         reserve_cpus=float(policy_raw.get("reserve_cpus", 8.0)),
         reserve_memory_gb=int(policy_raw.get("reserve_memory_gb", 32)),
+        max_gpus_per_user=int(policy_raw.get("max_gpus_per_user", 4)),
+        max_active_allocations_per_user=int(policy_raw.get("max_active_allocations_per_user", 4)),
     )
     if not 1 <= policy.default_hours <= policy.max_hours:
         raise ValueError("default_hours must be between 1 and max_hours")
     if policy.max_hours > 36:
         raise ValueError("max_hours must not exceed 36")
-    if policy.mode not in {"monitor", "active"}:
-        raise ValueError("policy.mode must be monitor or active")
+    if policy.mode not in {"monitor", "maintenance", "active"}:
+        raise ValueError("policy.mode must be monitor, maintenance, or active")
     if policy.mode == "active" and not policy.deployment_allowed:
         raise ValueError("policy.mode=active requires deployment_allowed=true")
     if policy.max_cpus <= 0 or policy.max_memory_gb <= 0:
         raise ValueError("policy.max_cpus and policy.max_memory_gb must be positive")
     if policy.reserve_cpus < 0 or policy.reserve_memory_gb < 0:
         raise ValueError("policy reserves must not be negative")
+    if policy.max_gpus_per_user <= 0 or policy.max_active_allocations_per_user <= 0:
+        raise ValueError("policy per-user limits must be positive")
     if policy.max_cpus + policy.reserve_cpus > hardware.cpu_logical:
         raise ValueError("max_cpus + reserve_cpus exceeds hardware.cpu_logical")
     if policy.max_memory_gb + policy.reserve_memory_gb > hardware.ram_gib:

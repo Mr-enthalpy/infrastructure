@@ -4,7 +4,7 @@ FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3-pip git curl ca-certificates \
+    python3.11 python3.11-venv python3-pip git curl ca-certificates tmux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3.11 -m pip install --no-cache-dir --upgrade pip \

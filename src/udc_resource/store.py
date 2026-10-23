@@ -242,6 +242,8 @@ def create_allocation(
     expires_at: datetime,
     max_cpus: float,
     max_memory_gb: int,
+    max_gpus_per_user: int = 4,
+    max_active_allocations_per_user: int = 4,
     now: datetime | None = None,
 ) -> str:
     if len(set(gpu_uuids)) != len(gpu_uuids):
@@ -275,6 +277,30 @@ def create_allocation(
         if int(used["memory_gb"]) + memory_gb > max_memory_gb:
             raise InsufficientResources(
                 f"memory budget exceeded: {int(used['memory_gb']) + memory_gb} > {max_memory_gb}"
+            )
+        user_allocations = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM allocations "
+                "WHERE owner_uid = ? AND status IN ('pending', 'active')",
+                (owner_uid,),
+            ).fetchone()[0]
+        )
+        if user_allocations + 1 > max_active_allocations_per_user:
+            raise InsufficientResources(
+                f"per-user allocation limit exceeded: "
+                f"{user_allocations + 1} > {max_active_allocations_per_user}"
+            )
+        user_gpus = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM allocation_gpus AS ag "
+                "JOIN allocations AS a ON a.id = ag.allocation_id "
+                "WHERE a.owner_uid = ? AND a.status IN ('pending', 'active')",
+                (owner_uid,),
+            ).fetchone()[0]
+        )
+        if user_gpus + len(gpu_uuids) > max_gpus_per_user:
+            raise InsufficientResources(
+                f"per-user GPU limit exceeded: {user_gpus + len(gpu_uuids)} > {max_gpus_per_user}"
             )
         connection.execute(
             """
@@ -518,9 +544,16 @@ def list_allocation_events(
     return [_event_to_dict(row) for row in rows]
 
 
+def active_lease_count(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) FROM allocations WHERE status IN ('pending', 'active')"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def get_mode(connection: sqlite3.Connection, default: str = "monitor") -> str:
     mode = get_setting(connection, "mode", default)
-    if mode in {"monitor", "active"}:
+    if mode in {"monitor", "maintenance", "active"}:
         return str(mode)
     return default
 
@@ -532,8 +565,8 @@ def set_mode(
     actor_uid: int,
     now: datetime | None = None,
 ) -> None:
-    if mode not in {"monitor", "active"}:
-        raise ValueError("mode must be monitor or active")
+    if mode not in {"monitor", "maintenance", "active"}:
+        raise ValueError("mode must be monitor, maintenance, or active")
     timestamp = (now or utcnow()).isoformat()
     connection.execute("BEGIN IMMEDIATE")
     try:

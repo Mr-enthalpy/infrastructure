@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import os
 import select
+import shlex
 import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NoReturn
@@ -30,8 +33,12 @@ from .stream import (
 app = typer.Typer(no_args_is_help=True, help="Timed lab GPU resource manager.")
 config_app = typer.Typer(no_args_is_help=True, help="Inspect the local configuration.")
 admin_app = typer.Typer(no_args_is_help=True, help="Administrator commands.")
+job_app = typer.Typer(no_args_is_help=True, help="Long-running job commands.")
+file_app = typer.Typer(no_args_is_help=True, help="Restricted workspace file transfer.")
 app.add_typer(config_app, name="config")
 app.add_typer(admin_app, name="admin")
+app.add_typer(job_app, name="job")
+app.add_typer(file_app, name="file")
 
 
 def _config_path(path: Path | None) -> Path:
@@ -57,6 +64,25 @@ def _make_client(config: LabConfig) -> BrokerClient:
     return BrokerClient(config.server.broker_socket)
 
 
+def _ssh_base(config: LabConfig) -> list[str]:
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        _fail("ssh_unavailable", "ssh executable is not available", False)
+    argv = [
+        ssh,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={config.gui.connect_timeout}",
+        "-o",
+        "StrictHostKeyChecking=yes",
+    ]
+    known_hosts = config.server.known_hosts.strip()
+    if known_hosts:
+        argv.extend(["-o", f"UserKnownHostsFile={os.path.expanduser(known_hosts)}"])
+    return argv
+
+
 def _fail(code: str, message: str, json_output: bool) -> NoReturn:
     if json_output:
         typer.echo(
@@ -73,12 +99,12 @@ def _fail(code: str, message: str, json_output: bool) -> NoReturn:
 
 def _request(
     client: BrokerClient,
-    command: str,
+    command_name: str,
     json_output: bool,
     **args: Any,
 ) -> dict[str, Any]:
     try:
-        response = client.request(command, **args)
+        response = client.request(command_name, **args)
     except UdcError as exc:
         _fail(exc.code, exc.message, json_output)
     if not response.get("ok"):
@@ -251,9 +277,11 @@ def list_command(
                 f"owner={container.get('owner')}"
             )
         for process in unmanaged_processes:
+            owner = process.get("username") or process.get("uid") or "unknown"
+            container = process.get("container_name") or "-"
             typer.echo(
                 f"  process gpu={process.get('gpu_index')}  pid={process['pid']}  "
-                f"name={process.get('process_name')}"
+                f"name={process.get('process_name')}  owner={owner}  container={container}"
             )
 
 
@@ -370,6 +398,316 @@ def logs_command(
     if json_output:
         return
     typer.echo(str(data.get("logs", "")), nl=False)
+
+
+@job_app.command(
+    "start",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def job_start(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    name: str = typer.Option(..., "--name", help="Job name."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Start a detached tmux job with a persistent workspace log."""
+    command = list(ctx.args)
+    if not command:
+        raise typer.BadParameter("provide a command after --")
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "job_start",
+        json_output,
+        id=allocation_id,
+        name=name,
+        command=command,
+    )
+    if json_output:
+        return
+    typer.echo(f"job: {data['name']}")
+    typer.echo(f"session: {data['session']}")
+    typer.echo(f"log: {data['log']}")
+
+
+@job_app.command("list")
+def job_list(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """List jobs in an allocation container."""
+    config = _load(ctx)
+    data = _request(_make_client(config), "job_list", json_output, id=allocation_id)
+    if json_output:
+        return
+    jobs = data.get("jobs", [])
+    if not jobs:
+        typer.echo("no jobs")
+    for job in jobs:
+        typer.echo(
+            f"{job['name']}  session={job['session']}  "
+            f"log_bytes={job.get('log_bytes', 0)}  attached={job.get('attached', '0')}"
+        )
+
+
+@job_app.command("logs")
+def job_logs(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    name: str = typer.Option(..., "--name", help="Job name."),
+    tail: int = typer.Option(200, "--tail"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Read a persistent job log from the allocation workspace."""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "job_logs",
+        json_output,
+        id=allocation_id,
+        name=name,
+        tail=tail,
+    )
+    if json_output:
+        return
+    typer.echo(str(data.get("logs", "")), nl=False)
+
+
+@job_app.command("attach")
+def job_attach(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    name: str = typer.Option(..., "--name", help="Job name."),
+) -> None:
+    """Attach to a detached tmux job."""
+    if os.name != "posix":
+        _fail("internal", "interactive attach requires a POSIX client", False)
+    config = _load(ctx)
+    size = shutil.get_terminal_size()
+    client = _make_client(config)
+    try:
+        sock, response = client.connect_shell(
+            allocation_id,
+            size.columns,
+            size.lines,
+            job=name,
+        )
+    except UdcError as exc:
+        _fail(exc.code, exc.message, False)
+    if not response.get("ok"):
+        sock.close()
+        error = response.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        _fail(
+            str(error.get("code", "internal")),
+            str(error.get("message", "could not attach to job")),
+            False,
+        )
+    try:
+        _run_shell_loop(sock)
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        _fail("internal", f"job attach failed: {exc}", False)
+    finally:
+        sock.close()
+
+
+@job_app.command("stop")
+def job_stop(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    name: str = typer.Option(..., "--name", help="Job name."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Stop a detached tmux job."""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "job_stop",
+        json_output,
+        id=allocation_id,
+        name=name,
+    )
+    if json_output:
+        return
+    typer.echo(f"stopped: {data['name']}")
+
+
+@file_app.command("put")
+def file_put(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    remote_path: str = typer.Argument(..., help="Relative path under /workspace."),
+) -> None:
+    """Receive a file from stdin into the allocation workspace (remote side)."""
+    config = _load(ctx)
+    client = _make_client(config)
+    try:
+        sock, response = client.connect_file(
+            allocation_id,
+            remote_path,
+            upload=True,
+        )
+    except UdcError as exc:
+        _fail(exc.code, exc.message, False)
+    if not response.get("ok"):
+        sock.close()
+        typer.echo(json.dumps(response, indent=2, sort_keys=True), err=True)
+        error = response.get("error") or {}
+        raise typer.Exit(exit_code_for(str(error.get("code", "internal"))))
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read(65536)
+            if not chunk:
+                break
+            send_frame(sock, FRAME_DATA, chunk)
+        send_frame(sock, FRAME_EXIT, exit_payload("upload complete"))
+        buffer = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("broker closed before upload acknowledgement")
+            frames, buffer = decode_frames(buffer + chunk)
+            for kind, payload in frames:
+                if kind != FRAME_EXIT:
+                    continue
+                result = json.loads(payload.decode("utf-8"))
+                if not result.get("ok"):
+                    error = result.get("error") or {}
+                    typer.echo(json.dumps(result, indent=2, sort_keys=True), err=True)
+                    raise typer.Exit(exit_code_for(str(error.get("code", "internal"))))
+                typer.echo(json.dumps(result, indent=2, sort_keys=True))
+                return
+    except UdcError as exc:
+        _fail(exc.code, exc.message, False)
+    except (OSError, RuntimeError) as exc:
+        _fail("internal", f"file upload failed: {exc}", False)
+    finally:
+        sock.close()
+
+
+@file_app.command("get")
+def file_get(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    remote_path: str = typer.Argument(..., help="Relative path under /workspace."),
+) -> None:
+    """Write a workspace file to stdout (remote side)."""
+    config = _load(ctx)
+    client = _make_client(config)
+    try:
+        sock, response = client.connect_file(
+            allocation_id,
+            remote_path,
+            upload=False,
+        )
+    except UdcError as exc:
+        _fail(exc.code, exc.message, False)
+    if not response.get("ok"):
+        sock.close()
+        typer.echo(json.dumps(response, indent=2, sort_keys=True), err=True)
+        error = response.get("error") or {}
+        raise typer.Exit(exit_code_for(str(error.get("code", "internal"))))
+    try:
+        buffer = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("broker closed before file download completed")
+            frames, buffer = decode_frames(buffer + chunk)
+            for kind, payload in frames:
+                if kind == FRAME_DATA:
+                    sys.stdout.buffer.write(payload)
+                    sys.stdout.buffer.flush()
+                elif kind == FRAME_EXIT:
+                    result = json.loads(payload.decode("utf-8"))
+                    if not result.get("ok"):
+                        error = result.get("error") or {}
+                        typer.echo(
+                            json.dumps(result, indent=2, sort_keys=True),
+                            err=True,
+                        )
+                        raise typer.Exit(exit_code_for(str(error.get("code", "internal"))))
+                    return
+    except (OSError, RuntimeError) as exc:
+        _fail("internal", f"file download failed: {exc}", False)
+    finally:
+        sock.close()
+
+
+@app.command("push")
+def push_command(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    local_path: Path = typer.Argument(..., help="Local file to upload."),
+    remote_path: str = typer.Argument(..., help="Relative path under /workspace."),
+    server: str | None = typer.Option(None, "--server", help="SSH alias."),
+) -> None:
+    """Upload a local file into an allocation workspace."""
+    config = _load(ctx)
+    if not local_path.is_file():
+        _fail("bad_request", f"local file not found: {local_path}", False)
+    remote = shlex.join(["udc-resource", "file", "put", allocation_id, remote_path])
+    argv = [*_ssh_base(config), server or config.server.ssh_alias, remote]
+    try:
+        with local_path.open("rb") as handle:
+            process = subprocess.run(
+                argv,
+                stdin=handle,
+                capture_output=True,
+                check=False,
+            )
+    except OSError as exc:
+        _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
+    if process.returncode != 0:
+        detail = process.stderr.decode("utf-8", errors="replace").strip()
+        _fail("ssh_error", detail or "upload failed", False)
+    typer.echo(process.stdout.decode("utf-8", errors="replace").strip())
+
+
+@app.command("pull")
+def pull_command(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+    remote_path: str = typer.Argument(..., help="Relative path under /workspace."),
+    local_path: Path = typer.Argument(..., help="Local destination file."),
+    server: str | None = typer.Option(None, "--server", help="SSH alias."),
+) -> None:
+    """Download a file from an allocation workspace."""
+    config = _load(ctx)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    remote = shlex.join(["udc-resource", "file", "get", allocation_id, remote_path])
+    argv = [*_ssh_base(config), server or config.server.ssh_alias, remote]
+    temp: Path | None = None
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{local_path.name}.",
+            suffix=".part",
+            dir=local_path.parent,
+            delete=False,
+        )
+        temp = Path(handle.name)
+        with handle:
+            process = subprocess.run(
+                argv,
+                stdout=handle,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    except OSError as exc:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+        _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
+    if process.returncode != 0:
+        temp.unlink(missing_ok=True)
+        detail = process.stderr.decode("utf-8", errors="replace").strip()
+        _fail("ssh_error", detail or "download failed", False)
+    temp.replace(local_path)
+    typer.echo(f"downloaded: {local_path}")
 
 
 @app.command("shell")
@@ -504,12 +842,12 @@ def admin_audit(
 @admin_app.command("mode")
 def admin_mode(
     ctx: typer.Context,
-    mode: str = typer.Argument(..., help="monitor or active"),
+    mode: str = typer.Argument(..., help="monitor, maintenance, or active"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Switch broker mode; active requires deployment_allowed=true."""
-    if mode not in {"monitor", "active"}:
-        raise typer.BadParameter("mode must be monitor or active")
+    if mode not in {"monitor", "maintenance", "active"}:
+        raise typer.BadParameter("mode must be monitor, maintenance, or active")
     config = _load(ctx)
     data = _request(_make_client(config), "admin_mode", json_output, mode=mode)
     if json_output:

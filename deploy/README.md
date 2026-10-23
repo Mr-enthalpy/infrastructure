@@ -21,8 +21,9 @@ administrator approval.
 
    The installer is idempotent. It refuses to modify the host without `--yes`,
    does not overwrite an existing config unless `--force-config`, does not start
-   the broker unless `--start`, and always forces the persisted mode to
-   `monitor`.
+   the broker unless `--start`. A fresh database starts in `monitor`; a
+   reinstall with active/pending leases preserves `active` or `maintenance`
+   so lease expiry is never silently paused.
 3. Create member accounts with:
 
    ```bash
@@ -33,8 +34,9 @@ administrator approval.
    `--admin`, keep a normal shell, and must not be in `udc-members`.
 4. Install the udev rule (done by the installer) and verify host GPU access is
    denied to a test member.
-5. Install the systemd unit with `policy.mode = "monitor"` (done by the
-   installer).
+5. The installer selects `monitor` for a fresh install. On reinstall it keeps
+   `active`/`maintenance` when leases exist, so the expiry worker cannot be
+   paused accidentally.
 6. Install the sshd drop-in, run `sshd -t`, then reload. Keep an admin SSH
    session open while changing SSH.
 7. Start in monitor-only mode:
@@ -46,9 +48,20 @@ administrator approval.
 
    The verifier is read-only: it checks ForceCommand, socket permissions,
    Docker/GPU denials, monitor mode, and that Docker/GPU state is unchanged over
-   the snapshot window (default 10 minutes).
+   the snapshot window (default 10 minutes) and all GPU/NVIDIA device
+   permissions through `verify_gpu_permissions.sh`.
+
+   `monitor` is read-only and never expires leases. If active/pending leases
+   exist, use `maintenance`: it blocks new applies but keeps expiry and
+   reconciliation running. The broker refuses `admin mode monitor` while leases
+   or managed containers exist.
 8. Only after explicit approval, switch to active mode and run a CPU then
    single-GPU acceptance allocation.
+
+See `docs/legacy-access-revocation.md` for the formal legacy administrator
+revocation and verification checklist, `docs/jobs-and-transfer.md` for detached
+tmux jobs and restricted file transfer, and `docs/acceptance.md` for the
+destructive active-mode acceptance.
 
 ## Files
 
@@ -56,6 +69,7 @@ administrator approval.
 - `audit_legacy.sh` (read-only legacy root/sudo/SSH/privileged-container audit)
 - `install_server.sh` (idempotent installer; `--dry-run`, `--yes`, `--start`)
 - `create_user.sh` (member/admin account and optional SSH key setup)
+- `verify_gpu_permissions.sh` (read-only all-GPU/NVIDIA device permission acceptance)
 - `verify_monitor_only.sh` (read-only monitor-only security acceptance)
 - `acceptance_active.py` (destructive active-mode acceptance; see `docs/acceptance.md`)
 - `systemd/udc-resource-broker.service`

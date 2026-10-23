@@ -6,15 +6,17 @@ import csv
 import io
 import logging
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import docker
 from docker.errors import DockerException, NotFound
 
 from ..config import LabConfig
-from ..errors import DockerError
+from ..errors import Conflict, DockerError
 from ..errors import NotFound as UdcNotFound
 from ..models import GPU, Allocation
 
@@ -48,6 +50,8 @@ class GPUProcess:
     pid: int
     used_mib: int
     process_name: str
+    uid: int | None = None
+    username: str = ""
 
 
 class ShellSession(Protocol):
@@ -73,9 +77,21 @@ class DockerBackend(Protocol):
 
     def remove_container(self, container_id: str) -> None: ...
 
-    def open_shell(self, container_id: str, cols: int, rows: int) -> ShellSession: ...
+    def open_shell(
+        self,
+        container_id: str,
+        cols: int,
+        rows: int,
+        command: list[str] | None = None,
+    ) -> ShellSession: ...
 
     def logs(self, container_id: str, tail: int) -> str: ...
+
+    def start_job(self, container_id: str, name: str, command: list[str]) -> None: ...
+
+    def list_jobs(self, container_id: str) -> list[dict[str, str]]: ...
+
+    def stop_job(self, container_id: str, name: str) -> None: ...
 
 
 def matches_managed_allocation(
@@ -202,6 +218,36 @@ class DockerDriver:
             )
         return gpus
 
+    @staticmethod
+    def _process_owner(pid: int) -> tuple[int | None, str]:
+        try:
+            status = Path(f"/proc/{pid}/status").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None, ""
+        uid = None
+        for line in status.splitlines():
+            if line.startswith("Uid:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        uid = int(parts[1])
+                    except ValueError:
+                        uid = None
+                break
+        if uid is None:
+            return None, ""
+        try:
+            import pwd
+        except ImportError:
+            return uid, ""
+        try:
+            return uid, pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return uid, ""
+
     def list_compute_processes(self) -> list[GPUProcess]:
         rows = self._nvidia_smi("compute-apps=gpu_uuid,pid,used_memory,process_name")
         processes: list[GPUProcess] = []
@@ -212,12 +258,15 @@ class DockerDriver:
                 pid = int(row[1])
             except ValueError:
                 continue
+            uid, username = self._process_owner(pid)
             processes.append(
                 GPUProcess(
                     gpu_uuid=row[0],
                     pid=pid,
                     used_mib=self._as_int(row[2]),
                     process_name=row[3],
+                    uid=uid,
+                    username=username,
                 )
             )
         return processes
@@ -347,11 +396,18 @@ class DockerDriver:
         except DockerException as exc:
             raise DockerError(f"cannot remove container {container_id}: {exc}") from exc
 
-    def open_shell(self, container_id: str, cols: int, rows: int) -> ShellSession:
+    def open_shell(
+        self,
+        container_id: str,
+        cols: int,
+        rows: int,
+        command: list[str] | None = None,
+    ) -> ShellSession:
+        cmd = command or ["/bin/bash", "-l"]
         try:
             exec_id = self.client.api.exec_create(
                 container_id,
-                cmd=["/bin/bash", "-l"],
+                cmd=cmd,
                 stdin=True,
                 stdout=True,
                 stderr=True,
@@ -365,6 +421,118 @@ class DockerDriver:
         except DockerException as exc:
             raise DockerError(f"cannot open shell in {container_id}: {exc}") from exc
         return DockerShellSession(self.client, str(exec_id), sock)
+
+    def _exec_capture(
+        self,
+        container_id: str,
+        argv: list[str],
+    ) -> tuple[int, str, str]:
+        try:
+            exec_id = self.client.api.exec_create(
+                container_id,
+                cmd=argv,
+                stdin=False,
+                stdout=True,
+                stderr=True,
+                tty=False,
+            )["Id"]
+            output = self.client.api.exec_start(exec_id, tty=False, stream=False)
+            info = self.client.api.exec_inspect(exec_id)
+        except DockerException as exc:
+            raise DockerError(f"docker exec failed: {exc}") from exc
+        text = (
+            output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+        )
+        return int(info.get("ExitCode", -1)), text, ""
+
+    def _exec_detached(self, container_id: str, argv: list[str]) -> None:
+        try:
+            exec_id = self.client.api.exec_create(
+                container_id,
+                cmd=argv,
+                stdin=False,
+                stdout=True,
+                stderr=True,
+                tty=False,
+            )["Id"]
+            self.client.api.exec_start(exec_id, detach=True)
+        except DockerException as exc:
+            raise DockerError(f"docker exec failed: {exc}") from exc
+
+    @staticmethod
+    def _job_session(name: str) -> str:
+        return f"udc-{name}"
+
+    def start_job(self, container_id: str, name: str, command: list[str]) -> None:
+        if not command:
+            raise DockerError("job command is empty")
+        session = self._job_session(name)
+        logfile = f"/workspace/.udc-logs/{name}.log"
+        code, _out, _err = self._exec_capture(container_id, ["tmux", "-V"])
+        if code != 0:
+            raise DockerError("tmux is not available in the container image")
+        code, _out, _err = self._exec_capture(
+            container_id,
+            ["tmux", "has-session", "-t", session],
+        )
+        if code == 0:
+            raise Conflict(f"job already exists: {name}")
+        inner = (
+            "mkdir -p /workspace/.udc-logs && "
+            f"exec {shlex.join(command)} >> {shlex.quote(logfile)} 2>&1"
+        )
+        self._exec_detached(
+            container_id,
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-c",
+                "/workspace",
+                "/bin/bash",
+                "-lc",
+                inner,
+            ],
+        )
+
+    def list_jobs(self, container_id: str) -> list[dict[str, str]]:
+        code, output, _err = self._exec_capture(
+            container_id,
+            [
+                "tmux",
+                "list-sessions",
+                "-F",
+                "#{session_name}|#{session_created}|#{session_attached}",
+            ],
+        )
+        if code != 0:
+            return []
+        jobs: list[dict[str, str]] = []
+        for line in output.splitlines():
+            parts = line.split("|")
+            if len(parts) != 3:
+                continue
+            if not parts[0].startswith("udc-"):
+                continue
+            jobs.append(
+                {
+                    "name": parts[0][4:],
+                    "session": parts[0],
+                    "created": parts[1],
+                    "attached": parts[2],
+                }
+            )
+        return jobs
+
+    def stop_job(self, container_id: str, name: str) -> None:
+        code, _out, _err = self._exec_capture(
+            container_id,
+            ["tmux", "kill-session", "-t", self._job_session(name)],
+        )
+        if code != 0:
+            raise UdcNotFound(f"job not found: {name}")
 
     def logs(self, container_id: str, tail: int) -> str:
         try:

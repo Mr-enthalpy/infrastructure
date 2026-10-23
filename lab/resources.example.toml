@@ -28,6 +28,8 @@ max_cpus = 32
 max_memory_gb = 128
 reserve_cpus = 8
 reserve_memory_gb = 32
+max_gpus_per_user = 4
+max_active_allocations_per_user = 4
 
 [groups]
 members = "udc-members"

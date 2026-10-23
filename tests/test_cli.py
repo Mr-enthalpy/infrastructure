@@ -17,8 +17,8 @@ class FakeClient:
         self.error = error
         self.calls: list[tuple[str, dict]] = []
 
-    def request(self, command: str, **args):
-        self.calls.append((command, args))
+    def request(self, command_name: str, **args):
+        self.calls.append((command_name, args))
         if self.error is not None:
             raise self.error
         return self.response
@@ -230,3 +230,28 @@ def test_gui_command_uses_ssh_aliases(monkeypatch):
     assert captured["member_alias"] == "member-alias"
     assert captured["admin_alias"] == "admin-alias"
     assert captured["open_browser"] is False
+
+
+def test_job_start_passes_command_argv(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "id": "alloc-1",
+                "name": "train",
+                "session": "udc-train",
+                "log": "/data1/udc-users/alice/.udc-logs/train.log",
+            },
+        }
+    )
+    result = _invoke(
+        monkeypatch,
+        fake,
+        ["job", "start", "alloc-1", "--name", "train", "--json", "--", "python", "train.py"],
+    )
+    assert result.exit_code == 0, result.output
+    command, args = fake.calls[0]
+    assert command == "job_start"
+    assert args["id"] == "alloc-1"
+    assert args["name"] == "train"
+    assert args["command"] == ["python", "train.py"]

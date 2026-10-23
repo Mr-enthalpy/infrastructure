@@ -269,3 +269,74 @@ def test_container_info_treats_count_minus_one_as_all(active_config):
     container.attrs["Config"]["Env"] = []
     info = driver._container_info(container)
     assert info.gpu_refs == ("all",)
+
+
+class FakeJobApi:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.exec_calls: list[tuple[str, dict]] = []
+        self.next_id = 1
+        self.outputs: dict[str, tuple[int, bytes]] = {}
+
+    def exec_create(self, container: str, **kwargs):
+        self.calls.append((container, kwargs))
+        exec_id = f"exec-{self.next_id}"
+        self.next_id += 1
+        return {"Id": exec_id}
+
+    def exec_start(self, exec_id: str, **kwargs):
+        self.exec_calls.append((exec_id, kwargs))
+        if kwargs.get("detach"):
+            return None
+        code, output = self.outputs.get(exec_id, (0, b""))
+        self.outputs[exec_id] = (code, output)
+        return output
+
+    def exec_inspect(self, exec_id: str):
+        code, _output = self.outputs.get(exec_id, (0, b""))
+        return {"ExitCode": code}
+
+
+def test_start_job_uses_tmux_and_workspace_log(active_config):
+    driver = DockerDriver(active_config)
+    client = FakeClient()
+    api = FakeJobApi()
+    client.api = api
+    driver._client = client
+    api.outputs["exec-1"] = (0, b"tmux 3.4\n")
+    api.outputs["exec-2"] = (1, b"")
+    driver.start_job("container-1", "train", ["python", "train.py", "--lr", "1e-4"])
+    assert [call[1]["cmd"] for call in api.calls[:2]] == [
+        ["tmux", "-V"],
+        ["tmux", "has-session", "-t", "udc-train"],
+    ]
+    detached = api.calls[2][1]
+    assert detached["cmd"][:5] == ["tmux", "new-session", "-d", "-s", "udc-train"]
+    assert detached["cmd"][5] == "-c"
+    assert "mkdir -p /workspace/.udc-logs" in detached["cmd"][-1]
+    assert ">> /workspace/.udc-logs/train.log 2>&1" in detached["cmd"][-1]
+    assert any(call[1].get("detach") for call in api.exec_calls)
+
+
+def test_list_and_stop_jobs(active_config):
+    driver = DockerDriver(active_config)
+    client = FakeClient()
+    api = FakeJobApi()
+    client.api = api
+    driver._client = client
+    api.outputs["exec-1"] = (
+        0,
+        b"udc-train|1700000000|0\nother|1700000001|1\n",
+    )
+    jobs = driver.list_jobs("container-1")
+    assert jobs == [
+        {
+            "name": "train",
+            "session": "udc-train",
+            "created": "1700000000",
+            "attached": "0",
+        }
+    ]
+    api.outputs["exec-2"] = (0, b"")
+    driver.stop_job("container-1", "train")
+    assert api.calls[1][1]["cmd"] == ["tmux", "kill-session", "-t", "udc-train"]

@@ -58,6 +58,7 @@ class FakeDocker:
         self.container_logs: dict[str, str] = {}
         self.shell_output = b"fake shell output\n"
         self.shells: list[FakeShellSession] = []
+        self.jobs: dict[str, dict[str, dict[str, str]]] = {}
         self.fail_create = fail_create
         self.fail_remove = fail_remove
         self._next_id = 1
@@ -107,14 +108,41 @@ class FakeDocker:
         self.removed.append(container_id)
         self.containers.pop(container_id, None)
 
-    def open_shell(self, container_id: str, cols: int, rows: int) -> FakeShellSession:
+    def open_shell(
+        self,
+        container_id: str,
+        cols: int,
+        rows: int,
+        command: list[str] | None = None,
+    ) -> FakeShellSession:
         session = FakeShellSession(self.shell_output)
         session.sizes.append((cols, rows))
+        session.command = command
         self.shells.append(session)
         return session
 
     def logs(self, container_id: str, tail: int) -> str:
         return self.container_logs.get(container_id, "fake log line\n")
+
+    def start_job(self, container_id: str, name: str, command: list[str]) -> None:
+        container_jobs = self.jobs.setdefault(container_id, {})
+        if name in container_jobs:
+            raise RuntimeError(f"job already exists: {name}")
+        container_jobs[name] = {"created": "1", "attached": "0"}
+
+    def list_jobs(self, container_id: str) -> list[dict[str, str]]:
+        return [
+            {
+                "name": name,
+                "session": f"udc-{name}",
+                "created": info["created"],
+                "attached": info["attached"],
+            }
+            for name, info in self.jobs.get(container_id, {}).items()
+        ]
+
+    def stop_job(self, container_id: str, name: str) -> None:
+        self.jobs.get(container_id, {}).pop(name, None)
 
 
 class FakeIdentityResolver:

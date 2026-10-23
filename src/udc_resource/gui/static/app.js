@@ -80,7 +80,7 @@
   function setMode(mode) {
     const pill = $("#mode-pill");
     pill.textContent = `mode ${mode || "?"}`;
-    pill.className = `pill ${mode === "active" ? "active" : mode === "monitor" ? "monitor" : "unknown"}`;
+    pill.className = `pill ${mode === "active" ? "active" : mode === "maintenance" ? "maintenance" : mode === "monitor" ? "monitor" : "unknown"}`;
   }
 
   function activateTab(name) {
@@ -343,8 +343,8 @@
         <div class="allocation-item">
           <div><div class="id">PID ${esc(process.pid)}</div><div class="muted">GPU ${esc(process.gpu_index ?? "?")}</div></div>
           <div class="muted">${esc(process.process_name || "?")}</div>
-          <div class="muted">${esc(process.used_mib)} MiB</div>
-          <div class="muted">read-only</div>
+          <div class="muted">${esc(process.used_mib)} MiB<br>${esc(process.username || process.uid || "unknown")}</div>
+          <div class="muted">${process.container_name ? `container ${esc(process.container_name)}` : "read-only"}${process.container_owner ? `<br>owner ${esc(process.container_owner)}` : ""}</div>
         </div>
       `).join("");
     }
@@ -633,6 +633,7 @@
     $$(".tab").forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tab)));
     $("#refresh-my").addEventListener("click", refreshMy);
     $("#mode-monitor").addEventListener("click", () => changeBrokerMode("monitor"));
+    $("#mode-maintenance").addEventListener("click", () => changeBrokerMode("maintenance"));
     $("#mode-active").addEventListener("click", () => changeBrokerMode("active"));
     $("#admin-audit").addEventListener("click", refreshAdmin);
     $("#admin-reconcile").addEventListener("click", async () => {

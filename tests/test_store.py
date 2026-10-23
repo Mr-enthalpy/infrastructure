@@ -33,6 +33,7 @@ def _create(
     memory_gb: int = 32,
     max_cpus: float = 32.0,
     max_memory_gb: int = 128,
+    max_active_allocations_per_user: int = 4,
     owner_uid: int = 1000,
     owner_name: str = "alice",
 ) -> str:
@@ -50,6 +51,7 @@ def _create(
         expires_at=NOW + timedelta(hours=12),
         max_cpus=max_cpus,
         max_memory_gb=max_memory_gb,
+        max_active_allocations_per_user=max_active_allocations_per_user,
         now=NOW,
     )
 
@@ -156,6 +158,8 @@ def test_mode_setting_roundtrip(tmp_path):
     assert store.get_mode(connection, "monitor") == "monitor"
     store.set_mode(connection, "active", actor_uid=0, now=NOW)
     assert store.get_mode(connection, "monitor") == "active"
+    store.set_mode(connection, "maintenance", actor_uid=0, now=NOW)
+    assert store.get_mode(connection, "monitor") == "maintenance"
     events = store.list_events(connection)
     assert events[0]["action"] == "mode_changed"
     with pytest.raises(ValueError):
@@ -185,3 +189,33 @@ def test_concurrent_claims_only_one_wins(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(attempt, [1000, 1001]))
     assert sum(result is not None for result in results) == 1
+
+
+def test_per_user_allocation_limit_is_enforced(tmp_path):
+    connection = _connection(tmp_path)
+    for _ in range(4):
+        _create(connection, gpus=(), cpus=1, memory_gb=1)
+    with pytest.raises(InsufficientResources, match="per-user allocation limit"):
+        _create(connection, gpus=(), cpus=1, memory_gb=1)
+    connection.close()
+
+
+def test_per_user_gpu_limit_is_enforced(tmp_path):
+    connection = _connection(tmp_path)
+    for index in range(4):
+        _create(
+            connection,
+            gpus=(f"GPU-{index}",),
+            cpus=1,
+            memory_gb=1,
+            max_active_allocations_per_user=10,
+        )
+    with pytest.raises(InsufficientResources, match="per-user GPU limit"):
+        _create(
+            connection,
+            gpus=("GPU-4",),
+            cpus=1,
+            memory_gb=1,
+            max_active_allocations_per_user=10,
+        )
+    connection.close()

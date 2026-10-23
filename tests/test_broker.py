@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,7 +8,9 @@ from udc_resource import store
 from udc_resource.broker.docker_driver import ContainerInfo, GPUProcess
 from udc_resource.broker.server import Broker
 from udc_resource.db import connect, init_db
+from udc_resource.errors import Forbidden
 from udc_resource.identity import Identity
+from udc_resource.models import GPU
 
 FIXED = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 ALICE = Identity(uid=1000, gid=1000, username="alice", role="member", is_admin=False)
@@ -408,8 +410,11 @@ async def test_member_cannot_select_custom_image(tmp_path, active_config):
 async def test_release_pending_allocation_removes_container_by_label(tmp_path, active_config):
     fake = FakeDocker()
     broker, _ = _broker(tmp_path, active_config, docker=fake)
-    connection = connect(tmp_path / "state.db")
+    connection = init_db(tmp_path / "state.db")
     try:
+        store.upsert_gpus(
+            connection, [GPU(index=0, uuid="GPU-0", name="RTX 4090", memory_mib=49140)]
+        )
         allocation_id = store.create_allocation(
             connection,
             owner_uid=ALICE.uid,
@@ -469,8 +474,11 @@ async def test_cpu_only_allocation_is_supported(tmp_path, active_config):
 async def test_monitor_mode_does_not_stop_or_reconcile(tmp_path, monitor_config):
     fake = FakeDocker()
     broker, _ = _broker(tmp_path, monitor_config, docker=fake)
-    connection = connect(tmp_path / "state.db")
+    connection = init_db(tmp_path / "state.db")
     try:
+        store.upsert_gpus(
+            connection, [GPU(index=0, uuid="GPU-0", name="RTX 4090", memory_mib=49140)]
+        )
         allocation_id = store.create_allocation(
             connection,
             owner_uid=ALICE.uid,
@@ -657,3 +665,191 @@ async def test_apply_fails_closed_when_live_detection_fails(tmp_path, active_con
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "docker_error"
+
+
+async def test_admin_monitor_blocked_with_active_lease(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    applied = await _call(
+        broker,
+        "apply",
+        {"gpus": [1], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert applied["ok"] is True
+    blocked = await _call(broker, "admin_mode", {"mode": "monitor"}, ADMIN)
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "conflict"
+    assert "maintenance" in blocked["error"]["message"]
+
+
+async def test_maintenance_keeps_expiry_and_blocks_new_apply(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    applied = await _call(
+        broker,
+        "apply",
+        {"gpus": [1], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    allocation_id = applied["data"]["id"]
+    switched = await _call(broker, "admin_mode", {"mode": "maintenance"}, ADMIN)
+    assert switched["ok"] is True
+    blocked = await _call(
+        broker,
+        "apply",
+        {"gpus": [2], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert blocked["error"]["code"] == "monitor_only"
+    connection = connect(tmp_path / "state.db")
+    try:
+        connection.execute(
+            "UPDATE allocations SET expires_at = ? WHERE id = ?",
+            ((FIXED - timedelta(minutes=1)).isoformat(), allocation_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    expired = await broker.expire_once()
+    assert expired == [allocation_id]
+    status = await _call(broker, "status", {"id": allocation_id}, ALICE)
+    assert status["data"]["allocation"]["status"] == "expired"
+
+
+async def test_initialize_promotes_monitor_with_lease_to_maintenance(tmp_path, monitor_config):
+    connection = init_db(tmp_path / "state.db")
+    try:
+        store.upsert_gpus(
+            connection, [GPU(index=0, uuid="GPU-0", name="RTX 4090", memory_mib=49140)]
+        )
+        allocation_id = store.create_allocation(
+            connection,
+            owner_uid=ALICE.uid,
+            owner_name=ALICE.username,
+            gpu_uuids=("GPU-0",),
+            cpus=8.0,
+            memory_gb=32,
+            image=monitor_config.image.base,
+            workspace="/tmp/alice",
+            note="",
+            starts_at=FIXED.replace(hour=0),
+            expires_at=FIXED.replace(hour=1),
+            max_cpus=monitor_config.policy.max_cpus,
+            max_memory_gb=monitor_config.policy.max_memory_gb,
+            now=FIXED.replace(hour=0),
+        )
+        store.activate_allocation(
+            connection,
+            allocation_id,
+            container_id="existing-container",
+            container_name="udc-alice-existing",
+            now=FIXED.replace(hour=0),
+        )
+    finally:
+        connection.close()
+    broker, _ = _broker(tmp_path, monitor_config)
+    response = await _call(broker, "ping", {}, ALICE)
+    assert response["data"]["mode"] == "maintenance"
+
+
+async def test_stopped_gpu_container_does_not_block_new_allocation(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_container(
+        ContainerInfo(
+            id="old-stopped",
+            name="old-stopped",
+            image="old:latest",
+            status="exited",
+            labels={},
+            gpu_refs=("GPU-4",),
+        )
+    )
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    before = await _call(broker, "list", {}, ALICE)
+    gpu = next(item for item in before["data"]["gpus"] if item["index"] == 4)
+    assert gpu["state"] == "free"
+    history = next(
+        item for item in before["data"]["unmanaged"]["containers"] if item["id"] == "old-stopped"
+    )
+    assert history["active_gpu_access"] is False
+    response = await _call(
+        broker,
+        "apply",
+        {"gpus": [4], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert response["ok"] is True
+
+
+async def test_unmanaged_process_reports_owner(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_process(
+        GPUProcess(
+            gpu_uuid="GPU-7",
+            pid=4321,
+            used_mib=512,
+            process_name="python",
+            uid=1001,
+            username="bob",
+        )
+    )
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    response = await _call(broker, "list", {}, ALICE)
+    process = response["data"]["unmanaged"]["processes"][0]
+    assert process["uid"] == 1001
+    assert process["username"] == "bob"
+
+
+async def test_job_lifecycle(tmp_path, active_config):
+    fake = FakeDocker()
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    applied = await _call(
+        broker,
+        "apply",
+        {"gpus": [2], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    allocation_id = applied["data"]["id"]
+    container_id = applied["data"]["container_id"]
+    started = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "train", "command": ["python", "train.py"]},
+        ALICE,
+    )
+    assert started["ok"] is True
+    assert started["data"]["session"] == "udc-train"
+    assert "train" in fake.jobs[container_id]
+    log_path = (
+        Path(active_config.server.workspace_root) / ALICE.username / ".udc-logs" / "train.log"
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(b"epoch 1\nepoch 2\n")
+    listed = await _call(broker, "job_list", {"id": allocation_id}, ALICE)
+    assert listed["data"]["jobs"][0]["name"] == "train"
+    assert listed["data"]["jobs"][0]["log_bytes"] > 0
+    logs = await _call(broker, "job_logs", {"id": allocation_id, "name": "train"}, ALICE)
+    assert logs["data"]["logs"] == "epoch 1\nepoch 2\n"
+    stopped = await _call(broker, "job_stop", {"id": allocation_id, "name": "train"}, ALICE)
+    assert stopped["ok"] is True
+    assert "train" not in fake.jobs[container_id]
+
+
+async def test_workspace_target_normalizes_workspace_and_rejects_symlinks(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real = workspace / "real.bin"
+    real.write_bytes(b"data")
+    try:
+        (workspace / "link.bin").symlink_to(real)
+    except OSError:
+        pytest.skip("symlinks are not available in this environment")
+    relative, target = broker._workspace_target(
+        {"workspace": str(workspace)}, "/workspace/real.bin"
+    )
+    assert relative == "real.bin"
+    assert target == real
+    with pytest.raises(Forbidden):
+        broker._workspace_target({"workspace": str(workspace)}, "link.bin")
+    with pytest.raises(Forbidden):
+        broker._workspace_target({"workspace": str(workspace)}, "../real.bin")

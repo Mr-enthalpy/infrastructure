@@ -292,8 +292,11 @@ async def _api_admin_audit(request: web.Request) -> web.Response:
 async def _api_admin_mode(request: web.Request) -> web.Response:
     body = await _json_body(request)
     mode = body.get("mode")
-    if mode not in {"monitor", "active"}:
-        return _json(_error("bad_request", "mode must be monitor or active"), 400)
+    if mode not in {"monitor", "maintenance", "active"}:
+        return _json(
+            _error("bad_request", "mode must be monitor, maintenance, or active"),
+            400,
+        )
     return await _remote(request, ["admin", "mode", str(mode)], admin=True)
 
 

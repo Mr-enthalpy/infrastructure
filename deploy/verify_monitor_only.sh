@@ -14,6 +14,7 @@ CONFIG=${UDC_RESOURCE_CONFIG:-/etc/udc-resource/config.toml}
 VENV=${UDC_RESOURCE_VENV:-/opt/udc-resource/.venv}
 CLI=${UDC_RESOURCE_CLI:-/usr/local/bin/udc-resource}
 LOGIN_WRAPPER=${UDC_RESOURCE_LOGIN:-/usr/local/bin/udc-resource-login}
+GPU_COUNT=8
 
 FAIL=0
 WARN=0
@@ -173,13 +174,22 @@ from udc_resource.config import load_config
 config = load_config(os.environ["UDC_RESOURCE_CONFIG"])
 print(config.server.broker_socket)
 print(config.server.state_db)
+print(config.hardware.gpu_count)
 PY
 ) || { printf '[fail] could not parse config\n'; exit 1; }
 mapfile -t CONFIG_LINES <<< "$CONFIG_VALUES"
 SOCKET=${CONFIG_LINES[0]:-}
 DB_PATH=${CONFIG_LINES[1]:-}
+GPU_COUNT=${CONFIG_LINES[2]:-8}
 [ -n "$SOCKET" ] || fail "broker socket path is empty"
 [ -n "$DB_PATH" ] || fail "state database path is empty"
+
+section "all GPU device permissions"
+if bash "$SCRIPT_DIR/verify_gpu_permissions.sh" --member "$MEMBER" --expected-gpus "$GPU_COUNT"; then
+    ok "all GPU and NVIDIA device permissions verified"
+else
+    fail "GPU device permission verification failed"
+fi
 if [ -S "$SOCKET" ]; then
     ok "broker socket exists: $SOCKET"
 else
@@ -280,6 +290,11 @@ if printf '%s' "$LIST_JSON" | grep -q '"mode"[[:space:]]*:[[:space:]]*"monitor"'
     ok "broker is in monitor mode"
 else
     fail "broker is not in monitor mode"
+fi
+if printf '%s' "$LIST_JSON" | grep -qE '"status"[[:space:]]*:[[:space:]]*"(pending|active)"'; then
+    fail "active/pending leases exist; monitor-only acceptance requires an idle deployment"
+else
+    ok "no active/pending leases"
 fi
 if printf '%s' "$LIST_JSON" | grep -q '"unmanaged"'; then
     ok "unmanaged resources are reported"

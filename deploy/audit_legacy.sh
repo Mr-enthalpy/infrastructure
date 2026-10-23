@@ -111,6 +111,7 @@ if [ -n "$docker_bin" ]; then
         for container_id in $container_ids; do
             name=$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")
             managed=$(docker inspect -f '{{index .Config.Labels "udc.managed"}}' "$container_id" 2>/dev/null || true)
+            container_status=$(docker inspect -f '{{.State.Status}}' "$container_id" 2>/dev/null || true)
             privileged=$(docker inspect -f '{{.HostConfig.Privileged}}' "$container_id" 2>/dev/null || true)
             pid_mode=$(docker inspect -f '{{.HostConfig.PidMode}}' "$container_id" 2>/dev/null || true)
             network_mode=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container_id" 2>/dev/null || true)
@@ -142,11 +143,18 @@ if [ -n "$docker_bin" ]; then
                 gpu_access="${gpu_access:+$gpu_access,}nvidia-visible-devices"
             fi
             if [ -n "$gpu_access" ]; then
-                if [ "$managed" = "true" ]; then
-                    warn "managed container $name has GPU access ($gpu_access)"
-                else
-                    fail "unmanaged container $name has GPU access ($gpu_access)"
-                fi
+                case "$container_status" in
+                    running|restarting|paused)
+                        if [ "$managed" = "true" ]; then
+                            warn "managed container $name has active GPU access ($gpu_access)"
+                        else
+                            fail "unmanaged container $name has active GPU access ($gpu_access)"
+                        fi
+                        ;;
+                    *)
+                        warn "stopped container $name has historical GPU refs ($gpu_access)"
+                        ;;
+                esac
             fi
         done
     fi

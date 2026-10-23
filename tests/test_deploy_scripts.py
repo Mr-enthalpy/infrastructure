@@ -11,6 +11,7 @@ SCRIPTS = [
     "audit_legacy.sh",
     "install_server.sh",
     "create_user.sh",
+    "verify_gpu_permissions.sh",
     "verify_monitor_only.sh",
 ]
 

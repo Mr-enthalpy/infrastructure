@@ -44,9 +44,10 @@ class BrokerClient:
             raise ProtocolError("broker response must be a JSON object")
         return decoded
 
-    def request(self, command: str, **args: Any) -> dict[str, Any]:
+    def request(self, command_name: str, **args: Any) -> dict[str, Any]:
         payload = (
-            json.dumps({"cmd": command, "args": args}, separators=(",", ":"), sort_keys=True) + "\n"
+            json.dumps({"cmd": command_name, "args": args}, separators=(",", ":"), sort_keys=True)
+            + "\n"
         )
         try:
             with socket.socket(self._family(), socket.SOCK_STREAM) as client:
@@ -59,17 +60,57 @@ class BrokerClient:
         except OSError as exc:
             raise BrokerUnavailable(f"cannot reach broker: {exc}") from exc
 
+    def connect_file(
+        self,
+        allocation_id: str,
+        path: str,
+        *,
+        upload: bool,
+    ) -> tuple[socket.socket, dict[str, Any]]:
+        command = "file_put" if upload else "file_get"
+        payload = (
+            json.dumps(
+                {
+                    "cmd": command,
+                    "args": {"id": allocation_id, "path": path},
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        client = socket.socket(self._family(), socket.SOCK_STREAM)
+        try:
+            client.settimeout(self.timeout)
+            client.connect(self.socket_path)
+            client.sendall(payload.encode("utf-8"))
+            response = self._read_line(client)
+            client.settimeout(None)
+        except OSError as exc:
+            client.close()
+            raise BrokerUnavailable(f"cannot reach broker: {exc}") from exc
+        except Exception:
+            client.close()
+            raise
+        return client, response
+
     def connect_shell(
         self,
         allocation_id: str,
         cols: int,
         rows: int,
+        job: str | None = None,
     ) -> tuple[socket.socket, dict[str, Any]]:
         payload = (
             json.dumps(
                 {
                     "cmd": "shell",
-                    "args": {"id": allocation_id, "cols": cols, "rows": rows},
+                    "args": {
+                        "id": allocation_id,
+                        "cols": cols,
+                        "rows": rows,
+                        **({"job": job} if job else {}),
+                    },
                 },
                 separators=(",", ":"),
                 sort_keys=True,

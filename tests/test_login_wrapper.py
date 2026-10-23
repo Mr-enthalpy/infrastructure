@@ -12,6 +12,22 @@ def test_empty_command_opens_menu():
     assert parse_command("") == ["udc-resource", "menu"]
 
 
+def test_job_and_file_commands_are_allowed():
+    assert parse_command("udc-resource job list abc") == [
+        "udc-resource",
+        "job",
+        "list",
+        "abc",
+    ]
+    assert parse_command("udc-resource file put abc data.bin") == [
+        "udc-resource",
+        "file",
+        "put",
+        "abc",
+        "data.bin",
+    ]
+
+
 @pytest.mark.parametrize(
     "raw",
     [

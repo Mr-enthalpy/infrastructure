@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-ALLOWED = {"list", "status", "apply", "release", "shell", "logs", "menu", "version"}
+ALLOWED = {"list", "status", "apply", "release", "shell", "logs", "job", "file", "menu", "version"}
 DENIED_TOKENS = {";", "&&", "||", "|", ">", ">>", "<", "&"}
 
 

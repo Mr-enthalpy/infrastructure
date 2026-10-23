@@ -7,12 +7,14 @@ import json
 import logging
 import math
 import os
+import re
 import stat
+import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .. import store
@@ -61,6 +63,8 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_BYTES = 64 * 1024
 CONNECTION_TIMEOUT = 30.0
+ACTIVE_GPU_HOLDER_STATUSES = {"running", "restarting", "paused"}
+JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,8 @@ class Broker:
         holders: dict[str, list[ContainerInfo]] = {}
         unknown = False
         for container in containers:
+            if container.status not in ACTIVE_GPU_HOLDER_STATUSES:
+                continue
             managed_active = (
                 container.labels.get("udc.managed") == "true"
                 and container.labels.get("udc.allocation") in active_allocation_ids
@@ -257,17 +263,27 @@ class Broker:
         connection = init_db(self.db_path)
         try:
             self._mode = store.get_mode(connection, self.config.policy.mode)
-            if self._mode == "active" and not self.config.policy.deployment_allowed:
+            leases = store.active_lease_count(connection)
+            target = self._mode
+            if self._mode == "monitor" and leases:
+                target = "maintenance"
+            elif self._mode == "active" and not self.config.policy.deployment_allowed:
+                target = "maintenance" if leases else "monitor"
+            if target != self._mode:
                 logger.warning(
-                    "active mode was persisted but deployment_allowed=false; forcing monitor"
+                    "adjusting persisted mode %s -> %s (leases=%d, deployment_allowed=%s)",
+                    self._mode,
+                    target,
+                    leases,
+                    self.config.policy.deployment_allowed,
                 )
                 store.set_mode(
                     connection,
-                    "monitor",
+                    target,
                     actor_uid=0,
                     now=self._now(),
                 )
-                self._mode = "monitor"
+                self._mode = target
         finally:
             connection.close()
         try:
@@ -314,14 +330,14 @@ class Broker:
             logger.warning("could not chown %s to group %s", path, self.config.groups.cli)
 
     def reconcile_once(self) -> dict[str, int]:
-        if self._mode != "active":
+        if self._mode not in {"active", "maintenance"}:
             logger.info("reconcile skipped in %s mode", self._mode)
             return {"skipped": 1}
         with self._connection() as connection:
             return reconcile_allocations(connection, self.docker, now=self._now())
 
     async def expire_once(self) -> list[str]:
-        if self._mode != "active":
+        if self._mode not in {"active", "maintenance"}:
             return []
         return await asyncio.to_thread(self._expire_once)
 
@@ -424,6 +440,18 @@ class Broker:
                         gid=gid,
                     )
                     break
+                if isinstance(payload, dict) and payload.get("cmd") in {
+                    "file_put",
+                    "file_get",
+                }:
+                    await self._handle_file(
+                        payload,
+                        reader=reader,
+                        writer=writer,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    break
                 response = await self.handle_request(payload, uid=uid, gid=gid, pid=pid)
                 await self._send(writer, response)
         except (BrokenPipeError, ConnectionResetError):
@@ -434,6 +462,197 @@ class Broker:
                 await writer.wait_closed()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+    def _workspace_target(
+        self,
+        allocation: dict[str, Any],
+        raw_path: Any,
+    ) -> tuple[str, Path]:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise BadRequest("path must be a non-empty relative path")
+        if raw_path == "/workspace":
+            raise BadRequest("path must name a file below /workspace")
+        if raw_path.startswith("/workspace/"):
+            raw_path = raw_path[len("/workspace/") :]
+        relative = PurePosixPath(raw_path)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise Forbidden("path must stay inside the allocation workspace")
+        workspace = Path(str(allocation["workspace"])).resolve()
+        candidate = workspace
+        for part in relative.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise Forbidden("refusing to transfer through a symlink")
+        target = candidate.resolve()
+        if target != workspace and workspace not in target.parents:
+            raise Forbidden("path must stay inside the allocation workspace")
+        return relative.as_posix(), target
+
+    async def _handle_file(
+        self,
+        payload: Any,
+        *,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        uid: int,
+        gid: int,
+    ) -> None:
+        try:
+            identity = self.identity_resolver.resolve(uid, gid)
+            with self._connection() as connection:
+                store.ensure_user(
+                    connection,
+                    uid=identity.uid,
+                    username=identity.username,
+                    role=identity.role,
+                    now=self._now(),
+                )
+            command, args = self._parse_request(payload)
+            if command not in {"file_put", "file_get"}:
+                raise BadRequest("expected file transfer command")
+            self._check_args(args, {"id", "path"})
+            allocation_id = args.get("id")
+            if not isinstance(allocation_id, str) or not allocation_id:
+                raise BadRequest("id must be a non-empty string")
+            with self._connection() as connection:
+                allocation = store.get_allocation(connection, allocation_id, now=self._now())
+            if allocation["owner_uid"] != identity.uid and not identity.is_admin:
+                raise Forbidden("only the owner or an admin may transfer files")
+            if allocation["status"] != "active":
+                raise Conflict(f"allocation is {allocation['status']}, not active")
+            relative, target = self._workspace_target(allocation, args.get("path"))
+            if target.is_symlink():
+                raise Forbidden("refusing to transfer through a symlink")
+            if command == "file_get" and not target.is_file():
+                raise NotFound(f"file not found: {relative}")
+            if command == "file_put" and target.exists() and target.is_dir():
+                raise Conflict(f"target is a directory: {relative}")
+        except (KeyError, RuntimeError) as exc:
+            await self._send(writer, _error("forbidden", f"peer identity failed: {exc}"))
+            return
+        except UdcError as exc:
+            await self._send(writer, _error(exc.code, exc.message))
+            return
+        except Exception:
+            logger.exception("could not prepare file transfer")
+            await self._send(writer, _error("internal", "could not prepare file transfer"))
+            return
+
+        await self._send(
+            writer,
+            _ok({"id": allocation_id, "path": relative}),
+        )
+        if command == "file_get":
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(target, flags)
+                with os.fdopen(fd, "rb") as handle:
+                    while chunk := handle.read(65536):
+                        await write_frame(writer, FRAME_DATA, chunk)
+                await write_frame(
+                    writer,
+                    FRAME_EXIT,
+                    json.dumps(
+                        {"ok": True, "data": {"path": relative}},
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+                with self._connection() as connection:
+                    store.record_event(
+                        connection,
+                        actor_uid=identity.uid,
+                        action="file_get",
+                        allocation_id=allocation_id,
+                        detail={"path": relative},
+                        now=self._now(),
+                    )
+                    connection.commit()
+            except Exception:
+                logger.exception("file get failed")
+                try:
+                    await write_frame(
+                        writer,
+                        FRAME_EXIT,
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": {
+                                    "code": "internal",
+                                    "message": "file download failed",
+                                },
+                            },
+                            sort_keys=True,
+                        ).encode("utf-8"),
+                    )
+                except Exception:
+                    pass
+            return
+
+        written = 0
+        temp: Path | None = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=".udc-upload-",
+                dir=str(target.parent),
+            )
+            temp = Path(temp_name)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                while True:
+                    frame = await read_frame(reader)
+                    if frame is None:
+                        raise BadRequest("file upload ended without an exit frame")
+                    kind, data = frame
+                    if kind == FRAME_DATA:
+                        handle.write(data)
+                        written += len(data)
+                    elif kind == FRAME_EXIT:
+                        break
+                    else:
+                        raise BadRequest("unexpected file transfer frame")
+            os.replace(temp, target)
+            temp = None
+            with self._connection() as connection:
+                store.record_event(
+                    connection,
+                    actor_uid=identity.uid,
+                    action="file_put",
+                    allocation_id=allocation_id,
+                    detail={"path": relative, "bytes": written},
+                    now=self._now(),
+                )
+                connection.commit()
+            await write_frame(
+                writer,
+                FRAME_EXIT,
+                json.dumps(
+                    {
+                        "ok": True,
+                        "data": {"path": relative, "bytes": written},
+                    },
+                    sort_keys=True,
+                ).encode("utf-8"),
+            )
+        except Exception as exc:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+            logger.exception("file put failed")
+            await write_frame(
+                writer,
+                FRAME_EXIT,
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": {"code": "internal", "message": str(exc)},
+                    },
+                    sort_keys=True,
+                ).encode("utf-8"),
+            )
 
     async def _handle_shell(
         self,
@@ -457,7 +676,7 @@ class Broker:
             command, args = self._parse_request(payload)
             if command != "shell":
                 raise BadRequest("expected shell command")
-            self._check_args(args, {"id", "cols", "rows"})
+            self._check_args(args, {"id", "cols", "rows", "job"})
             allocation_id = args.get("id")
             if not isinstance(allocation_id, str) or not allocation_id:
                 raise BadRequest("id must be a non-empty string")
@@ -476,11 +695,27 @@ class Broker:
             container_id = str(allocation["container_id"])
             if not container_id:
                 raise NotFound("allocation has no container")
+            shell_command: list[str] | None = None
+            job = args.get("job")
+            if job is not None:
+                job_name = self._job_name(job)
+                jobs = await asyncio.to_thread(self.docker.list_jobs, container_id)
+                if not any(item.get("name") == job_name for item in jobs):
+                    raise NotFound(f"job not found: {job_name}")
+                shell_command = [
+                    "env",
+                    "TERM=xterm-256color",
+                    "tmux",
+                    "attach-session",
+                    "-t",
+                    f"udc-{job_name}",
+                ]
             session = await asyncio.to_thread(
                 self.docker.open_shell,
                 container_id,
                 cols,
                 rows,
+                shell_command,
             )
         except (KeyError, RuntimeError) as exc:
             await self._send(writer, _error("forbidden", f"peer identity failed: {exc}"))
@@ -601,6 +836,18 @@ class Broker:
             if command == "logs":
                 self._check_args(args, {"id", "tail"})
                 return _ok(await self._logs(identity, args))
+            if command == "job_start":
+                self._check_args(args, {"id", "name", "command"})
+                return _ok(await self._job_start(identity, args))
+            if command == "job_list":
+                self._check_args(args, {"id"})
+                return _ok(await self._job_list(identity, args))
+            if command == "job_logs":
+                self._check_args(args, {"id", "name", "tail"})
+                return _ok(await self._job_logs(identity, args))
+            if command == "job_stop":
+                self._check_args(args, {"id", "name"})
+                return _ok(await self._job_stop(identity, args))
             if command == "admin_users":
                 self._check_args(args)
                 self._require_admin(identity)
@@ -656,7 +903,12 @@ class Broker:
         now = self._now()
         live = self._live_resources()
         with self._connection() as connection:
-            self._mode = store.get_mode(connection, self._mode)
+            persisted = store.get_mode(connection, self._mode)
+            if persisted == "monitor" and store.active_lease_count(connection):
+                logger.warning("promoting monitor to maintenance while active/pending leases exist")
+                store.set_mode(connection, "maintenance", actor_uid=0, now=now)
+                persisted = "maintenance"
+            self._mode = persisted
             db_gpus = store.list_gpus(connection, now=now)
             allocations = store.list_allocations(connection, now=now)
             active_ids = {
@@ -697,6 +949,9 @@ class Broker:
                 continue
             resolved, unknown_ref = self._resolve_gpu_refs(container.gpu_refs, gpus)
             indices = sorted({int(gpu["index"]) for gpu in gpus if str(gpu["uuid"]) in resolved})
+            active_gpu_access = (
+                bool(indices) or unknown_ref
+            ) and container.status in ACTIVE_GPU_HOLDER_STATUSES
             unmanaged_containers.append(
                 {
                     "id": container.id,
@@ -708,6 +963,7 @@ class Broker:
                     "gpu_refs": list(container.gpu_refs),
                     "gpus": indices,
                     "gpu_unknown": unknown_ref,
+                    "active_gpu_access": active_gpu_access,
                 }
             )
         unmanaged_processes: list[dict[str, Any]] = []
@@ -715,6 +971,7 @@ class Broker:
             container_id = container_by_uuid.get(process.gpu_uuid)
             if container_id and self._pid_in_container(process.pid, container_id):
                 continue
+            process_container = self._pid_container(process.pid, live.containers)
             unmanaged_processes.append(
                 {
                     "gpu_uuid": process.gpu_uuid,
@@ -722,12 +979,33 @@ class Broker:
                     "pid": process.pid,
                     "used_mib": process.used_mib,
                     "process_name": process.process_name,
+                    "uid": process.uid,
+                    "username": process.username,
+                    "container_id": (process_container.id if process_container else None),
+                    "container_name": (process_container.name if process_container else None),
+                    "container_owner": (
+                        process_container.labels.get("udc.owner") if process_container else None
+                    ),
                 }
             )
         return {
             "containers": unmanaged_containers,
             "processes": unmanaged_processes,
         }
+
+    @staticmethod
+    def _pid_container(pid: int, containers: list[ContainerInfo]) -> ContainerInfo | None:
+        try:
+            cgroup = Path(f"/proc/{pid}/cgroup").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None
+        for container in containers:
+            if container.id and container.id in cgroup:
+                return container
+        return None
 
     @staticmethod
     def _pid_in_container(pid: int, container_id: str) -> bool:
@@ -838,6 +1116,10 @@ class Broker:
                 expires_at=expires_at,
                 max_cpus=self.config.policy.max_cpus,
                 max_memory_gb=self.config.policy.max_memory_gb,
+                max_gpus_per_user=self.config.policy.max_gpus_per_user,
+                max_active_allocations_per_user=(
+                    self.config.policy.max_active_allocations_per_user
+                ),
                 now=self._now(),
             )
             allocation_data = store.get_allocation(connection, allocation_id, now=self._now())
@@ -934,6 +1216,126 @@ class Broker:
             )
             return store.get_allocation(connection, allocation_id, now=self._now())
 
+    @staticmethod
+    def _job_name(raw: Any) -> str:
+        if not isinstance(raw, str) or not JOB_NAME_RE.fullmatch(raw):
+            raise BadRequest("job name must match [A-Za-z0-9_.-]{1,32}")
+        if raw in {".", ".."}:
+            raise BadRequest("invalid job name")
+        return raw
+
+    def _job_allocation(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation_id = args.get("id")
+        if not isinstance(allocation_id, str) or not allocation_id:
+            raise BadRequest("id must be a non-empty string")
+        with self._connection() as connection:
+            allocation = store.get_allocation(connection, allocation_id, now=self._now())
+        if allocation["owner_uid"] != identity.uid and not identity.is_admin:
+            raise Forbidden("only the owner or an admin may manage jobs")
+        if allocation["status"] != "active":
+            raise Conflict(f"allocation is {allocation['status']}, not active")
+        if not allocation["container_id"]:
+            raise NotFound("allocation has no container")
+        return allocation
+
+    def _job_log_path(self, allocation: dict[str, Any], name: str) -> Path:
+        workspace = Path(str(allocation["workspace"]))
+        path = workspace / ".udc-logs" / f"{name}.log"
+        try:
+            path.resolve().relative_to(workspace.resolve())
+        except ValueError as exc:
+            raise Forbidden("job log path escapes the workspace") from exc
+        return path
+
+    @staticmethod
+    def _tail_file(path: Path, tail: int) -> str:
+        if tail <= 0:
+            return ""
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 2 * 1024 * 1024))
+            data = handle.read()
+        lines = data.decode("utf-8", errors="replace").splitlines(keepends=True)
+        return "".join(lines[-tail:])
+
+    async def _job_start(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation = self._job_allocation(identity, args)
+        name = self._job_name(args.get("name"))
+        command = args.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(item, str) for item in command)
+        ):
+            raise BadRequest("command must be a non-empty list of strings")
+        container_id = str(allocation["container_id"])
+        log_path = self._job_log_path(allocation, name)
+        await asyncio.to_thread(self.docker.start_job, container_id, name, command)
+        with self._connection() as connection:
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="job_started",
+                allocation_id=str(allocation["id"]),
+                detail={"name": name, "command": command},
+                now=self._now(),
+            )
+            connection.commit()
+        return {
+            "id": allocation["id"],
+            "name": name,
+            "session": f"udc-{name}",
+            "log": str(log_path),
+        }
+
+    async def _job_list(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation = self._job_allocation(identity, args)
+        container_id = str(allocation["container_id"])
+        jobs = await asyncio.to_thread(self.docker.list_jobs, container_id)
+        enriched: list[dict[str, Any]] = []
+        for job in jobs:
+            path = self._job_log_path(allocation, str(job["name"]))
+            item: dict[str, Any] = dict(job)
+            item["log"] = str(path)
+            item["log_bytes"] = path.stat().st_size if path.is_file() else 0
+            enriched.append(item)
+        return {"id": allocation["id"], "jobs": enriched}
+
+    async def _job_logs(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation = self._job_allocation(identity, args)
+        name = self._job_name(args.get("name"))
+        tail = self._parse_positive_int(args.get("tail", 200), "tail")
+        if tail > 10000:
+            raise BadRequest("tail must not exceed 10000")
+        path = self._job_log_path(allocation, name)
+        if not path.is_file():
+            raise NotFound(f"job log not found: {name}")
+        content = await asyncio.to_thread(self._tail_file, path, tail)
+        return {
+            "id": allocation["id"],
+            "name": name,
+            "log": str(path),
+            "logs": content,
+        }
+
+    async def _job_stop(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation = self._job_allocation(identity, args)
+        name = self._job_name(args.get("name"))
+        container_id = str(allocation["container_id"])
+        await asyncio.to_thread(self.docker.stop_job, container_id, name)
+        with self._connection() as connection:
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="job_stopped",
+                allocation_id=str(allocation["id"]),
+                detail={"name": name},
+                now=self._now(),
+            )
+            connection.commit()
+        return {"id": allocation["id"], "name": name, "stopped": True}
+
     async def _logs(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
         allocation_id = args.get("id")
         if not isinstance(allocation_id, str) or not allocation_id:
@@ -987,8 +1389,28 @@ class Broker:
         args: dict[str, Any],
     ) -> dict[str, Any]:
         mode = args.get("mode")
-        if mode not in {"monitor", "active"}:
-            raise BadRequest("mode must be monitor or active")
+        if mode not in {"monitor", "maintenance", "active"}:
+            raise BadRequest("mode must be monitor, maintenance, or active")
+        if mode == "monitor":
+            with self._connection() as connection:
+                leases = store.active_lease_count(connection)
+            if leases:
+                raise Conflict(
+                    "cannot switch to monitor while active/pending leases exist; "
+                    "use maintenance mode"
+                )
+            try:
+                managed = [
+                    container
+                    for container in self.docker.list_containers()
+                    if container.labels.get("udc.managed") == "true"
+                ]
+            except Exception as exc:
+                raise Conflict(f"cannot verify managed containers: {exc}") from exc
+            if managed:
+                raise Conflict(
+                    "cannot switch to monitor while managed containers exist; use maintenance mode"
+                )
         if mode == "active" and not self.config.policy.deployment_allowed:
             raise Forbidden("deployment_allowed=false; active mode is not approved")
         if mode == "active":
@@ -1016,7 +1438,7 @@ class Broker:
             blocking_containers = [
                 str(container["name"])
                 for container in unmanaged["containers"]
-                if container.get("gpus")
+                if container.get("active_gpu_access")
             ]
             blocking_processes = [
                 f"pid {process['pid']} on GPU {process.get('gpu_index')}"
@@ -1038,6 +1460,8 @@ class Broker:
             raise Forbidden("admin permission required")
 
     def _require_active(self) -> None:
+        if self._mode == "maintenance":
+            raise MonitorOnly("broker is in maintenance mode; new allocations are disabled")
         if self._mode != "active":
             raise MonitorOnly("broker is in monitor-only mode")
 

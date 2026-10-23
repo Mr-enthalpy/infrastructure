@@ -71,6 +71,7 @@ p { margin: 0; }
 .pill.offline { color: var(--offline); border-color: rgba(249, 115, 22, 0.45); }
 .pill.unknown { color: var(--muted); }
 .pill.monitor { color: var(--warn); border-color: rgba(251, 191, 36, 0.35); }
+.pill.maintenance { color: var(--accent-2); border-color: rgba(56, 189, 248, 0.4); }
 .pill.active { color: var(--ok); border-color: rgba(52, 211, 153, 0.35); }
 
 .banner {

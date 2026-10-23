@@ -1,6 +1,6 @@
 # UDC Lab Infrastructure
 
-本仓库是 UDC 实验室共享 GPU 服务器的独立基础设施仓库，核心实现为 `udc-resource`：受限 SSH CLI、root Broker、SQLite 状态、Docker 生命周期、monitor-only 对账和本地 Web GUI。
+本仓库是 UDC 实验室共享 GPU 服务器的独立基础设施仓库，核心实现为 `udc-resource`：受限 SSH CLI、root Broker、SQLite 状态、Docker 生命周期、monitor/maintenance 模式与对账、和本地 Web GUI。
 
 `infrastructure` 不依附于研究仓库，不是 `reconstruction` / `optic_system` 的 submodule；不修改 Meta pin、不读取测试集、不操作实验机。
 
@@ -20,6 +20,7 @@
 - **Broker**：root systemd 服务，只监听 Unix socket，通过 `SO_PEERCRED` 识别 UID。
 - **SQLite**：allocation、GPU claim、settings 和审计事件；WAL + 显式事务。
 - **Docker driver**：整卡 GPU、CPU/RAM 限制、workspace 挂载、到期/释放/重启对账。
+- **Job/file**：tmux 长任务可断线重连并保留日志；文件传输只限个人 workspace。
 - **GUI**：本地 `127.0.0.1` Web UI + xterm.js；只通过 SSH 调用 CLI，不直连 Broker。
 
 ## 设计约束
@@ -28,8 +29,9 @@
 - Broker 以 root systemd 运行，只开 Unix socket，通过 `SO_PEERCRED` 识别用户。
 - CLI 是唯一用户业务入口；GUI 的数据请求只调用 CLI `--json`，交互终端只调用 CLI `shell`。
 - GPU 整卡、12h 默认 / 36h 上限；到期停止容器，保留 workspace，不自动续租。
+- 每用户默认最多 4 张 GPU、4 个 active allocation，admin 同样受限。
 - 容器内 root，但不 privileged、不挂 host Docker socket、只挂个人 workspace。
-- 先 `monitor-only`，只显示现有占用，不碰未知容器。
+- `monitor` 只读、不碰未知容器也不暂停既有 lease；存在 active/pending lease 时使用 `maintenance`，禁止新申请但继续到期/对账。
 
 ## 本地实验室资源
 
@@ -58,7 +60,7 @@ src/udc_resource/
   identity.py        # UID/组身份解析与 SO_PEERCRED
   errors.py          # Broker/CLI 共享错误码与退出码
   stream.py          # shell 长度前缀帧协议
-  cli.py             # CLI：list/status/apply/release/logs/shell/gui/admin
+  cli.py             # CLI：list/status/apply/release/logs/shell/gui/admin/job/push/pull
   client.py          # Unix socket 客户端（超时/协议错误）
   login_wrapper.py   # SSH ForceCommand 白名单包装器
   broker/            # UDS Broker、Docker driver、到期 worker、重启对账
@@ -67,19 +69,27 @@ deploy/
   preflight.sh       # 只读部署预检，不修改主机
   install_server.sh  # 幂等安装器；--dry-run / --yes / --start
   create_user.sh     # 成员/管理员账号与 SSH key
+  verify_gpu_permissions.sh # 只读全 GPU/NVIDIA 设备权限验收
   verify_monitor_only.sh  # 只读 monitor-only 安全验收
   systemd/udev/sshd/docker/  # 部署模板
+docs/                # 验收、legacy 权限撤销、job 与文件传输文档
 tests/               # 配置、数据库与安全规则测试
 lab/                 # 本地资源清单与说明
 .github/workflows/   # Linux/Windows CI
 uv.lock              # 锁定依赖版本
 ```
 
+## 文档
+
+- [docs/acceptance.md](docs/acceptance.md)：active 模式破坏性验收（包含 job 断线/重连/重启持久化）。
+- [docs/jobs-and-transfer.md](docs/jobs-and-transfer.md)：detached tmux 训练任务与受限文件传输。
+- [docs/legacy-access-revocation.md](docs/legacy-access-revocation.md)：旧管理员权限撤销与验证清单。
+
 ## 阶段状态
 
 - P0 已完成：Python 3.11+ 基线、依赖锁定、SQLite schema、配置上限、login wrapper 绝对路径、只读 preflight、CI。
 - P1 已完成：Unix socket Broker、`SO_PEERCRED`、SQLite 事务、多 GPU claim、用户/管理员权限、审计事件、CLI `list/status/apply/admin/config`。
-- P2 已完成：真实 Docker driver、GPU/CPU/RAM 限制、workspace 创建、release、到期 worker、重启对账、未纳管资源展示。
+- P2 已完成：真实 Docker driver、GPU/CPU/RAM 限制、workspace 创建、release、到期 worker、重启对账、未纳管资源展示；detached tmux job 与受限文件传输。
 - P3 已完成：幂等安装脚本、成员/管理员账号脚本、udev/sshd/systemd 模板、只读 monitor-only 安全验收脚本。
 - P4 已完成：本地 Web GUI、GPU 总览/申请/release/logs、管理员页、未纳管只读页、内嵌 xterm.js 终端。
 - P5 待实现：训练结束后的实机 monitor-only → CPU → 单 GPU 验收；四项 active 验收脚本见 `docs/acceptance.md`。

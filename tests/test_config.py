@@ -18,6 +18,8 @@ def test_example_config_is_valid():
     assert cfg.policy.max_memory_gb == 128
     assert cfg.policy.reserve_cpus == 8
     assert cfg.policy.reserve_memory_gb == 32
+    assert cfg.policy.max_gpus_per_user == 4
+    assert cfg.policy.max_active_allocations_per_user == 4
 
 
 def test_invalid_duration_is_rejected(tmp_path):

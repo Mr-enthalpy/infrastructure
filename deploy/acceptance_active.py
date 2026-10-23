@@ -53,7 +53,16 @@ def ssh_cli(
     *,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
-    command = shlex.join(["udc-resource", *args, "--json"])
+    return ssh_cli_raw(alias, [*args, "--json"], timeout=timeout)
+
+
+def ssh_cli_raw(
+    alias: str,
+    args: list[str],
+    *,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    command = shlex.join(["udc-resource", *args])
     result = ssh(alias, command, timeout=timeout)
     text = result.stdout.strip()
     try:
@@ -308,6 +317,85 @@ class Acceptance:
             "GPU to become free after holder cleanup",
         )
 
+    def test_file_transfer(self, allocation_id: str) -> None:
+        remote = f"acceptance/transfer-{os.getpid()}.bin"
+        payload = b"udc-transfer\x00" + os.urandom(32)
+        put = subprocess.run(
+            [
+                "ssh",
+                *SSH_DEFAULT_OPTIONS,
+                self.member_a,
+                shlex.join(
+                    [
+                        "udc-resource",
+                        "file",
+                        "put",
+                        allocation_id,
+                        f"/workspace/{remote}",
+                    ]
+                ),
+            ],
+            input=payload,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if put.returncode != 0:
+            raise AcceptanceError(
+                "file put failed: " + (put.stderr or put.stdout).decode("utf-8", errors="replace")
+            )
+        try:
+            ack = json.loads(put.stdout.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise AcceptanceError(f"file put returned invalid JSON: {put.stdout!r}") from exc
+        if not ack.get("ok"):
+            raise AcceptanceError(f"file put was rejected: {ack}")
+
+        get = subprocess.run(
+            [
+                "ssh",
+                *SSH_DEFAULT_OPTIONS,
+                self.member_a,
+                shlex.join(["udc-resource", "file", "get", allocation_id, remote]),
+            ],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if get.returncode != 0:
+            raise AcceptanceError(
+                "file get failed: " + (get.stderr or get.stdout).decode("utf-8", errors="replace")
+            )
+        if get.stdout != payload:
+            raise AcceptanceError("file get returned different bytes")
+
+        escape = subprocess.run(
+            [
+                "ssh",
+                *SSH_DEFAULT_OPTIONS,
+                self.member_a,
+                shlex.join(
+                    [
+                        "udc-resource",
+                        "file",
+                        "put",
+                        allocation_id,
+                        "../escape",
+                    ]
+                ),
+            ],
+            input=b"must-not-write",
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if escape.returncode == 0:
+            raise AcceptanceError("file put accepted a workspace escape path")
+        detail = (escape.stdout + escape.stderr).decode("utf-8", errors="replace").lower()
+        if "forbidden" not in detail:
+            raise AcceptanceError(f"file put escape was not rejected as forbidden: {detail}")
+        print("[pass] restricted file put/get works and rejects traversal")
+
     def test_expiry_restart_disconnect(self) -> None:
         self.require_free_gpu()
         if not self.args.allow_db_time_travel:
@@ -387,6 +475,92 @@ class Acceptance:
             marker = workspace / "acceptance-marker"
             if not marker.is_file():
                 raise AcceptanceError(f"workspace marker is missing: {marker}")
+            self.test_file_transfer(allocation_id)
+
+            job_name = f"accept-{os.getpid()}"
+            try:
+                started = require_ok(
+                    ssh_cli_raw(
+                        self.member_a,
+                        [
+                            "job",
+                            "start",
+                            allocation_id,
+                            "--name",
+                            job_name,
+                            "--json",
+                            "--",
+                            "bash",
+                            "-lc",
+                            "echo job-started; sleep 900",
+                        ],
+                    ),
+                    "job start",
+                )
+                log_path = Path(str(started["log"]))
+                if not log_path.is_file():
+                    raise AcceptanceError(f"job log was not created: {log_path}")
+                wait_until(
+                    lambda: "job-started" in log_path.read_text(errors="replace"),
+                    30,
+                    1,
+                    "job log content",
+                )
+                listed = require_ok(
+                    ssh_cli(self.member_a, ["job", "list", allocation_id]),
+                    "job list before disconnect",
+                )
+                if not any(item.get("name") == job_name for item in listed.get("jobs", [])):
+                    raise AcceptanceError("job is missing before SSH disconnect")
+
+                for attempt in range(2):
+                    attach = subprocess.Popen(
+                        [
+                            "ssh",
+                            "-tt",
+                            *SSH_DEFAULT_OPTIONS,
+                            self.member_a,
+                            shlex.join(
+                                [
+                                    "udc-resource",
+                                    "job",
+                                    "attach",
+                                    allocation_id,
+                                    "--name",
+                                    job_name,
+                                ]
+                            ),
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                    try:
+                        time.sleep(2)
+                    finally:
+                        attach.terminate()
+                        try:
+                            attach.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            attach.kill()
+                    listed = require_ok(
+                        ssh_cli(self.member_a, ["job", "list", allocation_id]),
+                        f"job list after attach disconnect {attempt + 1}",
+                    )
+                    if not any(item.get("name") == job_name for item in listed.get("jobs", [])):
+                        raise AcceptanceError(f"job died after SSH attach disconnect {attempt + 1}")
+                logs = require_ok(
+                    ssh_cli(
+                        self.member_a,
+                        ["job", "logs", allocation_id, "--name", job_name],
+                    ),
+                    "job logs before restart",
+                )
+                if "job-started" not in str(logs.get("logs", "")):
+                    raise AcceptanceError("job log did not survive attach disconnect")
+            except Exception:
+                raise
 
             result = local(["systemctl", "restart", "udc-resource-broker"], timeout=60)
             if result.returncode != 0:
@@ -409,6 +583,72 @@ class Acceptance:
             if not marker.is_file():
                 raise AcceptanceError("workspace marker disappeared after restart")
 
+            listed = require_ok(
+                ssh_cli(self.member_a, ["job", "list", allocation_id]),
+                "job list after broker restart",
+            )
+            if not any(item.get("name") == job_name for item in listed.get("jobs", [])):
+                raise AcceptanceError("job did not survive broker restart")
+            logs = require_ok(
+                ssh_cli(
+                    self.member_a,
+                    ["job", "logs", allocation_id, "--name", job_name],
+                ),
+                "job logs after broker restart",
+            )
+            if "job-started" not in str(logs.get("logs", "")):
+                raise AcceptanceError("job log did not survive broker restart")
+            attach = subprocess.Popen(
+                [
+                    "ssh",
+                    "-tt",
+                    *SSH_DEFAULT_OPTIONS,
+                    self.member_a,
+                    shlex.join(
+                        [
+                            "udc-resource",
+                            "job",
+                            "attach",
+                            allocation_id,
+                            "--name",
+                            job_name,
+                        ]
+                    ),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            try:
+                time.sleep(2)
+            finally:
+                attach.terminate()
+                try:
+                    attach.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    attach.kill()
+            require_ok(
+                ssh_cli(
+                    self.member_a,
+                    ["job", "stop", allocation_id, "--name", job_name],
+                ),
+                "job stop",
+            )
+            wait_until(
+                lambda: (
+                    not any(
+                        item.get("name") == job_name
+                        for item in require_ok(
+                            ssh_cli(self.member_a, ["job", "list", allocation_id]),
+                            "job list after stop",
+                        ).get("jobs", [])
+                    )
+                ),
+                10,
+                1,
+                "job stop",
+            )
             expires = (datetime.now(UTC) + timedelta(seconds=10)).isoformat()
             connection = sqlite3.connect(self.db_path)
             try:
@@ -460,6 +700,27 @@ class Acceptance:
                 + audit.stdout
                 + audit.stderr
             )
+        expected = int(self.config.get("hardware", {}).get("gpu_count", 8))
+        for user in (self.member_a_user, self.member_b_user):
+            if not user:
+                continue
+            gpu_check = local(
+                [
+                    "bash",
+                    str(Path(__file__).with_name("verify_gpu_permissions.sh")),
+                    "--member",
+                    user,
+                    "--expected-gpus",
+                    str(expected),
+                ],
+                timeout=180,
+            )
+            if gpu_check.returncode != 0:
+                raise AcceptanceError(
+                    f"GPU permission verification failed for {user}:\n"
+                    + gpu_check.stdout
+                    + gpu_check.stderr
+                )
         data = require_ok(ssh_cli(self.member_a, ["list"]), "initial list")
         existing = [
             allocation

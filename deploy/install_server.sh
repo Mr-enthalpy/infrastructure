@@ -285,9 +285,9 @@ fi
 
 run install -d -o root -g root -m 0750 "$STATE_DIR"
 if [ "$DRY_RUN" -eq 1 ]; then
-    note "would initialize SQLite and force mode=monitor"
+    note "would initialize SQLite; fresh install uses monitor, active leases keep management"
 else
-    (umask 077; UDC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" - <<'PY'
+    MODE=$(umask 077; UDC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" - <<'PY'
 import os
 
 from udc_resource.config import load_config
@@ -296,9 +296,18 @@ from udc_resource import store
 
 config = load_config(os.environ["UDC_RESOURCE_CONFIG"])
 connection = init_db(config.server.state_db)
-store.set_mode(connection, "monitor", actor_uid=0)
+leases = store.active_lease_count(connection)
+current = store.get_mode(connection, config.policy.mode)
+if leases:
+    target = current if current in {"active", "maintenance"} else "maintenance"
+    if target == "active" and not config.policy.deployment_allowed:
+        target = "maintenance"
+else:
+    target = "monitor"
+if target != current:
+    store.set_mode(connection, target, actor_uid=0)
 connection.close()
-print(f"state database ready: {config.server.state_db}")
+print(target)
 PY
     ) || fail "SQLite initialization failed"
     STATE_DB=$(UDC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
@@ -310,7 +319,7 @@ PY
         /var/lib/udc-resource/*) ;;
         *) warn "state_db is outside /var/lib/udc-resource; update systemd ReadWritePaths" ;;
     esac
-    ok "SQLite initialized in monitor mode"
+    ok "SQLite initialized in ${MODE} mode"
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -369,7 +378,7 @@ if [ "$START" -eq 1 ]; then
         sleep 1
         systemctl is-active --quiet udc-resource-broker.service \
             || fail "broker failed to start; inspect journalctl -u udc-resource-broker"
-        ok "broker started in monitor mode"
+        ok "broker started (${MODE:-unknown} mode)"
     fi
 else
     note "broker installed but not started; use: systemctl start udc-resource-broker"
