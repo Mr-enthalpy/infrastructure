@@ -6,7 +6,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .db import get_setting
@@ -227,6 +227,148 @@ def record_event(
     )
 
 
+def _check_capacity(
+    connection: sqlite3.Connection,
+    *,
+    owner_uid: int,
+    gpu_uuids: Sequence[str],
+    cpus: float,
+    memory_gb: int,
+    max_cpus: float,
+    max_memory_gb: int,
+    max_cpus_per_user: float,
+    max_memory_gb_per_user: int,
+    max_gpus_per_user: int,
+    max_active_allocations_per_user: int,
+    available_gpu_uuids: set[str] | None = None,
+) -> None:
+    if len(set(gpu_uuids)) != len(gpu_uuids):
+        raise GpuBusy("duplicate GPUs in request")
+    if available_gpu_uuids is not None:
+        unavailable = sorted(set(gpu_uuids) - available_gpu_uuids)
+        if unavailable:
+            raise GpuBusy("GPU is not currently free: " + ", ".join(unavailable))
+    if gpu_uuids:
+        placeholders = ",".join("?" for _ in gpu_uuids)
+        busy = connection.execute(
+            f"SELECT gpu_uuid FROM active_gpu_claims WHERE gpu_uuid IN ({placeholders})",
+            list(gpu_uuids),
+        ).fetchall()
+        if busy:
+            names = ", ".join(str(row["gpu_uuid"]) for row in busy)
+            raise GpuBusy(f"GPU already allocated: {names}")
+    used = connection.execute(
+        """
+        SELECT COALESCE(SUM(cpus), 0) AS cpus,
+               COALESCE(SUM(memory_gb), 0) AS memory_gb
+        FROM allocations
+        WHERE status IN ('pending', 'active')
+        """
+    ).fetchone()
+    if float(used["cpus"]) + cpus > max_cpus:
+        raise InsufficientResources(
+            f"CPU budget exceeded: {float(used['cpus']) + cpus:g} > {max_cpus:g}"
+        )
+    if int(used["memory_gb"]) + memory_gb > max_memory_gb:
+        raise InsufficientResources(
+            f"memory budget exceeded: {int(used['memory_gb']) + memory_gb} > {max_memory_gb}"
+        )
+    user = connection.execute(
+        """
+        SELECT COUNT(*) AS allocations,
+               COALESCE(SUM(cpus), 0) AS cpus,
+               COALESCE(SUM(memory_gb), 0) AS memory_gb
+        FROM allocations
+        WHERE owner_uid = ? AND status IN ('pending', 'active')
+        """,
+        (owner_uid,),
+    ).fetchone()
+    user_allocations = int(user["allocations"])
+    if user_allocations + 1 > max_active_allocations_per_user:
+        raise InsufficientResources(
+            f"per-user allocation limit exceeded: "
+            f"{user_allocations + 1} > {max_active_allocations_per_user}"
+        )
+    if float(user["cpus"]) + cpus > max_cpus_per_user:
+        raise InsufficientResources(
+            f"per-user CPU limit exceeded: {float(user['cpus']) + cpus:g} > {max_cpus_per_user:g}"
+        )
+    if int(user["memory_gb"]) + memory_gb > max_memory_gb_per_user:
+        raise InsufficientResources(
+            f"per-user memory limit exceeded: "
+            f"{int(user['memory_gb']) + memory_gb} > {max_memory_gb_per_user}"
+        )
+    user_gpus = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM allocation_gpus AS ag "
+            "JOIN allocations AS a ON a.id = ag.allocation_id "
+            "WHERE a.owner_uid = ? AND a.status IN ('pending', 'active')",
+            (owner_uid,),
+        ).fetchone()[0]
+    )
+    if user_gpus + len(gpu_uuids) > max_gpus_per_user:
+        raise InsufficientResources(
+            f"per-user GPU limit exceeded: {user_gpus + len(gpu_uuids)} > {max_gpus_per_user}"
+        )
+
+
+def _insert_allocation(
+    connection: sqlite3.Connection,
+    *,
+    allocation_id: str,
+    owner_uid: int,
+    owner_name: str,
+    gpu_uuids: Sequence[str],
+    cpus: float,
+    memory_gb: int,
+    image: str,
+    workspace: str,
+    note: str,
+    starts_at: datetime,
+    expires_at: datetime,
+    now: datetime | None,
+    action: str = "allocation_pending",
+) -> None:
+    timestamp = (now or utcnow()).isoformat()
+    connection.execute(
+        """
+        INSERT INTO allocations(
+            id, owner_uid, owner_name, status, image, cpus, memory_gb,
+            workspace, note, created_at, starts_at, expires_at
+        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            allocation_id,
+            owner_uid,
+            owner_name,
+            image,
+            cpus,
+            memory_gb,
+            workspace,
+            note,
+            timestamp,
+            starts_at.isoformat(),
+            expires_at.isoformat(),
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO allocation_gpus(allocation_id, gpu_uuid) VALUES (?, ?)",
+        [(allocation_id, gpu_uuid) for gpu_uuid in gpu_uuids],
+    )
+    connection.executemany(
+        "INSERT INTO active_gpu_claims(gpu_uuid, allocation_id) VALUES (?, ?)",
+        [(gpu_uuid, allocation_id) for gpu_uuid in gpu_uuids],
+    )
+    record_event(
+        connection,
+        actor_uid=owner_uid,
+        action=action,
+        allocation_id=allocation_id,
+        detail={"gpus": list(gpu_uuids), "cpus": cpus, "memory_gb": memory_gb},
+        now=now,
+    )
+
+
 def create_allocation(
     connection: sqlite3.Connection,
     *,
@@ -242,101 +384,43 @@ def create_allocation(
     expires_at: datetime,
     max_cpus: float,
     max_memory_gb: int,
+    max_cpus_per_user: float | None = None,
+    max_memory_gb_per_user: int | None = None,
     max_gpus_per_user: int = 4,
     max_active_allocations_per_user: int = 4,
     now: datetime | None = None,
 ) -> str:
-    if len(set(gpu_uuids)) != len(gpu_uuids):
-        raise GpuBusy("duplicate GPUs in request")
     allocation_id = uuid.uuid4().hex
-    timestamp = (now or utcnow()).isoformat()
     try:
         connection.execute("BEGIN IMMEDIATE")
-        busy: list[sqlite3.Row] = []
-        if gpu_uuids:
-            placeholders = ",".join("?" for _ in gpu_uuids)
-            busy = connection.execute(
-                f"SELECT gpu_uuid FROM active_gpu_claims WHERE gpu_uuid IN ({placeholders})",
-                list(gpu_uuids),
-            ).fetchall()
-        if busy:
-            names = ", ".join(str(row["gpu_uuid"]) for row in busy)
-            raise GpuBusy(f"GPU already allocated: {names}")
-        used = connection.execute(
-            """
-            SELECT COALESCE(SUM(cpus), 0) AS cpus,
-                   COALESCE(SUM(memory_gb), 0) AS memory_gb
-            FROM allocations
-            WHERE status IN ('pending', 'active')
-            """
-        ).fetchone()
-        if float(used["cpus"]) + cpus > max_cpus:
-            raise InsufficientResources(
-                f"CPU budget exceeded: {float(used['cpus']) + cpus:g} > {max_cpus:g}"
-            )
-        if int(used["memory_gb"]) + memory_gb > max_memory_gb:
-            raise InsufficientResources(
-                f"memory budget exceeded: {int(used['memory_gb']) + memory_gb} > {max_memory_gb}"
-            )
-        user_allocations = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM allocations "
-                "WHERE owner_uid = ? AND status IN ('pending', 'active')",
-                (owner_uid,),
-            ).fetchone()[0]
-        )
-        if user_allocations + 1 > max_active_allocations_per_user:
-            raise InsufficientResources(
-                f"per-user allocation limit exceeded: "
-                f"{user_allocations + 1} > {max_active_allocations_per_user}"
-            )
-        user_gpus = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM allocation_gpus AS ag "
-                "JOIN allocations AS a ON a.id = ag.allocation_id "
-                "WHERE a.owner_uid = ? AND a.status IN ('pending', 'active')",
-                (owner_uid,),
-            ).fetchone()[0]
-        )
-        if user_gpus + len(gpu_uuids) > max_gpus_per_user:
-            raise InsufficientResources(
-                f"per-user GPU limit exceeded: {user_gpus + len(gpu_uuids)} > {max_gpus_per_user}"
-            )
-        connection.execute(
-            """
-            INSERT INTO allocations(
-                id, owner_uid, owner_name, status, image, cpus, memory_gb,
-                workspace, note, created_at, starts_at, expires_at
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                allocation_id,
-                owner_uid,
-                owner_name,
-                image,
-                cpus,
-                memory_gb,
-                workspace,
-                note,
-                timestamp,
-                starts_at.isoformat(),
-                expires_at.isoformat(),
-            ),
-        )
-        connection.executemany(
-            "INSERT INTO allocation_gpus(allocation_id, gpu_uuid) VALUES (?, ?)",
-            [(allocation_id, gpu_uuid) for gpu_uuid in gpu_uuids],
-        )
-        connection.executemany(
-            "INSERT INTO active_gpu_claims(gpu_uuid, allocation_id) VALUES (?, ?)",
-            [(gpu_uuid, allocation_id) for gpu_uuid in gpu_uuids],
-        )
-        record_event(
+        _check_capacity(
             connection,
-            actor_uid=owner_uid,
-            action="allocation_pending",
+            owner_uid=owner_uid,
+            gpu_uuids=gpu_uuids,
+            cpus=cpus,
+            memory_gb=memory_gb,
+            max_cpus=max_cpus,
+            max_memory_gb=max_memory_gb,
+            max_cpus_per_user=max_cpus if max_cpus_per_user is None else max_cpus_per_user,
+            max_memory_gb_per_user=(
+                max_memory_gb if max_memory_gb_per_user is None else max_memory_gb_per_user
+            ),
+            max_gpus_per_user=max_gpus_per_user,
+            max_active_allocations_per_user=max_active_allocations_per_user,
+        )
+        _insert_allocation(
+            connection,
             allocation_id=allocation_id,
-            detail={"gpus": list(gpu_uuids), "cpus": cpus, "memory_gb": memory_gb},
+            owner_uid=owner_uid,
+            owner_name=owner_name,
+            gpu_uuids=gpu_uuids,
+            cpus=cpus,
+            memory_gb=memory_gb,
+            image=image,
+            workspace=workspace,
+            note=note,
+            starts_at=starts_at,
+            expires_at=expires_at,
             now=now,
         )
         connection.commit()
@@ -347,6 +431,386 @@ def create_allocation(
         connection.rollback()
         raise
     return allocation_id
+
+
+def _queue_row(connection: sqlite3.Connection, queue_id: str) -> sqlite3.Row:
+    row = connection.execute("SELECT * FROM queue_requests WHERE id = ?", (queue_id,)).fetchone()
+    if row is None:
+        raise NotFound(f"queue request not found: {queue_id}")
+    return row
+
+
+def _queue_position(connection: sqlite3.Connection, row: sqlite3.Row) -> int | None:
+    if str(row["state"]) != "queued":
+        return None
+    position = connection.execute(
+        """
+        SELECT COUNT(*) FROM queue_requests
+        WHERE state = 'queued'
+          AND (
+              priority > ?
+              OR (
+                  priority = ?
+                  AND (
+                      created_at < ?
+                      OR (created_at = ? AND id < ?)
+                  )
+              )
+          )
+        """,
+        (
+            int(row["priority"]),
+            int(row["priority"]),
+            str(row["created_at"]),
+            str(row["created_at"]),
+            str(row["id"]),
+        ),
+    ).fetchone()
+    return int(position[0]) + 1 if position else 1
+
+
+def queue_to_dict(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    try:
+        decoded_gpus = json.loads(str(row["requested_gpus"]))
+        requested_gpus = (
+            [int(index) for index in decoded_gpus] if isinstance(decoded_gpus, list) else []
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        requested_gpus = []
+    expires_at = datetime.fromisoformat(str(row["expires_at"]))
+    current = now or utcnow()
+    remaining = max(0, int((expires_at - current).total_seconds()))
+    return {
+        "queue_id": str(row["id"]),
+        "owner_uid": int(row["owner_uid"]),
+        "owner": str(row["owner_name"]),
+        "status": str(row["state"]),
+        "cpus": float(row["cpus"]),
+        "memory_gb": int(row["memory_gb"]),
+        "hours": int(row["hours"]),
+        "image": str(row["image"]),
+        "workspace": str(row["workspace"]),
+        "note": str(row["note"]),
+        "gpus": [int(index) for index in requested_gpus],
+        "created_at": str(row["created_at"]),
+        "expires_at": str(row["expires_at"]),
+        "remaining_seconds": remaining,
+        "position": _queue_position(connection, row),
+        "allocation_id": row["allocation_id"],
+        "admitted_at": str(row["admitted_at"]),
+        "reason": str(row["reason"]),
+    }
+
+
+def create_queue_request(
+    connection: sqlite3.Connection,
+    *,
+    owner_uid: int,
+    owner_name: str,
+    requested_gpus: Sequence[int],
+    cpus: float,
+    memory_gb: int,
+    hours: int,
+    image: str,
+    workspace: str,
+    note: str,
+    max_queue_length: int,
+    max_queued_allocations_per_user: int,
+    max_queue_hours: int,
+    priority: int = 0,
+    now: datetime | None = None,
+) -> str:
+    if len(set(requested_gpus)) != len(requested_gpus):
+        raise GpuBusy("duplicate GPUs in request")
+    current = now or utcnow()
+    queue_id = uuid.uuid4().hex
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        total = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM queue_requests WHERE state = 'queued'"
+            ).fetchone()[0]
+        )
+        if total >= max_queue_length:
+            raise InsufficientResources(f"queue is full ({max_queue_length} requests)")
+        user_total = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM queue_requests WHERE state = 'queued' AND owner_uid = ?",
+                (owner_uid,),
+            ).fetchone()[0]
+        )
+        if user_total >= max_queued_allocations_per_user:
+            raise InsufficientResources(
+                "per-user queue limit exceeded: "
+                f"{user_total} queued requests (max {max_queued_allocations_per_user})"
+            )
+        connection.execute(
+            """
+            INSERT INTO queue_requests(
+                id, owner_uid, owner_name, cpus, memory_gb, hours, image,
+                workspace, note, requested_gpus, priority, state, created_at,
+                expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+            """,
+            (
+                queue_id,
+                owner_uid,
+                owner_name,
+                cpus,
+                memory_gb,
+                hours,
+                image,
+                workspace,
+                note,
+                json.dumps(sorted(requested_gpus)),
+                priority,
+                current.isoformat(),
+                (current + timedelta(hours=max_queue_hours)).isoformat(),
+            ),
+        )
+        record_event(
+            connection,
+            actor_uid=owner_uid,
+            action="queue_enqueued",
+            detail={
+                "queue_id": queue_id,
+                "gpus": sorted(requested_gpus),
+                "cpus": cpus,
+                "memory_gb": memory_gb,
+                "hours": hours,
+            },
+            now=current,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return queue_id
+
+
+def list_queue_requests(
+    connection: sqlite3.Connection,
+    *,
+    owner_uid: int | None = None,
+    include_finished: bool = False,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if owner_uid is not None:
+        clauses.append("owner_uid = ?")
+        params.append(owner_uid)
+    if not include_finished:
+        clauses.append("state = 'queued'")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = connection.execute(
+        f"SELECT * FROM queue_requests{where} ORDER BY priority DESC, created_at ASC, id",
+        params,
+    ).fetchall()
+    return [queue_to_dict(connection, row, now=now) for row in rows]
+
+
+def get_queue_request(
+    connection: sqlite3.Connection,
+    queue_id: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    return queue_to_dict(connection, _queue_row(connection, queue_id), now=now)
+
+
+def cancel_queue_request(
+    connection: sqlite3.Connection,
+    queue_id: str,
+    *,
+    actor_uid: int,
+    reason: str = "",
+    now: datetime | None = None,
+) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = _queue_row(connection, queue_id)
+        if row["state"] != "queued":
+            raise Conflict(f"queue request {queue_id} is {row['state']}")
+        connection.execute(
+            "UPDATE queue_requests SET state = 'cancelled', reason = ? WHERE id = ?",
+            (reason, queue_id),
+        )
+        record_event(
+            connection,
+            actor_uid=actor_uid,
+            action="queue_cancelled",
+            detail={"queue_id": queue_id, "reason": reason},
+            now=now,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def expire_queue_requests(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    current = now or utcnow()
+    expired: list[str] = []
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT id FROM queue_requests "
+            "WHERE state = 'queued' AND expires_at <= ? ORDER BY created_at",
+            (current.isoformat(),),
+        ).fetchall()
+        for row in rows:
+            queue_id = str(row["id"])
+            connection.execute(
+                "UPDATE queue_requests SET state = 'expired', reason = ? WHERE id = ?",
+                ("queue wait expired", queue_id),
+            )
+            record_event(
+                connection,
+                actor_uid=None,
+                action="queue_expired",
+                detail={"queue_id": queue_id},
+                now=current,
+            )
+            expired.append(queue_id)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return expired
+
+
+def queue_request_count(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT COUNT(*) FROM queue_requests WHERE state = 'queued'"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def admit_next_queued(
+    connection: sqlite3.Connection,
+    *,
+    max_cpus: float,
+    max_memory_gb: int,
+    max_cpus_per_user: float,
+    max_memory_gb_per_user: int,
+    max_gpus_per_user: int,
+    max_active_allocations_per_user: int,
+    available_gpu_uuids: set[str] | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    current = now or utcnow()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT * FROM queue_requests "
+            "WHERE state = 'queued' AND expires_at > ? "
+            "ORDER BY priority DESC, created_at ASC, id",
+            (current.isoformat(),),
+        ).fetchall()
+        for row in rows:
+            queue_id = str(row["id"])
+            try:
+                requested = [int(index) for index in json.loads(str(row["requested_gpus"]))]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                connection.execute(
+                    "UPDATE queue_requests SET state = 'failed', reason = ? WHERE id = ?",
+                    ("invalid GPU request", queue_id),
+                )
+                record_event(
+                    connection,
+                    actor_uid=None,
+                    action="queue_failed",
+                    detail={"queue_id": queue_id, "reason": "invalid GPU request"},
+                    now=current,
+                )
+                continue
+            try:
+                gpu_uuids = (
+                    [str(gpu["uuid"]) for gpu in gpus_for_indices(connection, requested)]
+                    if requested
+                    else []
+                )
+            except NotFound:
+                connection.execute(
+                    "UPDATE queue_requests SET state = 'failed', reason = ? WHERE id = ?",
+                    ("requested GPU no longer exists", queue_id),
+                )
+                record_event(
+                    connection,
+                    actor_uid=None,
+                    action="queue_failed",
+                    detail={"queue_id": queue_id, "reason": "requested GPU no longer exists"},
+                    now=current,
+                )
+                continue
+            try:
+                _check_capacity(
+                    connection,
+                    owner_uid=int(row["owner_uid"]),
+                    gpu_uuids=gpu_uuids,
+                    cpus=float(row["cpus"]),
+                    memory_gb=int(row["memory_gb"]),
+                    max_cpus=max_cpus,
+                    max_memory_gb=max_memory_gb,
+                    max_cpus_per_user=max_cpus_per_user,
+                    max_memory_gb_per_user=max_memory_gb_per_user,
+                    max_gpus_per_user=max_gpus_per_user,
+                    max_active_allocations_per_user=max_active_allocations_per_user,
+                    available_gpu_uuids=available_gpu_uuids,
+                )
+            except (GpuBusy, InsufficientResources):
+                continue
+            allocation_id = uuid.uuid4().hex
+            starts_at = current
+            expires_at = current + timedelta(hours=int(row["hours"]))
+            _insert_allocation(
+                connection,
+                allocation_id=allocation_id,
+                owner_uid=int(row["owner_uid"]),
+                owner_name=str(row["owner_name"]),
+                gpu_uuids=gpu_uuids,
+                cpus=float(row["cpus"]),
+                memory_gb=int(row["memory_gb"]),
+                image=str(row["image"]),
+                workspace=str(row["workspace"]),
+                note=str(row["note"]),
+                starts_at=starts_at,
+                expires_at=expires_at,
+                now=current,
+            )
+            connection.execute(
+                """
+                UPDATE queue_requests
+                SET state = 'admitted', admitted_at = ?, allocation_id = ?
+                WHERE id = ?
+                """,
+                (current.isoformat(), allocation_id, queue_id),
+            )
+            record_event(
+                connection,
+                actor_uid=int(row["owner_uid"]),
+                action="queue_admitted",
+                allocation_id=allocation_id,
+                detail={"queue_id": queue_id},
+                now=current,
+            )
+            connection.commit()
+            return allocation_id
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    return None
 
 
 def activate_allocation(

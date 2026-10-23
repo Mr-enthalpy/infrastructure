@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NoReturn
@@ -35,10 +36,12 @@ config_app = typer.Typer(no_args_is_help=True, help="Inspect the local configura
 admin_app = typer.Typer(no_args_is_help=True, help="Administrator commands.")
 job_app = typer.Typer(no_args_is_help=True, help="Long-running job commands.")
 file_app = typer.Typer(no_args_is_help=True, help="Restricted workspace file transfer.")
+queue_app = typer.Typer(no_args_is_help=True, help="Queued allocation requests.")
 app.add_typer(config_app, name="config")
 app.add_typer(admin_app, name="admin")
 app.add_typer(job_app, name="job")
 app.add_typer(file_app, name="file")
+app.add_typer(queue_app, name="queue")
 
 
 def _config_path(path: Path | None) -> Path:
@@ -230,8 +233,18 @@ def config_show(
     typer.echo(f"hardware: {cfg.hardware.gpu_count}x {cfg.hardware.gpu_model}")
     typer.echo(f"mode: {cfg.policy.mode}")
     typer.echo(f"hours: {cfg.policy.default_hours}-{cfg.policy.max_hours}")
-    typer.echo(f"cpu budget: {cfg.policy.max_cpus:g}")
-    typer.echo(f"memory budget: {cfg.policy.max_memory_gb} GiB")
+    typer.echo(
+        f"cpu budgets: global={cfg.policy.global_max_cpus:g} "
+        f"allocation={cfg.policy.max_cpus_per_allocation:g} "
+        f"user={cfg.policy.max_cpus_per_user:g}"
+    )
+    typer.echo(
+        f"memory budgets: global={cfg.policy.global_max_memory_gb} GiB "
+        f"allocation={cfg.policy.max_memory_gb_per_allocation} GiB "
+        f"user={cfg.policy.max_memory_gb_per_user} GiB"
+    )
+    typer.echo(f"legacy audit: {cfg.policy.legacy_audit_required}")
+    typer.echo(f"queue enabled: {cfg.policy.queue_enabled}")
     typer.echo(f"deployment_allowed: {cfg.policy.deployment_allowed}")
 
 
@@ -264,6 +277,16 @@ def list_command(
                 f"  {allocation['id']}  owner={allocation['owner']}  "
                 f"status={allocation['status']}  gpus={allocation['gpus']}  "
                 f"remaining={_format_remaining(allocation.get('remaining_seconds'))}"
+            )
+    queued = data.get("queue", [])
+    if queued:
+        typer.echo("")
+        typer.echo("queue:")
+        for request in queued:
+            typer.echo(
+                f"  {request['queue_id']}  owner={request['owner']}  "
+                f"position={request.get('position')}  gpus={request['gpus']}  "
+                f"cpus={request['cpus']:g}  memory={request['memory_gb']} GiB"
             )
     unmanaged = data.get("unmanaged") or {}
     unmanaged_containers = unmanaged.get("containers", [])
@@ -327,6 +350,94 @@ def _print_allocation(allocation: dict[str, Any]) -> None:
         typer.echo(f"container: {allocation['container_name']}")
 
 
+def _print_queue(request: dict[str, Any]) -> None:
+    typer.echo(f"queue: {request['queue_id']}")
+    typer.echo(f"status: {request['status']}")
+    typer.echo(f"owner: {request['owner']}")
+    typer.echo(f"gpus: {request['gpus']}")
+    typer.echo(f"cpus: {request['cpus']:g}")
+    typer.echo(f"memory: {request['memory_gb']} GiB")
+    typer.echo(f"hours: {request['hours']}")
+    typer.echo(f"workspace: {request['workspace']}")
+    typer.echo(f"created: {request['created_at']}")
+    typer.echo(f"queue expires: {request['expires_at']}")
+    if request.get("position") is not None:
+        typer.echo(f"position: {request['position']}")
+    if request.get("allocation_id"):
+        typer.echo(f"allocation: {request['allocation_id']}")
+    if request.get("reason"):
+        typer.echo(f"reason: {request['reason']}")
+
+
+def _silent_request(
+    client: BrokerClient,
+    command_name: str,
+    *,
+    json_output: bool = False,
+    **args: Any,
+) -> dict[str, Any]:
+    try:
+        response = client.request(command_name, **args)
+    except UdcError as exc:
+        _fail(exc.code, exc.message, json_output)
+    if not response.get("ok"):
+        error = response.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        _fail(
+            str(error.get("code", "internal")),
+            str(error.get("message", "broker request failed")),
+            json_output,
+        )
+    data = response.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _wait_for_queue(
+    config: LabConfig,
+    queue_id: str,
+    timeout: int,
+    *,
+    json_output: bool = False,
+) -> dict[str, Any]:
+    client = _make_client(config)
+    deadline = time.monotonic() + timeout
+    while True:
+        data = _silent_request(
+            client,
+            "queue_get",
+            json_output=json_output,
+            id=queue_id,
+        )
+        request = data.get("queue", {})
+        status = request.get("status")
+        allocation = data.get("allocation")
+        if status == "admitted":
+            if isinstance(allocation, dict):
+                if allocation.get("status") == "failed":
+                    _fail(
+                        "docker_error",
+                        "queued allocation was admitted but container creation failed",
+                        json_output,
+                    )
+                return allocation
+        elif status in {"cancelled", "expired", "failed"}:
+            reason = request.get("reason") or status
+            _fail(
+                "conflict",
+                f"queued request {queue_id} is {status}: {reason}",
+                json_output,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _fail(
+                "conflict",
+                f"timed out waiting for queue request {queue_id}",
+                json_output,
+            )
+        time.sleep(min(2.0, remaining))
+
+
 @app.command("apply")
 def apply_command(
     ctx: typer.Context,
@@ -340,6 +451,22 @@ def apply_command(
     hours: int | None = typer.Option(None, "--hours", help="Lease hours (1-36)."),
     image: str | None = typer.Option(None, "--image", help="Container image."),
     note: str = typer.Option("", "--note", help="Free-form note."),
+    queue: bool = typer.Option(
+        True,
+        "--queue/--no-queue",
+        help="Queue the request when CPU, memory, or a requested GPU is unavailable.",
+    ),
+    wait: bool = typer.Option(
+        False,
+        "--wait",
+        help="Wait for a queued request to be admitted.",
+    ),
+    wait_timeout: int = typer.Option(
+        3600,
+        "--wait-timeout",
+        min=1,
+        help="Maximum seconds to wait with --wait.",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Apply for whole GPUs, or CPU-only when --gpus is omitted."""
@@ -349,20 +476,129 @@ def apply_command(
         "cpus": cpus,
         "memory_gb": memory,
         "note": note,
+        "queue": queue,
     }
     if hours is not None:
         args["hours"] = hours
     if image is not None:
         args["image"] = image
     config = _load(ctx)
-    data = _request(_make_client(config), "apply", json_output, **args)
+    client = _make_client(config)
+    if wait and json_output:
+        data = _silent_request(client, "apply", json_output=True, **args)
+    else:
+        data = _request(client, "apply", json_output, **args)
+    if "queue_id" in data:
+        if wait:
+            allocation = _wait_for_queue(
+                config,
+                str(data["queue_id"]),
+                wait_timeout,
+                json_output=json_output,
+            )
+            if json_output:
+                typer.echo(
+                    json.dumps(
+                        {"ok": True, "data": {"allocation": allocation}},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                _print_allocation(allocation)
+            return
+        if json_output:
+            return
+        _print_queue(data)
+        return
     if json_output:
+        if wait:
+            typer.echo(json.dumps({"ok": True, "data": data}, indent=2, sort_keys=True))
         return
     typer.echo(f"allocation: {data['id']}")
     typer.echo(f"status: {data['status']}")
     typer.echo(f"gpus: {data['gpus']}")
     typer.echo(f"expires: {data['expires_at']}")
     typer.echo(f"workspace: {data['workspace']}")
+
+
+@queue_app.command("list")
+def queue_list_command(
+    ctx: typer.Context,
+    all_users: bool = typer.Option(False, "--all", help="Show all users (admin only)."),
+    history: bool = typer.Option(
+        False,
+        "--history",
+        help="Include admitted, cancelled, expired, and failed requests.",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """List queued allocation requests."""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "queue_list",
+        json_output,
+        all=all_users,
+        include_finished=history,
+    )
+    if json_output:
+        return
+    requests = data.get("queue", [])
+    if not requests:
+        typer.echo("no queued requests")
+        return
+    for request in requests:
+        typer.echo(
+            f"{request['queue_id']}  owner={request['owner']}  "
+            f"status={request['status']}  position={request.get('position')}  "
+            f"gpus={request['gpus']}  cpus={request['cpus']:g}  "
+            f"memory={request['memory_gb']} GiB  remaining="
+            f"{_format_remaining(request.get('remaining_seconds'))}"
+        )
+
+
+@queue_app.command("cancel")
+def queue_cancel_command(
+    ctx: typer.Context,
+    queue_id: str = typer.Argument(..., help="Queue request id."),
+    reason: str = typer.Option("", "--reason"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Cancel a queued allocation request."""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "queue_cancel",
+        json_output,
+        id=queue_id,
+        reason=reason,
+    )
+    if json_output:
+        return
+    typer.echo(f"cancelled: {data['queue_id']}  status={data['status']}")
+
+
+@queue_app.command("wait")
+def queue_wait_command(
+    ctx: typer.Context,
+    queue_id: str = typer.Argument(..., help="Queue request id."),
+    timeout: int = typer.Option(3600, "--timeout", min=1),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Wait until a queued request is admitted or fails."""
+    config = _load(ctx)
+    allocation = _wait_for_queue(config, queue_id, timeout, json_output=json_output)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {"ok": True, "data": {"allocation": allocation}},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    _print_allocation(allocation)
 
 
 @app.command("release")

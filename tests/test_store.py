@@ -33,6 +33,8 @@ def _create(
     memory_gb: int = 32,
     max_cpus: float = 32.0,
     max_memory_gb: int = 128,
+    max_cpus_per_user: float | None = None,
+    max_memory_gb_per_user: int | None = None,
     max_active_allocations_per_user: int = 4,
     owner_uid: int = 1000,
     owner_name: str = "alice",
@@ -51,6 +53,8 @@ def _create(
         expires_at=NOW + timedelta(hours=12),
         max_cpus=max_cpus,
         max_memory_gb=max_memory_gb,
+        max_cpus_per_user=max_cpus_per_user,
+        max_memory_gb_per_user=max_memory_gb_per_user,
         max_active_allocations_per_user=max_active_allocations_per_user,
         now=NOW,
     )
@@ -189,6 +193,152 @@ def test_concurrent_claims_only_one_wins(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(attempt, [1000, 1001]))
     assert sum(result is not None for result in results) == 1
+
+
+def test_per_user_cpu_limit_is_enforced(tmp_path):
+    connection = _connection(tmp_path)
+    _create(connection, gpus=("GPU-0",), cpus=8, memory_gb=8)
+    with pytest.raises(InsufficientResources, match="per-user CPU limit"):
+        _create(
+            connection,
+            gpus=("GPU-1",),
+            cpus=8,
+            memory_gb=8,
+            max_cpus_per_user=12,
+        )
+    connection.close()
+
+
+def test_per_user_memory_limit_is_enforced(tmp_path):
+    connection = _connection(tmp_path)
+    _create(connection, gpus=("GPU-0",), cpus=4, memory_gb=32)
+    with pytest.raises(InsufficientResources, match="per-user memory limit"):
+        _create(
+            connection,
+            gpus=("GPU-1",),
+            cpus=4,
+            memory_gb=32,
+            max_memory_gb_per_user=50,
+        )
+    connection.close()
+
+
+def _queue(
+    connection: sqlite3.Connection,
+    *,
+    gpus: tuple[int, ...] = (3,),
+    owner_uid: int = 1000,
+    owner_name: str = "alice",
+    now: datetime = NOW,
+):
+    return store.create_queue_request(
+        connection,
+        owner_uid=owner_uid,
+        owner_name=owner_name,
+        requested_gpus=gpus,
+        cpus=8,
+        memory_gb=32,
+        hours=12,
+        image="udc-base:2026.10",
+        workspace=f"/data1/udc-users/{owner_name}",
+        note="queued test",
+        max_queue_length=10,
+        max_queued_allocations_per_user=4,
+        max_queue_hours=24,
+        now=now,
+    )
+
+
+def test_queue_request_position_and_cancel(tmp_path):
+    connection = _connection(tmp_path)
+    first = _queue(connection, gpus=(3,), now=NOW)
+    second = _queue(connection, gpus=(4,), now=NOW + timedelta(seconds=1))
+    listed = store.list_queue_requests(connection, owner_uid=1000, now=NOW)
+    assert [item["queue_id"] for item in listed] == [first, second]
+    assert listed[0]["position"] == 1
+    assert listed[1]["position"] == 2
+    store.cancel_queue_request(connection, first, actor_uid=1000, reason="test", now=NOW)
+    assert [item["queue_id"] for item in store.list_queue_requests(connection)] == [second]
+    history = store.list_queue_requests(connection, include_finished=True)
+    assert history[0]["status"] == "cancelled" or history[1]["status"] == "cancelled"
+    connection.close()
+
+
+def test_queue_positions_are_unique_with_identical_timestamps(tmp_path):
+    connection = _connection(tmp_path)
+    _queue(connection, gpus=(3,), now=NOW)
+    _queue(connection, gpus=(4,), now=NOW)
+    listed = store.list_queue_requests(connection, owner_uid=1000, now=NOW)
+    assert sorted(item["position"] for item in listed) == [1, 2]
+    connection.close()
+
+
+def test_expired_queue_request_is_not_admitted(tmp_path):
+    connection = _connection(tmp_path)
+    queue_id = _queue(connection, gpus=(3,), now=NOW)
+    limits = {
+        "max_cpus": 32.0,
+        "max_memory_gb": 128,
+        "max_cpus_per_user": 32.0,
+        "max_memory_gb_per_user": 128,
+        "max_gpus_per_user": 4,
+        "max_active_allocations_per_user": 4,
+    }
+    assert (
+        store.admit_next_queued(
+            connection,
+            available_gpu_uuids={"GPU-3"},
+            now=NOW + timedelta(hours=25),
+            **limits,
+        )
+        is None
+    )
+    assert store.get_queue_request(connection, queue_id)["status"] == "queued"
+    connection.close()
+
+
+def test_queue_admission_waits_for_available_gpu(tmp_path):
+    connection = _connection(tmp_path)
+    queue_id = _queue(connection, gpus=(3,))
+    limits = {
+        "max_cpus": 32.0,
+        "max_memory_gb": 128,
+        "max_cpus_per_user": 32.0,
+        "max_memory_gb_per_user": 128,
+        "max_gpus_per_user": 4,
+        "max_active_allocations_per_user": 4,
+    }
+    assert (
+        store.admit_next_queued(
+            connection,
+            available_gpu_uuids={"GPU-0"},
+            now=NOW,
+            **limits,
+        )
+        is None
+    )
+    assert store.get_queue_request(connection, queue_id)["status"] == "queued"
+    allocation_id = store.admit_next_queued(
+        connection,
+        available_gpu_uuids={"GPU-3"},
+        now=NOW,
+        **limits,
+    )
+    assert allocation_id is not None
+    allocation = store.get_allocation(connection, allocation_id, now=NOW)
+    assert allocation["status"] == "pending"
+    assert allocation["gpus"] == [3]
+    assert store.get_queue_request(connection, queue_id)["status"] == "admitted"
+    connection.close()
+
+
+def test_queue_expiry(tmp_path):
+    connection = _connection(tmp_path)
+    queue_id = _queue(connection, gpus=(5,), now=NOW)
+    expired = store.expire_queue_requests(connection, now=NOW + timedelta(hours=25))
+    assert expired == [queue_id]
+    assert store.get_queue_request(connection, queue_id)["status"] == "expired"
+    connection.close()
 
 
 def test_per_user_allocation_limit_is_enforced(tmp_path):

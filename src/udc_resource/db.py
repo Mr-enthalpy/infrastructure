@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -76,6 +76,30 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE INDEX IF NOT EXISTS idx_allocations_expiry
     ON allocations(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS queue_requests (
+    id TEXT PRIMARY KEY,
+    owner_uid INTEGER NOT NULL,
+    owner_name TEXT NOT NULL,
+    cpus REAL NOT NULL CHECK (cpus > 0),
+    memory_gb INTEGER NOT NULL CHECK (memory_gb > 0),
+    hours INTEGER NOT NULL CHECK (hours > 0),
+    image TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    requested_gpus TEXT NOT NULL DEFAULT '[]',
+    priority INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'queued'
+        CHECK (state IN ('queued', 'admitted', 'cancelled', 'expired', 'failed')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    admitted_at TEXT NOT NULL DEFAULT '',
+    allocation_id TEXT,
+    reason TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_requests_schedule
+    ON queue_requests(state, priority DESC, created_at);
 """
 
 

@@ -38,6 +38,7 @@ from ..identity import (
     IdentityResolverProtocol,
     peer_credentials,
 )
+from ..legacy_audit import LegacyAuditResult, LegacyAuditRunner
 from ..members import load_members, public_member_data
 from ..models import GPU, Allocation
 from ..stream import (
@@ -94,6 +95,7 @@ class Broker:
         socket_path: str | Path | None = None,
         docker: DockerBackend | None = None,
         identity_resolver: IdentityResolverProtocol | None = None,
+        legacy_audit: Callable[[], LegacyAuditResult] | None = None,
         clock: Callable[[], datetime] | None = None,
         expiry_interval: float = 30.0,
         reconcile_interval: float = 300.0,
@@ -103,6 +105,11 @@ class Broker:
         self.socket_path = Path(socket_path or config.server.broker_socket)
         self.docker = docker or DockerDriver(config)
         self.identity_resolver = identity_resolver or IdentityResolver(config.groups.admins)
+        self.legacy_audit = legacy_audit or LegacyAuditRunner(
+            config.policy.legacy_audit_script,
+            timeout=config.policy.legacy_audit_timeout,
+            allow_root_ssh_keys=config.policy.allow_root_ssh_keys,
+        )
         self.clock = clock or store.utcnow
         self.expiry_interval = expiry_interval
         self.reconcile_interval = reconcile_interval
@@ -120,6 +127,11 @@ class Broker:
 
     def _now(self) -> datetime:
         return self.clock()
+
+    def _legacy_audit_result(self) -> LegacyAuditResult:
+        if not self.config.policy.legacy_audit_required:
+            return LegacyAuditResult(True, "legacy audit disabled by configuration")
+        return self.legacy_audit()
 
     def _live_resources(self) -> LiveResources:
         try:
@@ -266,18 +278,29 @@ class Broker:
         try:
             self._mode = store.get_mode(connection, self.config.policy.mode)
             leases = store.active_lease_count(connection)
+            queued = store.queue_request_count(connection)
             target = self._mode
-            if self._mode == "monitor" and leases:
+            audit_failure = ""
+            if self._mode == "active" and self.config.policy.legacy_audit_required:
+                audit = self._legacy_audit_result()
+                if not audit.passed:
+                    audit_failure = audit.failure_message()
+            if self._mode == "monitor" and (leases or queued):
                 target = "maintenance"
             elif self._mode == "active" and not self.config.policy.deployment_allowed:
-                target = "maintenance" if leases else "monitor"
+                target = "maintenance" if (leases or queued) else "monitor"
+            elif self._mode == "active" and audit_failure:
+                target = "maintenance" if (leases or queued) else "monitor"
             if target != self._mode:
                 logger.warning(
-                    "adjusting persisted mode %s -> %s (leases=%d, deployment_allowed=%s)",
+                    "adjusting persisted mode %s -> %s "
+                    "(leases=%d queued=%d deployment_allowed=%s audit=%s)",
                     self._mode,
                     target,
                     leases,
+                    queued,
                     self.config.policy.deployment_allowed,
+                    audit_failure or "passed",
                 )
                 store.set_mode(
                     connection,
@@ -304,6 +327,12 @@ class Broker:
             logger.info("startup reconcile: %s", summary)
         except Exception:
             logger.exception("startup reconcile failed")
+        try:
+            admitted = await self._schedule_queue()
+            if admitted:
+                logger.info("startup queue admission: %s", ", ".join(admitted))
+        except Exception:
+            logger.exception("startup queue scheduling failed")
         path = self.socket_path
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -345,7 +374,9 @@ class Broker:
 
     def _expire_once(self) -> list[str]:
         with self._connection() as connection:
-            return expire_allocations(connection, self.docker, now=self._now())
+            expired = expire_allocations(connection, self.docker, now=self._now())
+            store.expire_queue_requests(connection, now=self._now())
+            return expired
 
     async def _expiry_loop(self) -> None:
         elapsed = 0.0
@@ -365,6 +396,13 @@ class Broker:
                     logger.info("expired allocations: %s", ", ".join(expired))
             except Exception:
                 logger.exception("expiry tick failed")
+            if self._mode == "active":
+                try:
+                    admitted = await self._schedule_queue()
+                    if admitted:
+                        logger.info("queue admissions: %s", ", ".join(admitted))
+                except Exception:
+                    logger.exception("queue scheduling failed")
 
     async def stop(self) -> None:
         if self._expiry_task is not None:
@@ -848,8 +886,20 @@ class Broker:
                 self._check_args(args, {"id"})
                 return _ok(self._status(identity, args))
             if command == "apply":
-                self._check_args(args, {"gpus", "cpus", "memory_gb", "hours", "image", "note"})
+                self._check_args(
+                    args,
+                    {"gpus", "cpus", "memory_gb", "hours", "image", "note", "queue"},
+                )
                 return _ok(await self._apply(identity, args))
+            if command == "queue_list":
+                self._check_args(args, {"all", "include_finished"})
+                return _ok(self._queue_list(identity, args))
+            if command == "queue_get":
+                self._check_args(args, {"id"})
+                return _ok(self._queue_get(identity, args))
+            if command == "queue_cancel":
+                self._check_args(args, {"id", "reason"})
+                return _ok(self._queue_cancel(identity, args))
             if command == "release":
                 self._check_args(args, {"id"})
                 return _ok(await self._release(identity, args))
@@ -924,13 +974,18 @@ class Broker:
         live = self._live_resources()
         with self._connection() as connection:
             persisted = store.get_mode(connection, self._mode)
-            if persisted == "monitor" and store.active_lease_count(connection):
-                logger.warning("promoting monitor to maintenance while active/pending leases exist")
+            if persisted == "monitor" and (
+                store.active_lease_count(connection) or store.queue_request_count(connection)
+            ):
+                logger.warning(
+                    "promoting monitor to maintenance while active/pending/queued work exists"
+                )
                 store.set_mode(connection, "maintenance", actor_uid=0, now=now)
                 persisted = "maintenance"
             self._mode = persisted
             db_gpus = store.list_gpus(connection, now=now)
             allocations = store.list_allocations(connection, now=now)
+            queue = store.list_queue_requests(connection, now=now)
             active_ids = {
                 str(allocation["id"])
                 for allocation in store.list_allocations(
@@ -946,6 +1001,7 @@ class Broker:
             "detection_error": live.error,
             "gpus": self._merge_gpus(db_gpus, live, active_ids),
             "allocations": allocations,
+            "queue": queue,
             "unmanaged": self._unmanaged(db_gpus, active_ids, live),
         }
         self._add_member_identity(data)
@@ -989,6 +1045,8 @@ class Broker:
 
         for allocation in data.get("allocations", []):
             enrich(allocation, allocation.get("owner"))
+        for request in data.get("queue", []):
+            enrich(request, request.get("owner"))
         for gpu in data.get("gpus", []):
             enrich(gpu, gpu.get("owner"))
         unmanaged = data.get("unmanaged") or {}
@@ -1087,6 +1145,64 @@ class Broker:
             return False
         return container_id in cgroup
 
+    def _queue_list(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        all_users = args.get("all", False)
+        include_finished = args.get("include_finished", False)
+        if not isinstance(all_users, bool) or not isinstance(include_finished, bool):
+            raise BadRequest("all and include_finished must be booleans")
+        if all_users:
+            self._require_admin(identity)
+        with self._connection() as connection:
+            queue = store.list_queue_requests(
+                connection,
+                owner_uid=None if all_users else identity.uid,
+                include_finished=include_finished,
+                now=self._now(),
+            )
+        return {"queue": queue}
+
+    def _queue_get(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        queue_id = args.get("id")
+        if not isinstance(queue_id, str) or not queue_id:
+            raise BadRequest("id must be a non-empty string")
+        with self._connection() as connection:
+            queue = store.get_queue_request(connection, queue_id, now=self._now())
+            if queue["owner_uid"] != identity.uid and not identity.is_admin:
+                raise Forbidden("only the owner or an admin may inspect this queue request")
+            result: dict[str, Any] = {"queue": queue}
+            allocation_id = queue.get("allocation_id")
+            if isinstance(allocation_id, str) and allocation_id:
+                try:
+                    result["allocation"] = store.get_allocation(
+                        connection,
+                        allocation_id,
+                        now=self._now(),
+                    )
+                    result["events"] = store.list_allocation_events(connection, allocation_id)
+                except NotFound:
+                    pass
+        return result
+
+    def _queue_cancel(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        queue_id = args.get("id")
+        if not isinstance(queue_id, str) or not queue_id:
+            raise BadRequest("id must be a non-empty string")
+        reason = args.get("reason", "")
+        if not isinstance(reason, str):
+            raise BadRequest("reason must be a string")
+        with self._connection() as connection:
+            queue = store.get_queue_request(connection, queue_id, now=self._now())
+            if queue["owner_uid"] != identity.uid and not identity.is_admin:
+                raise Forbidden("only the owner or an admin may cancel this queue request")
+            store.cancel_queue_request(
+                connection,
+                queue_id,
+                actor_uid=identity.uid,
+                reason=reason,
+                now=self._now(),
+            )
+            return store.get_queue_request(connection, queue_id, now=self._now())
+
     def _status(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
         allocation_id = args.get("id")
         if allocation_id is not None and not isinstance(allocation_id, str):
@@ -1116,15 +1232,19 @@ class Broker:
         )
         if not 1 <= hours <= self.config.policy.max_hours:
             raise BadRequest(f"hours must be between 1 and {self.config.policy.max_hours}")
-        if cpus > self.config.policy.max_cpus:
+        if cpus > self.config.policy.max_cpus_per_allocation:
             raise InsufficientResources(
-                f"requested cpus exceed policy.max_cpus ({self.config.policy.max_cpus:g})"
+                "requested cpus exceed policy.max_cpus_per_allocation "
+                f"({self.config.policy.max_cpus_per_allocation:g})"
             )
-        if memory_gb > self.config.policy.max_memory_gb:
+        if memory_gb > self.config.policy.max_memory_gb_per_allocation:
             raise InsufficientResources(
-                f"requested memory exceeds policy.max_memory_gb "
-                f"({self.config.policy.max_memory_gb})"
+                "requested memory exceeds policy.max_memory_gb_per_allocation "
+                f"({self.config.policy.max_memory_gb_per_allocation})"
             )
+        queue_requested = args.get("queue", self.config.policy.queue_enabled)
+        if not isinstance(queue_requested, bool):
+            raise BadRequest("queue must be a boolean")
         image = args.get("image", self.config.image.base)
         if not isinstance(image, str) or not image:
             raise BadRequest("image must be a non-empty string")
@@ -1136,6 +1256,7 @@ class Broker:
         workspace = self._workspace(identity.username)
         starts_at = self._now()
         expires_at = starts_at + timedelta(hours=hours)
+        busy_reason: str | None = None
         if gpus:
             now = self._now()
             with self._connection() as connection:
@@ -1159,8 +1280,10 @@ class Broker:
                 state = str(gpu["state"])
                 if state == "unknown":
                     raise DockerError(f"cannot determine GPU {index} state: {gpu['state_reason']}")
-                if state != "free":
-                    raise GpuBusy(f"GPU {index} is {state}: {gpu['state_reason']}")
+                if state == "unmanaged":
+                    busy_reason = f"GPU {index} is unmanaged: {gpu['state_reason']}"
+                elif state not in {"free", "allocated"}:
+                    busy_reason = f"GPU {index} is {state}: {gpu['state_reason']}"
             gpu_uuids = [str(row["uuid"]) for row in gpu_rows]
         else:
             gpu_uuids = []
@@ -1184,28 +1307,138 @@ class Broker:
             raise
         except Exception as exc:
             raise InternalError(f"workspace creation failed: {exc}") from exc
-        with self._connection() as connection:
-            allocation_id = store.create_allocation(
-                connection,
-                owner_uid=identity.uid,
-                owner_name=identity.username,
-                gpu_uuids=gpu_uuids,
+        if busy_reason is not None:
+            if not (self.config.policy.queue_enabled and queue_requested):
+                raise GpuBusy(busy_reason)
+            return await self._enqueue_allocation(
+                identity,
+                gpus=gpus,
                 cpus=cpus,
                 memory_gb=memory_gb,
+                hours=hours,
                 image=image,
                 workspace=workspace,
                 note=note,
-                starts_at=starts_at,
-                expires_at=expires_at,
-                max_cpus=self.config.policy.max_cpus,
-                max_memory_gb=self.config.policy.max_memory_gb,
-                max_gpus_per_user=self.config.policy.max_gpus_per_user,
-                max_active_allocations_per_user=(
-                    self.config.policy.max_active_allocations_per_user
+                reason=busy_reason,
+            )
+        try:
+            with self._connection() as connection:
+                allocation_id = store.create_allocation(
+                    connection,
+                    owner_uid=identity.uid,
+                    owner_name=identity.username,
+                    gpu_uuids=gpu_uuids,
+                    cpus=cpus,
+                    memory_gb=memory_gb,
+                    image=image,
+                    workspace=workspace,
+                    note=note,
+                    starts_at=starts_at,
+                    expires_at=expires_at,
+                    max_cpus=self.config.policy.global_max_cpus,
+                    max_memory_gb=self.config.policy.global_max_memory_gb,
+                    max_cpus_per_user=self.config.policy.max_cpus_per_user,
+                    max_memory_gb_per_user=self.config.policy.max_memory_gb_per_user,
+                    max_gpus_per_user=self.config.policy.max_gpus_per_user,
+                    max_active_allocations_per_user=(
+                        self.config.policy.max_active_allocations_per_user
+                    ),
+                    now=self._now(),
+                )
+        except (GpuBusy, InsufficientResources) as exc:
+            if not (self.config.policy.queue_enabled and queue_requested):
+                raise
+            return await self._enqueue_allocation(
+                identity,
+                gpus=gpus,
+                cpus=cpus,
+                memory_gb=memory_gb,
+                hours=hours,
+                image=image,
+                workspace=workspace,
+                note=note,
+                reason=str(exc),
+            )
+        return await self._materialize_allocation(allocation_id)
+
+    async def _enqueue_allocation(
+        self,
+        identity: Identity,
+        *,
+        gpus: list[int],
+        cpus: float,
+        memory_gb: int,
+        hours: int,
+        image: str,
+        workspace: str,
+        note: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            queue_id = store.create_queue_request(
+                connection,
+                owner_uid=identity.uid,
+                owner_name=identity.username,
+                requested_gpus=gpus,
+                cpus=cpus,
+                memory_gb=memory_gb,
+                hours=hours,
+                image=image,
+                workspace=workspace,
+                note=note,
+                max_queue_length=self.config.policy.max_queue_length,
+                max_queued_allocations_per_user=(
+                    self.config.policy.max_queued_allocations_per_user
                 ),
+                max_queue_hours=self.config.policy.max_queue_hours,
                 now=self._now(),
             )
-            allocation_data = store.get_allocation(connection, allocation_id, now=self._now())
+        logger.info(
+            "queued allocation request %s for %s after: %s",
+            queue_id,
+            identity.username,
+            reason,
+        )
+        await self._schedule_queue_safely("apply")
+        with self._connection() as connection:
+            return store.get_queue_request(connection, queue_id, now=self._now())
+
+    async def _materialize_allocation(self, allocation_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            allocation_data = store.get_allocation(
+                connection,
+                allocation_id,
+                now=self._now(),
+            )
+            starts_at = datetime.fromisoformat(str(allocation_data["starts_at"]))
+            expires_at = datetime.fromisoformat(str(allocation_data["expires_at"]))
+            owner_uid = int(allocation_data["owner_uid"])
+            owner_gid = owner_uid
+        if os.name == "posix":
+            try:
+                import pwd
+
+                owner_gid = pwd.getpwuid(owner_uid).pw_gid
+            except (ImportError, KeyError):
+                pass
+        try:
+            await asyncio.to_thread(
+                workspace_io.ensure_workspace,
+                str(allocation_data["workspace"]),
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+        except Exception as exc:
+            with self._connection() as connection:
+                store.fail_allocation(
+                    connection,
+                    allocation_id,
+                    reason=f"workspace preparation failed: {exc}",
+                    now=self._now(),
+                )
+            if isinstance(exc, UdcError):
+                raise
+            raise InternalError(f"workspace preparation failed: {exc}") from exc
         allocation = self._allocation_model(allocation_data, starts_at, expires_at)
         try:
             container = await asyncio.to_thread(self.docker.create_container, allocation)
@@ -1231,16 +1464,15 @@ class Broker:
                 return store.get_allocation(connection, allocation_id, now=self._now())
         except Exception as exc:
             logger.exception("allocation activation failed for %s", allocation_id)
+            cleanup_failed = False
             try:
                 await asyncio.to_thread(self.docker.remove_container, container.id)
             except Exception:
+                cleanup_failed = True
                 logger.exception(
                     "could not remove container %s after activation failure",
                     container.id,
                 )
-                raise InternalError(
-                    "allocation activation failed and container cleanup failed"
-                ) from exc
             with self._connection() as connection:
                 store.fail_allocation(
                     connection,
@@ -1248,7 +1480,68 @@ class Broker:
                     reason=f"activation failed: {exc}",
                     now=self._now(),
                 )
+            if cleanup_failed:
+                raise InternalError(
+                    "allocation activation failed and container cleanup failed"
+                ) from exc
             raise InternalError("allocation could not be activated") from exc
+
+    async def _schedule_queue_safely(self, trigger: str) -> None:
+        try:
+            admitted = await self._schedule_queue()
+        except Exception:
+            logger.exception("queue scheduling failed during %s", trigger)
+            return
+        if admitted:
+            logger.info("%s queue admissions: %s", trigger, ", ".join(admitted))
+
+    async def _schedule_queue(self) -> list[str]:
+        if self._mode != "active" or not self.config.policy.queue_enabled:
+            return []
+        with self._connection() as connection:
+            if store.queue_request_count(connection) == 0:
+                return []
+        admitted: list[str] = []
+        while True:
+            live = await asyncio.to_thread(self._live_resources)
+            if live.error:
+                logger.warning("queue scheduling paused: live GPU detection failed: %s", live.error)
+                break
+            now = self._now()
+            with self._connection() as connection:
+                db_gpus = store.list_gpus(connection, now=now)
+                active_ids = {
+                    str(allocation["id"])
+                    for allocation in store.list_allocations(
+                        connection,
+                        statuses=("pending", "active"),
+                        now=now,
+                    )
+                }
+                merged = self._merge_gpus(db_gpus, live, active_ids)
+                available_gpu_uuids = {str(gpu["uuid"]) for gpu in merged if gpu["state"] == "free"}
+                allocation_id = store.admit_next_queued(
+                    connection,
+                    max_cpus=self.config.policy.global_max_cpus,
+                    max_memory_gb=self.config.policy.global_max_memory_gb,
+                    max_cpus_per_user=self.config.policy.max_cpus_per_user,
+                    max_memory_gb_per_user=self.config.policy.max_memory_gb_per_user,
+                    max_gpus_per_user=self.config.policy.max_gpus_per_user,
+                    max_active_allocations_per_user=(
+                        self.config.policy.max_active_allocations_per_user
+                    ),
+                    available_gpu_uuids=available_gpu_uuids,
+                    now=now,
+                )
+            if allocation_id is None:
+                break
+            logger.info("admitting queued request as allocation %s", allocation_id)
+            try:
+                await self._materialize_allocation(allocation_id)
+            except Exception:
+                logger.exception("queued allocation %s could not be materialized", allocation_id)
+            admitted.append(allocation_id)
+        return admitted
 
     async def _release(
         self,
@@ -1297,7 +1590,9 @@ class Broker:
                 reason=reason,
                 now=self._now(),
             )
-            return store.get_allocation(connection, allocation_id, now=self._now())
+            released = store.get_allocation(connection, allocation_id, now=self._now())
+        await self._schedule_queue_safely("release")
+        return released
 
     @staticmethod
     def _job_name(raw: Any) -> str:
@@ -1499,10 +1794,11 @@ class Broker:
         if mode == "monitor":
             with self._connection() as connection:
                 leases = store.active_lease_count(connection)
-            if leases:
+                queued = store.queue_request_count(connection)
+            if leases or queued:
                 raise Conflict(
-                    "cannot switch to monitor while active/pending leases exist; "
-                    "use maintenance mode"
+                    "cannot switch to monitor while active/pending leases or queued "
+                    "requests exist; use maintenance mode"
                 )
             try:
                 managed = [
@@ -1519,6 +1815,11 @@ class Broker:
         if mode == "active" and not self.config.policy.deployment_allowed:
             raise Forbidden("deployment_allowed=false; active mode is not approved")
         if mode == "active":
+            audit = await asyncio.to_thread(self._legacy_audit_result)
+            if not audit.passed:
+                raise Conflict(
+                    "active mode blocked by legacy access audit: " + audit.failure_message()
+                )
             now = self._now()
             with self._connection() as connection:
                 db_gpus = store.list_gpus(connection, now=now)
@@ -1557,6 +1858,8 @@ class Broker:
         with self._connection() as connection:
             store.set_mode(connection, str(mode), actor_uid=identity.uid, now=self._now())
         self._mode = str(mode)
+        if self._mode == "active":
+            await self._schedule_queue_safely("mode_activation")
         return {"mode": self._mode}
 
     @staticmethod

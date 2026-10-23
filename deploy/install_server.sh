@@ -28,6 +28,8 @@ DISK_TIMER=/etc/systemd/system/udc-resource-disk-check.timer
 LEGACY_LOGROTATE=/etc/logrotate.d/udc-resource
 LOGIN_WRAPPER=/usr/local/bin/udc-resource-login
 CLI_LINK=/usr/local/bin/udc-resource
+LIBEXEC_DIR=/usr/local/libexec/udc-resource
+AUDIT_INSTALL=$LIBEXEC_DIR/audit_legacy.sh
 UDC_GROUPS=(udc-members udc-cli udc-admins udc-gpu)
 
 DRY_RUN=0
@@ -79,6 +81,21 @@ warn() { printf '[warn] %s\n' "$1"; }
 note() { printf '[info] %s\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# List human members whose effective group set includes GROUP.  Supplementary
+# group lists omit users whose primary group is the target group, so always ask
+# the account database with id -G instead of parsing /etc/group field 4.
+effective_members() {
+    local group=$1 gid user uid
+    gid=$(getent group "$group" 2>/dev/null | awk -F: 'NR == 1 {print $3}')
+    [ -n "$gid" ] || return 0
+    getent passwd | while IFS=: read -r user _ uid _; do
+        [ "$uid" -ge 1000 ] || continue
+        if id -G "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$gid"; then
+            printf '%s\n' "$user"
+        fi
+    done
+}
 
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -176,7 +193,7 @@ rollback() {
     fi
     systemctl daemon-reload 2>/dev/null || true
     udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=nvidia 2>/dev/null || true
+    udevadm trigger --action=change --sysname-match='nvidia*' 2>/dev/null || true
     reload_sshd
     if [ "$BROKER_WAS_ENABLED" -eq 0 ]; then
         systemctl disable udc-resource-broker.service 2>/dev/null || true
@@ -246,17 +263,6 @@ else
     warn "preflight skipped by explicit request"
 fi
 
-if [ "$DRY_RUN" -eq 1 ]; then
-    note "would run $SCRIPT_DIR/audit_legacy.sh"
-else
-    if bash "$SCRIPT_DIR/audit_legacy.sh"; then
-        ok "legacy audit passed"
-    else
-        AUDIT_FAILED=1
-        warn "legacy audit found critical findings; install may continue, but --start is blocked"
-    fi
-fi
-
 if [ -z "$CONFIG_SOURCE" ]; then
     if [ -f "$REPO_ROOT/lab/resources.local.toml" ]; then
         CONFIG_SOURCE=$REPO_ROOT/lab/resources.local.toml
@@ -302,6 +308,15 @@ with open(sys.argv[1], "rb") as handle:
 print("true" if data.get("policy", {}).get("deployment_allowed", False) else "false")
 PY
 ) || fail "could not parse config: $CONFIG_SOURCE"
+CONFIG_ALLOW_ROOT_KEYS=$("$PYTHON_BIN" - "$CONFIG_SOURCE" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+print("true" if data.get("policy", {}).get("allow_root_ssh_keys", False) else "false")
+PY
+) || fail "could not parse config: $CONFIG_SOURCE"
 if [ "$CONFIG_MODE" = "active" ] && [ "$ALLOW_ACTIVE" -ne 1 ]; then
     fail "config is in active mode; pass --allow-active only after training and approval"
 fi
@@ -340,25 +355,25 @@ for group in "${UDC_GROUPS[@]}"; do
     fi
 done
 
-if getent group udc-gpu 2>/dev/null | awk -F: '$4 != "" {found=1} END {exit found ? 0 : 1}'; then
-    fail "udc-gpu has members; remove them before installing"
+if [ -n "$(effective_members udc-gpu)" ]; then
+    fail "udc-gpu has effective members; remove them before installing"
 fi
-ok "udc-gpu has no members"
+ok "udc-gpu has no effective members"
 
-for username in $(getent group udc-members 2>/dev/null | awk -F: '{print $4}' | tr ',' ' '); do
+while IFS= read -r username; do
     [ -n "$username" ] || continue
     for forbidden in sudo docker udc-gpu video render udc-admins; do
-        if id -nG "$username" 2>/dev/null | grep -qw "$forbidden"; then
+        if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "$forbidden"; then
             fail "member $username is in forbidden group $forbidden"
         fi
     done
-done
-for username in $(getent group udc-admins 2>/dev/null | awk -F: '{print $4}' | tr ',' ' '); do
+done < <(effective_members udc-members)
+while IFS= read -r username; do
     [ -n "$username" ] || continue
-    if id -nG "$username" 2>/dev/null | grep -qw udc-members; then
+    if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx udc-members; then
         fail "admin $username is also in udc-members; ForceCommand would apply"
     fi
-done
+done < <(effective_members udc-admins)
 
 if [ "$DRY_RUN" -eq 0 ]; then
     run install -d -o root -g root -m 0755 "$PREFIX"
@@ -387,6 +402,10 @@ else
         run_shell "$VENV/bin/python -m pip install $REPO_ROOT"
     fi
 fi
+
+run install -d -o root -g root -m 0755 "$LIBEXEC_DIR"
+install_file 0755 "$SCRIPT_DIR/audit_legacy.sh" "$AUDIT_INSTALL"
+ok "legacy audit installed: $AUDIT_INSTALL"
 
 run install -d -o root -g root -m 0755 "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ] && [ "$FORCE_CONFIG" -ne 1 ]; then
@@ -482,8 +501,8 @@ if [ "$DRY_RUN" -eq 0 ] && udevadm verify --help >/dev/null 2>&1; then
     ok "udev rule validated"
 fi
 run udevadm control --reload-rules
-run udevadm trigger --subsystem-match=nvidia
-ok "udev rule installed"
+run udevadm trigger --action=change --sysname-match='nvidia*'
+ok "udev rule installed and nvidia* device nodes re-triggered"
 
 install_file 0644 \
     "$SCRIPT_DIR/systemd/udc-resource-broker.service" "$SYSTEMD_UNIT"
@@ -550,6 +569,26 @@ else
     warn "keep an existing admin SSH session open until a new member login is verified"
 fi
 
+# Run the installed, root-owned audit after all access-control files exist but
+# before the broker can be started. This is the pre-activation gate; an active
+# config is never allowed to commit with critical legacy access still present.
+if [ "$DRY_RUN" -eq 1 ]; then
+    note "would run $AUDIT_INSTALL --production"
+else
+    AUDIT_ARGS=(--production)
+    if [ "$CONFIG_ALLOW_ROOT_KEYS" = "true" ]; then
+        AUDIT_ARGS+=(--allow-root-ssh-keys)
+    fi
+    if bash "$AUDIT_INSTALL" "${AUDIT_ARGS[@]}"; then
+        ok "legacy audit passed"
+    else
+        AUDIT_FAILED=1
+        warn "legacy audit found critical findings; active install/start is blocked"
+    fi
+fi
+if [ "$CONFIG_MODE" = "active" ] && [ "$AUDIT_FAILED" -eq 1 ]; then
+    fail "active config requires a passing legacy audit; revoke legacy access"
+fi
 if [ "$START" -eq 1 ] && [ "$AUDIT_FAILED" -eq 1 ]; then
     fail "legacy audit failed; resolve critical findings before starting the broker"
 fi

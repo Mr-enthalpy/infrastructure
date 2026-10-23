@@ -15,7 +15,8 @@ The script refuses to run without:
 - `policy.file_transfer_enabled = true` only after quotas and TOCTOU tests pass
 - an explicit `--gpu` index that is currently `free`
 - an empty active/pending allocation set
-- a passing legacy access audit
+- a passing `audit_legacy.sh --production` (invalid root keys are fatal unless
+  `allow_root_ssh_keys=true` is explicitly configured)
 
 ## Run
 
@@ -43,7 +44,7 @@ ForceCommand rejects arbitrary commands.
 The script records its own test allocations and removes the temporary holder
 container on exit. It does not delete workspaces or other users' containers.
 
-## Four checks
+## Five checks
 
 1. **Real SSH boundary**
    - member CLI `list --json` succeeds;
@@ -52,7 +53,10 @@ container on exit. It does not delete workspaces or other users' containers.
      broker socket through the CLI;
    - if local users are supplied, direct `docker ps`, `nvidia-smi`, and read/write
      access to every `/dev/nvidia*` node fail for those accounts;
-     `verify_gpu_permissions.sh` checks all eight visible GPUs.
+     `verify_gpu_permissions.sh` checks all eight visible GPUs, every additional
+     NVIDIA node, effective group membership, ACLs, and the installed
+     `KERNEL=="nvidia*"` udev rule. Re-run it after a reboot and after reloading
+     the NVIDIA driver.
    - `list` exposes only the public member-directory fields (`display_name`,
      `nickname`, `public_contact`), and each supplied local member has a
      profile. Private contact fields must not appear in the response.
@@ -66,7 +70,8 @@ container on exit. It does not delete workspaces or other users' containers.
 3. **Legacy GPU holder without compute**
    - a temporary running container is created with Docker GPU access and
      `sleep infinity`, so it has no CUDA compute process;
-   - member apply for that GPU must fail with `gpu_busy`;
+   - member apply with `--no-queue` for that GPU must fail with `gpu_busy`, and
+     default apply must create a queued request without creating a GPU claim;
    - the temporary container is always removed. A stopped legacy container
      must not block a GPU and is reported as historical only.
 
@@ -87,6 +92,19 @@ container on exit. It does not delete workspaces or other users' containers.
      the claim, and keeps the workspace marker;
    - the bystander is unaffected.
 
+5. **Queue admission and cancellation**
+    - member A holds the test GPU, then member B applies for the same GPU with
+      queueing enabled; B receives `queue_id` with state `queued` and no GPU
+      claim;
+    - A releases the GPU; within the expiry/scheduling interval B's request
+      becomes `admitted`, its allocation becomes `active`, and the GPU is
+      claimed by B only;
+    - repeat with a second queued request and cancel it as its owner; it must
+      become `cancelled`, create no allocation, and leave the GPU free;
+    - `queue list --history` shows the terminal state; `queue list --all` is
+      rejected for a member and accepted for an admin;
+    - queue admission must pause (not guess) when live GPU detection fails.
+
 ## Evidence to retain
 
 Save the script output plus:
@@ -96,7 +114,10 @@ Save the script output plus:
 - `docker ps -a` before/after;
 - test allocation `status` before/after expiry;
 - workspace marker path and existence;
-- legacy audit output.
+- queue request before/after release and cancellation, including `queue list
+  --history --json`;
+- `audit_legacy.sh --production` JSON output (or human output) and
+  `verify_gpu_permissions.sh` output before/after reboot.
 
 Abort immediately if an unmanaged container is touched, a GPU is double
 allocated, a non-owner can release, or another user's container/workspace is

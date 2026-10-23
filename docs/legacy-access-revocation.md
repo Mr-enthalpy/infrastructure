@@ -48,7 +48,7 @@ stopped; stopped containers are history and must not be treated as current GPU
 holders, but still need an ownership decision.
 
 ```bash
-bash deploy/audit_legacy.sh
+bash deploy/audit_legacy.sh --production
 docker ps -a --format '{{.ID}}' | while read -r id; do
   docker inspect -f '{{.Name}} privileged={{.HostConfig.Privileged}} pid={{.HostConfig.PidMode}} gpus={{json .HostConfig.DeviceRequests}}' "$id"
 done
@@ -93,9 +93,13 @@ pkill -KILL -u "$user" || true
       root and uses the Docker socket; members must not.
 - [ ] Confirm `/var/run/docker.sock` is not group-readable/writable by
       `udc-members` or any legacy administrator group.
-- [ ] Ensure `udc-gpu` has no members and `/dev/nvidia*` is `0660
-      root:udc-gpu` (or stricter). Run
+- [ ] Ensure `udc-gpu` has no effective members (including primary-group
+      membership) and every `/dev/nvidia*` node, including `nvidia-uvm`,
+      `nvidia-uvm-tools`, and `nvidia-modeset`, is `0660 root:udc-gpu` (or
+      stricter) with no extra ACL. Run
       `bash deploy/verify_gpu_permissions.sh --member <member> --expected-gpus 8`.
+      Re-run it after reboot and after reloading the NVIDIA driver; the udev
+      rule must use `KERNEL=="nvidia*"`, not only `SUBSYSTEM=="nvidia"`.
 - [ ] Stop and remove legacy privileged containers, host-PID containers, and
       containers mounting the host Docker socket. Do not touch a container
       owned by a current allocation without the owner's approval.
@@ -103,8 +107,10 @@ pkill -KILL -u "$user" || true
       history, but record why they are retained.
 - [ ] Confirm no legacy process still owns a GPU:
       `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`.
-- [ ] Re-run `bash deploy/audit_legacy.sh`; it must report no running unmanaged
-      GPU access and no privileged legacy containers.
+- [ ] Re-run `bash deploy/audit_legacy.sh --production`; it must report no running
+      unmanaged GPU access and no privileged legacy containers. A non-empty
+      `/root/.ssh/authorized_keys` is fatal unless the configuration explicitly
+      sets `allow_root_ssh_keys=true`.
 
 ## 4. Revoke legacy broker/administrator state
 
@@ -141,7 +147,7 @@ su -s /bin/bash <legacy-admin> -c 'docker ps'       # must fail
 su -s /bin/bash <legacy-admin> -c 'nvidia-smi -L'   # must fail
 su -s /bin/bash <legacy-admin> -c 'test -r /dev/nvidia0 && echo BAD'  # must not print BAD
 ssh -o BatchMode=yes <legacy-admin>@<server> true   # must fail
-bash deploy/audit_legacy.sh
+bash deploy/audit_legacy.sh --production
 bash deploy/verify_gpu_permissions.sh --member <current-member> --expected-gpus 8
 ```
 

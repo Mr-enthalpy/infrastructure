@@ -12,6 +12,18 @@ warn() { printf '[warn] %s\n' "$1"; WARN=$((WARN + 1)); }
 fail() { printf '[fail] %s\n' "$1"; FAIL=$((FAIL + 1)); }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+effective_members() {
+    local group=$1 gid user uid
+    gid=$(getent group "$group" 2>/dev/null | awk -F: 'NR == 1 {print $3}')
+    [ -n "$gid" ] || return 0
+    getent passwd | while IFS=: read -r user _ uid _; do
+        [ "$uid" -ge 1000 ] || continue
+        if id -G "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$gid"; then
+            printf '%s\n' "$user"
+        fi
+    done
+}
+
 case "${1:-}" in
     -h|--help)
         printf 'usage: %s\n\nRead-only preflight for the udc-resource host.\n' "$0"
@@ -126,29 +138,34 @@ for group in udc-members udc-cli udc-admins udc-gpu; do
         warn "group does not exist yet: $group"
     fi
 done
-if getent group udc-gpu 2>/dev/null | awk -F: '$4 != "" {found=1} END {exit found ? 0 : 1}'; then
-    fail "udc-gpu has members; ordinary members must not be in this group"
+GPU_MEMBERS=$(effective_members udc-gpu | tr '\n' ' ')
+if [ -n "$GPU_MEMBERS" ]; then
+    fail "udc-gpu has effective members ($GPU_MEMBERS); ordinary members must not be in this group"
 else
-    ok "udc-gpu has no members"
+    ok "udc-gpu has no effective members"
 fi
 
 section "gpu device permissions"
 if compgen -G '/dev/nvidia*' >/dev/null; then
-    stat -c '%a %U %G %n' /dev/nvidia* 2>/dev/null || warn "could not stat /dev/nvidia*"
-    if [ -e /dev/nvidia0 ]; then
-        MODE=$(stat -c '%a' /dev/nvidia0 2>/dev/null || true)
-        GROUP=$(stat -c '%G' /dev/nvidia0 2>/dev/null || true)
+    for device in /dev/nvidia*; do
+        [ -e "$device" ] || continue
+        MODE=$(stat -c '%a' "$device" 2>/dev/null || true)
+        GROUP=$(stat -c '%G' "$device" 2>/dev/null || true)
         if [ "$MODE" = "660" ] && [ "$GROUP" = "udc-gpu" ]; then
-            ok "/dev/nvidia0 is 0660 and owned by group udc-gpu"
+            ok "$device is 0660 and owned by group udc-gpu"
         else
-            warn "/dev/nvidia0 mode/group is ${MODE:-unknown}/${GROUP:-unknown}; udev rule may not be installed"
+            warn "$device mode/group is ${MODE:-unknown}/${GROUP:-unknown}; udev rule may not be installed"
         fi
-    fi
+    done
 else
     warn "no /dev/nvidia* devices found"
 fi
 if [ -r /etc/udev/rules.d/99-udc-gpu.rules ]; then
-    ok "udev rule is installed"
+    if grep -Fq 'KERNEL=="nvidia*"' /etc/udev/rules.d/99-udc-gpu.rules; then
+        ok "udev rule matches all nvidia* device names"
+    else
+        warn "udev rule exists but does not use the KERNEL-based nvidia* match"
+    fi
 else
     warn "udev rule is not installed yet"
 fi

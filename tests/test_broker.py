@@ -13,6 +13,7 @@ from udc_resource.broker.docker_driver import ContainerInfo, GPUProcess
 from udc_resource.broker.server import Broker
 from udc_resource.db import connect, init_db
 from udc_resource.identity import Identity
+from udc_resource.legacy_audit import LegacyAuditResult
 from udc_resource.models import GPU
 
 FIXED = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
@@ -26,6 +27,7 @@ def _broker(
     config,
     *,
     docker: FakeDocker | None = None,
+    legacy_audit=None,
 ):
     fake_docker = docker or FakeDocker()
     resolver = FakeIdentityResolver(
@@ -41,6 +43,7 @@ def _broker(
         socket_path=tmp_path / "broker.sock",
         docker=fake_docker,
         identity_resolver=resolver,
+        legacy_audit=legacy_audit,
         clock=lambda: FIXED,
     )
     broker.initialize()
@@ -53,6 +56,111 @@ async def _call(broker: Broker, command: str, args: dict, identity: Identity) ->
         uid=identity.uid,
         gid=identity.gid,
     )
+
+
+async def test_startup_audit_failure_falls_back_to_monitor(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, legacy_audit_required=True),
+    )
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        legacy_audit=lambda: LegacyAuditResult(False, "legacy root key found"),
+    )
+    response = await _call(broker, "ping", {}, ALICE)
+    assert response["data"]["mode"] == "monitor"
+    blocked = await _call(broker, "admin_mode", {"mode": "active"}, ADMIN)
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "conflict"
+    assert "legacy access audit" in blocked["error"]["message"]
+
+
+async def test_admin_active_rechecks_audit_even_after_startup(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, legacy_audit_required=True),
+    )
+    calls = 0
+
+    def audit():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return LegacyAuditResult(True, "clean")
+        return LegacyAuditResult(False, "new root key appeared")
+
+    broker, _ = _broker(tmp_path, config, legacy_audit=audit)
+    assert (await _call(broker, "ping", {}, ALICE))["data"]["mode"] == "active"
+    switched = await _call(broker, "admin_mode", {"mode": "maintenance"}, ADMIN)
+    assert switched["ok"] is True
+    blocked = await _call(broker, "admin_mode", {"mode": "active"}, ADMIN)
+    assert blocked["ok"] is False
+    assert "new root key appeared" in blocked["error"]["message"]
+    assert calls == 2
+
+
+async def test_queue_admits_after_release(tmp_path, active_config):
+    broker, docker = _broker(tmp_path, active_config)
+    first = await _call(
+        broker,
+        "apply",
+        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert first["ok"] is True
+    second = await _call(
+        broker,
+        "apply",
+        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        BOB,
+    )
+    assert second["ok"] is True
+    queued = second["data"]
+    assert queued["status"] == "queued"
+    assert queued["owner"] == "bob"
+    assert queued["position"] == 1
+
+    listed = await _call(broker, "queue_list", {}, BOB)
+    assert [item["queue_id"] for item in listed["data"]["queue"]] == [queued["queue_id"]]
+
+    released = await _call(broker, "release", {"id": first["data"]["id"]}, ALICE)
+    assert released["ok"] is True
+    admitted = await _call(
+        broker,
+        "queue_get",
+        {"id": queued["queue_id"]},
+        BOB,
+    )
+    assert admitted["ok"] is True
+    assert admitted["data"]["queue"]["status"] == "admitted"
+    assert admitted["data"]["allocation"]["status"] == "active"
+    assert len(docker.created) == 2
+
+
+async def test_queue_cancel_removes_pending_request(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    first = await _call(
+        broker,
+        "apply",
+        {"gpus": [2], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    second = await _call(
+        broker,
+        "apply",
+        {"gpus": [2], "cpus": 8, "memory_gb": 32},
+        BOB,
+    )
+    queue_id = second["data"]["queue_id"]
+    cancelled = await _call(broker, "queue_cancel", {"id": queue_id}, BOB)
+    assert cancelled["ok"] is True
+    assert cancelled["data"]["status"] == "cancelled"
+    listed = await _call(broker, "queue_list", {}, BOB)
+    assert listed["data"]["queue"] == []
+    history = await _call(broker, "queue_list", {"include_finished": True}, BOB)
+    assert history["data"]["queue"][0]["status"] == "cancelled"
+    assert first["ok"] is True
 
 
 async def test_ping_returns_peer_identity(tmp_path, active_config):
@@ -107,7 +215,7 @@ async def test_second_apply_for_same_gpu_is_busy(tmp_path, active_config):
     second = await _call(
         broker,
         "apply",
-        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        {"gpus": [3], "cpus": 8, "memory_gb": 32, "queue": False},
         BOB,
     )
     assert second["ok"] is False
@@ -289,11 +397,26 @@ async def test_apply_rejects_gpu_with_unmanaged_process(tmp_path, active_config)
     response = await _call(
         broker,
         "apply",
-        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        {"gpus": [3], "cpus": 8, "memory_gb": 32, "queue": False},
         ALICE,
     )
     assert response["ok"] is False
     assert response["error"]["code"] == "gpu_busy"
+    assert fake.created == []
+
+
+async def test_apply_queues_gpu_with_unmanaged_process(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_process(GPUProcess(gpu_uuid="GPU-3", pid=4242, used_mib=1024, process_name="python"))
+    broker, _ = _broker(tmp_path, active_config, docker=fake)
+    response = await _call(
+        broker,
+        "apply",
+        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert response["ok"] is True
+    assert response["data"]["status"] == "queued"
     assert fake.created == []
 
 
@@ -430,8 +553,8 @@ async def test_release_pending_allocation_removes_container_by_label(tmp_path, a
             note="",
             starts_at=FIXED,
             expires_at=FIXED.replace(hour=23),
-            max_cpus=active_config.policy.max_cpus,
-            max_memory_gb=active_config.policy.max_memory_gb,
+            max_cpus=active_config.policy.global_max_cpus,
+            max_memory_gb=active_config.policy.global_max_memory_gb,
             now=FIXED,
         )
     finally:
@@ -494,8 +617,8 @@ async def test_monitor_mode_does_not_stop_or_reconcile(tmp_path, monitor_config)
             note="",
             starts_at=FIXED.replace(hour=0),
             expires_at=FIXED.replace(hour=1),
-            max_cpus=monitor_config.policy.max_cpus,
-            max_memory_gb=monitor_config.policy.max_memory_gb,
+            max_cpus=monitor_config.policy.global_max_cpus,
+            max_memory_gb=monitor_config.policy.global_max_memory_gb,
             now=FIXED.replace(hour=0),
         )
         store.activate_allocation(
@@ -626,7 +749,7 @@ async def test_apply_rejects_container_gpu_holder_without_compute(tmp_path, acti
     response = await _call(
         broker,
         "apply",
-        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        {"gpus": [3], "cpus": 8, "memory_gb": 32, "queue": False},
         ALICE,
     )
     assert response["ok"] is False
@@ -736,8 +859,8 @@ async def test_initialize_promotes_monitor_with_lease_to_maintenance(tmp_path, m
             note="",
             starts_at=FIXED.replace(hour=0),
             expires_at=FIXED.replace(hour=1),
-            max_cpus=monitor_config.policy.max_cpus,
-            max_memory_gb=monitor_config.policy.max_memory_gb,
+            max_cpus=monitor_config.policy.global_max_cpus,
+            max_memory_gb=monitor_config.policy.global_max_memory_gb,
             now=FIXED.replace(hour=0),
         )
         store.activate_allocation(

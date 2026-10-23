@@ -40,8 +40,12 @@ class PolicyConfig:
     max_hours: int = 36
     mode: str = "monitor"
     deployment_allowed: bool = False
-    max_cpus: float = 32.0
-    max_memory_gb: int = 128
+    global_max_cpus: float = 120.0
+    global_max_memory_gb: int = 219
+    max_cpus_per_allocation: float = 32.0
+    max_memory_gb_per_allocation: int = 128
+    max_cpus_per_user: float = 64.0
+    max_memory_gb_per_user: int = 192
     reserve_cpus: float = 8.0
     reserve_memory_gb: int = 32
     max_gpus_per_user: int = 4
@@ -54,6 +58,14 @@ class PolicyConfig:
     container_user: str = "member"
     container_read_only: bool = True
     userns_mode: str = ""
+    legacy_audit_required: bool = True
+    legacy_audit_script: str = "/usr/local/libexec/udc-resource/audit_legacy.sh"
+    legacy_audit_timeout: int = 120
+    allow_root_ssh_keys: bool = False
+    queue_enabled: bool = True
+    max_queue_length: int = 100
+    max_queued_allocations_per_user: int = 4
+    max_queue_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -145,15 +157,33 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("hardware.cpu_logical must be positive")
     if hardware.ram_gib <= 0:
         raise ValueError("hardware.ram_gib must be positive")
+    reserve_cpus = float(policy_raw.get("reserve_cpus", 8.0))
+    reserve_memory_gb = int(policy_raw.get("reserve_memory_gb", 32))
+    # max_cpus/max_memory_gb are accepted as legacy names for the per-allocation
+    # cap. They no longer act as the global capacity.
+    max_cpus_per_allocation = float(
+        policy_raw.get("max_cpus_per_allocation", policy_raw.get("max_cpus", 32.0))
+    )
+    max_memory_gb_per_allocation = int(
+        policy_raw.get("max_memory_gb_per_allocation", policy_raw.get("max_memory_gb", 128))
+    )
+    global_max_cpus = float(policy_raw.get("global_max_cpus", hardware.cpu_logical - reserve_cpus))
+    global_max_memory_gb = int(
+        policy_raw.get("global_max_memory_gb", hardware.ram_gib - reserve_memory_gb)
+    )
     policy = PolicyConfig(
         default_hours=int(policy_raw.get("default_hours", 12)),
         max_hours=int(policy_raw.get("max_hours", 36)),
         mode=str(policy_raw.get("mode", "monitor")),
         deployment_allowed=bool(policy_raw.get("deployment_allowed", False)),
-        max_cpus=float(policy_raw.get("max_cpus", 32.0)),
-        max_memory_gb=int(policy_raw.get("max_memory_gb", 128)),
-        reserve_cpus=float(policy_raw.get("reserve_cpus", 8.0)),
-        reserve_memory_gb=int(policy_raw.get("reserve_memory_gb", 32)),
+        global_max_cpus=global_max_cpus,
+        global_max_memory_gb=global_max_memory_gb,
+        max_cpus_per_allocation=max_cpus_per_allocation,
+        max_memory_gb_per_allocation=max_memory_gb_per_allocation,
+        max_cpus_per_user=float(policy_raw.get("max_cpus_per_user", global_max_cpus)),
+        max_memory_gb_per_user=int(policy_raw.get("max_memory_gb_per_user", global_max_memory_gb)),
+        reserve_cpus=reserve_cpus,
+        reserve_memory_gb=reserve_memory_gb,
         max_gpus_per_user=int(policy_raw.get("max_gpus_per_user", 4)),
         max_active_allocations_per_user=int(policy_raw.get("max_active_allocations_per_user", 4)),
         file_transfer_enabled=bool(policy_raw.get("file_transfer_enabled", False)),
@@ -164,6 +194,19 @@ def load_config(path: str | Path) -> LabConfig:
         container_user=str(policy_raw.get("container_user", "member")),
         container_read_only=bool(policy_raw.get("container_read_only", True)),
         userns_mode=str(policy_raw.get("userns_mode", "")),
+        legacy_audit_required=bool(policy_raw.get("legacy_audit_required", True)),
+        legacy_audit_script=str(
+            policy_raw.get(
+                "legacy_audit_script",
+                "/usr/local/libexec/udc-resource/audit_legacy.sh",
+            )
+        ),
+        legacy_audit_timeout=int(policy_raw.get("legacy_audit_timeout", 120)),
+        allow_root_ssh_keys=bool(policy_raw.get("allow_root_ssh_keys", False)),
+        queue_enabled=bool(policy_raw.get("queue_enabled", True)),
+        max_queue_length=int(policy_raw.get("max_queue_length", 100)),
+        max_queued_allocations_per_user=int(policy_raw.get("max_queued_allocations_per_user", 4)),
+        max_queue_hours=int(policy_raw.get("max_queue_hours", 24)),
     )
     if not 1 <= policy.default_hours <= policy.max_hours:
         raise ValueError("default_hours must be between 1 and max_hours")
@@ -173,8 +216,26 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("policy.mode must be monitor, maintenance, or active")
     if policy.mode == "active" and not policy.deployment_allowed:
         raise ValueError("policy.mode=active requires deployment_allowed=true")
-    if policy.max_cpus <= 0 or policy.max_memory_gb <= 0:
-        raise ValueError("policy.max_cpus and policy.max_memory_gb must be positive")
+    if policy.mode == "active" and not policy.legacy_audit_required:
+        raise ValueError("policy.mode=active requires legacy_audit_required=true")
+    if policy.global_max_cpus <= 0 or policy.global_max_memory_gb <= 0:
+        raise ValueError("global CPU and memory budgets must be positive")
+    if policy.max_cpus_per_allocation <= 0 or policy.max_memory_gb_per_allocation <= 0:
+        raise ValueError("per-allocation CPU and memory limits must be positive")
+    if policy.max_cpus_per_user <= 0 or policy.max_memory_gb_per_user <= 0:
+        raise ValueError("per-user CPU and memory limits must be positive")
+    if policy.max_cpus_per_allocation > policy.global_max_cpus:
+        raise ValueError("max_cpus_per_allocation exceeds global_max_cpus")
+    if policy.max_memory_gb_per_allocation > policy.global_max_memory_gb:
+        raise ValueError("max_memory_gb_per_allocation exceeds global_max_memory_gb")
+    if policy.max_cpus_per_user > policy.global_max_cpus:
+        raise ValueError("max_cpus_per_user exceeds global_max_cpus")
+    if policy.max_memory_gb_per_user > policy.global_max_memory_gb:
+        raise ValueError("max_memory_gb_per_user exceeds global_max_memory_gb")
+    if policy.max_cpus_per_user < policy.max_cpus_per_allocation:
+        raise ValueError("max_cpus_per_user is below max_cpus_per_allocation")
+    if policy.max_memory_gb_per_user < policy.max_memory_gb_per_allocation:
+        raise ValueError("max_memory_gb_per_user is below max_memory_gb_per_allocation")
     if policy.reserve_cpus < 0 or policy.reserve_memory_gb < 0:
         raise ValueError("policy reserves must not be negative")
     if policy.max_gpus_per_user <= 0 or policy.max_active_allocations_per_user <= 0:
@@ -189,10 +250,18 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("policy.container_user must be root or member")
     if policy.userns_mode not in {"", "host"}:
         raise ValueError("policy.userns_mode must be empty or host")
-    if policy.max_cpus + policy.reserve_cpus > hardware.cpu_logical:
-        raise ValueError("max_cpus + reserve_cpus exceeds hardware.cpu_logical")
-    if policy.max_memory_gb + policy.reserve_memory_gb > hardware.ram_gib:
-        raise ValueError("max_memory_gb + reserve_memory_gb exceeds hardware.ram_gib")
+    if not policy.legacy_audit_script:
+        raise ValueError("policy.legacy_audit_script must not be empty")
+    if policy.legacy_audit_timeout <= 0:
+        raise ValueError("policy.legacy_audit_timeout must be positive")
+    if policy.max_queue_length <= 0 or policy.max_queued_allocations_per_user <= 0:
+        raise ValueError("policy queue limits must be positive")
+    if policy.max_queue_hours <= 0:
+        raise ValueError("policy.max_queue_hours must be positive")
+    if policy.global_max_cpus + policy.reserve_cpus > hardware.cpu_logical:
+        raise ValueError("global_max_cpus + reserve_cpus exceeds hardware.cpu_logical")
+    if policy.global_max_memory_gb + policy.reserve_memory_gb > hardware.ram_gib:
+        raise ValueError("global_max_memory_gb + reserve_memory_gb exceeds hardware.ram_gib")
     groups = GroupsConfig(
         members=str(groups_raw.get("members", "udc-members")),
         cli=str(groups_raw.get("cli", "udc-cli")),

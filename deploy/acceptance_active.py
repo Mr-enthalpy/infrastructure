@@ -141,9 +141,15 @@ class Acceptance:
         )
         self.holder_name = f"udc-accept-holder-{os.getpid()}"
         self.allocations: list[tuple[str, str]] = []
+        self.queue_requests: list[tuple[str, str]] = []
         self.holder_container = ""
 
     def cleanup(self) -> None:
+        for alias, queue_id in reversed(self.queue_requests):
+            try:
+                ssh_cli(alias, ["queue", "cancel", queue_id, "--reason", "acceptance cleanup"])
+            except Exception as exc:
+                print(f"[warn] cleanup queue {queue_id}: {exc}", file=sys.stderr)
         for alias, allocation_id in reversed(self.allocations):
             try:
                 ssh_cli(alias, ["release", allocation_id], timeout=30)
@@ -246,6 +252,7 @@ class Acceptance:
             "1",
             "--note",
             "acceptance concurrency",
+            "--no-queue",
         ]
 
         def attempt(alias: str) -> tuple[str, dict[str, Any]]:
@@ -279,6 +286,202 @@ class Acceptance:
             "GPU to become free after release",
         )
         print(f"[pass] concurrent apply: one winner ({winner_alias}); GPU {gpu['index']} released")
+
+    def _queue_entry(self, queue_id: str, *, history: bool = False) -> dict[str, Any]:
+        data = require_ok(
+            ssh_cli(
+                self.member_b,
+                ["queue", "list", *(["--history"] if history else [])],
+            ),
+            "queue list",
+        )
+        for item in data.get("queue", []):
+            if item.get("queue_id") == queue_id:
+                return item
+        raise AcceptanceError(f"queue request {queue_id} is missing from queue list")
+
+    def test_queue_admission(self) -> None:
+        self.require_free_gpu()
+        holder_id = ""
+        queue_id = ""
+        allocation_id = ""
+        try:
+            holder = require_ok(
+                ssh_cli(
+                    self.member_a,
+                    [
+                        "apply",
+                        "--gpus",
+                        str(self.gpu_index),
+                        "--cpus",
+                        "2",
+                        "--memory",
+                        "4",
+                        "--hours",
+                        "1",
+                        "--note",
+                        "acceptance queue holder",
+                        "--no-queue",
+                    ],
+                ),
+                "queue holder allocation",
+            )
+            holder_id = str(holder["id"])
+            self.allocations.append((self.member_a, holder_id))
+            if not container_running(str(holder["container_id"])):
+                raise AcceptanceError("queue holder container is not running")
+
+            queued = require_ok(
+                ssh_cli(
+                    self.member_b,
+                    [
+                        "apply",
+                        "--gpus",
+                        str(self.gpu_index),
+                        "--cpus",
+                        "2",
+                        "--memory",
+                        "4",
+                        "--hours",
+                        "1",
+                        "--note",
+                        "acceptance queue request",
+                    ],
+                ),
+                "queue request",
+            )
+            queue_id = str(queued["queue_id"])
+            self.queue_requests.append((self.member_b, queue_id))
+            if queued.get("status") != "queued" or queued.get("allocation_id"):
+                raise AcceptanceError(f"expected a queued request without allocation: {queued}")
+            entry = self._queue_entry(queue_id)
+            if entry.get("status") != "queued" or entry.get("position") is None:
+                raise AcceptanceError(f"queue entry has no queued position: {entry}")
+            gpu = self.gpu()
+            if gpu.get("state") != "allocated" or gpu.get("owner") != holder.get("owner"):
+                raise AcceptanceError(f"queued request changed GPU ownership: {gpu}")
+
+            cancelled = require_ok(
+                ssh_cli(
+                    self.member_b,
+                    ["queue", "cancel", queue_id, "--reason", "acceptance cancel"],
+                ),
+                "queue cancel",
+            )
+            if cancelled.get("status") != "cancelled":
+                raise AcceptanceError(f"queue cancel returned {cancelled}")
+            self.queue_requests.remove((self.member_b, queue_id))
+            queue_id = ""
+            cancelled_entry = self._queue_entry(
+                str(cancelled["queue_id"]),
+                history=True,
+            )
+            if cancelled_entry.get("status") != "cancelled":
+                raise AcceptanceError(
+                    f"cancelled queue request is not in history: {cancelled_entry}"
+                )
+            status = require_ok(ssh_cli(self.member_b, ["status"]), "status after queue cancel")
+            if any(
+                allocation.get("status") in {"pending", "active"}
+                for allocation in status.get("allocations", [])
+            ):
+                raise AcceptanceError("cancelled queue request created an allocation")
+
+            queued = require_ok(
+                ssh_cli(
+                    self.member_b,
+                    [
+                        "apply",
+                        "--gpus",
+                        str(self.gpu_index),
+                        "--cpus",
+                        "2",
+                        "--memory",
+                        "4",
+                        "--hours",
+                        "1",
+                        "--note",
+                        "acceptance queue admission",
+                    ],
+                ),
+                "second queue request",
+            )
+            queue_id = str(queued["queue_id"])
+            self.queue_requests.append((self.member_b, queue_id))
+            require_ok(
+                ssh_cli(self.member_a, ["release", holder_id]),
+                "release queue holder",
+            )
+            self.allocations.remove((self.member_a, holder_id))
+            holder_id = ""
+
+            admitted = require_ok(
+                ssh_cli(
+                    self.member_b,
+                    ["queue", "wait", queue_id, "--timeout", "180"],
+                    timeout=210,
+                ),
+                "queue wait",
+            )
+            allocation = admitted.get("allocation")
+            if not isinstance(allocation, dict) or allocation.get("status") != "active":
+                raise AcceptanceError(f"queue wait did not return an active allocation: {admitted}")
+            allocation_id = str(allocation["id"])
+            self.allocations.append((self.member_b, allocation_id))
+            self.queue_requests.remove((self.member_b, queue_id))
+            queue_id = ""
+            if not container_running(str(allocation["container_id"])):
+                raise AcceptanceError("admitted queue container is not running")
+            gpu = self.gpu()
+            if gpu.get("owner") != allocation.get("owner"):
+                raise AcceptanceError(f"admitted allocation does not own the GPU: {gpu}")
+            admitted_entry = self._queue_entry(
+                str(queued["queue_id"]),
+                history=True,
+            )
+            if (
+                admitted_entry.get("status") != "admitted"
+                or admitted_entry.get("allocation_id") != allocation_id
+            ):
+                raise AcceptanceError(f"admitted queue request is not in history: {admitted_entry}")
+            require_ok(
+                ssh_cli(self.member_b, ["release", allocation_id]),
+                "release admitted allocation",
+            )
+            self.allocations.remove((self.member_b, allocation_id))
+            allocation_id = ""
+            wait_until(
+                lambda: self.gpu().get("state") == "free",
+                30,
+                1,
+                "GPU to become free after queue admission test",
+            )
+            print("[pass] queue: no claim while queued, cancel creates no allocation, wait admits")
+        finally:
+            if queue_id:
+                try:
+                    ssh_cli(
+                        self.member_b,
+                        ["queue", "cancel", queue_id, "--reason", "acceptance cleanup"],
+                    )
+                except Exception:
+                    pass
+                if (self.member_b, queue_id) in self.queue_requests:
+                    self.queue_requests.remove((self.member_b, queue_id))
+            if holder_id:
+                try:
+                    ssh_cli(self.member_a, ["release", holder_id], timeout=30)
+                except Exception:
+                    pass
+                if (self.member_a, holder_id) in self.allocations:
+                    self.allocations.remove((self.member_a, holder_id))
+            if allocation_id:
+                try:
+                    ssh_cli(self.member_b, ["release", allocation_id], timeout=30)
+                except Exception:
+                    pass
+                if (self.member_b, allocation_id) in self.allocations:
+                    self.allocations.remove((self.member_b, allocation_id))
 
     def test_unmanaged_gpu_holder(self) -> None:
         self.require_free_gpu()
@@ -322,6 +525,7 @@ class Acceptance:
                     "1",
                     "--note",
                     "acceptance holder rejection",
+                    "--no-queue",
                 ],
             )
             if response.get("ok"):
@@ -331,7 +535,42 @@ class Acceptance:
             error = response.get("error") or {}
             if error.get("code") != "gpu_busy":
                 raise AcceptanceError(f"expected gpu_busy, got {error}")
-            print("[pass] unmanaged GPU holder rejected apply with gpu_busy")
+            queued = require_ok(
+                ssh_cli(
+                    self.member_b,
+                    [
+                        "apply",
+                        "--gpus",
+                        str(self.gpu_index),
+                        "--cpus",
+                        "2",
+                        "--memory",
+                        "4",
+                        "--hours",
+                        "1",
+                        "--note",
+                        "acceptance holder queue",
+                    ],
+                ),
+                "queue behind unmanaged holder",
+            )
+            queue_id = str(queued["queue_id"])
+            self.queue_requests.append((self.member_b, queue_id))
+            if queued.get("status") != "queued" or queued.get("allocation_id"):
+                raise AcceptanceError(f"unmanaged holder request was not queued: {queued}")
+            if self.gpu().get("state") != "unmanaged":
+                raise AcceptanceError("queued request ignored or changed the unmanaged holder")
+            cancelled = require_ok(
+                ssh_cli(
+                    self.member_b,
+                    ["queue", "cancel", queue_id, "--reason", "acceptance holder cleanup"],
+                ),
+                "cancel queue behind unmanaged holder",
+            )
+            self.queue_requests.remove((self.member_b, queue_id))
+            if cancelled.get("status") != "cancelled":
+                raise AcceptanceError(f"queue behind holder was not cancelled: {cancelled}")
+            print("[pass] unmanaged GPU holder rejects --no-queue and queues default apply")
         finally:
             local(["docker", "rm", "-f", self.holder_name], timeout=30)
             self.holder_container = ""
@@ -443,6 +682,7 @@ class Acceptance:
                     "1",
                     "--note",
                     "acceptance expiry",
+                    "--no-queue",
                 ],
             ),
             "expiry allocation",
@@ -464,6 +704,7 @@ class Acceptance:
                     "1",
                     "--note",
                     "acceptance bystander",
+                    "--no-queue",
                 ],
             ),
             "bystander allocation",
@@ -715,8 +956,11 @@ class Acceptance:
                     self.allocations.remove((alias, current_id))
 
     def run(self) -> None:
+        audit_args = ["--production"]
+        if self.config.get("policy", {}).get("allow_root_ssh_keys"):
+            audit_args.append("--allow-root-ssh-keys")
         audit = local(
-            ["bash", str(Path(__file__).with_name("audit_legacy.sh"))],
+            ["bash", str(Path(__file__).with_name("audit_legacy.sh")), *audit_args],
             timeout=120,
         )
         if audit.returncode != 0:
@@ -760,6 +1004,7 @@ class Acceptance:
         self.test_real_ssh()
         self.test_public_member_directory()
         self.test_concurrent_apply()
+        self.test_queue_admission()
         self.test_unmanaged_gpu_holder()
         self.test_expiry_restart_disconnect()
 

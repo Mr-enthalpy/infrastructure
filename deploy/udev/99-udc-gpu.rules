@@ -1,2 +1,5 @@
-# Restrict NVIDIA device nodes to the broker/root. Members must not be in udc-gpu.
-SUBSYSTEM=="nvidia", KERNEL=="nvidia*", GROUP="udc-gpu", MODE="0660"
+# NVIDIA device nodes are not all in SUBSYSTEM=="nvidia": nvidia-uvm,
+# nvidia-uvm-tools, and nvidia-modeset can be misc devices. Match the kernel
+# name instead so every current and future /dev/nvidia* node gets the same
+# broker-only ownership. Members must not be in udc-gpu.
+ACTION=="add|change", KERNEL=="nvidia*", GROUP="udc-gpu", MODE="0660"

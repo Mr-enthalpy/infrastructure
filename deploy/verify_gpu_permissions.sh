@@ -30,6 +30,18 @@ ok() { printf '[ok]   %s\n' "$1"; }
 section() { printf '\n== %s ==\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+effective_members() {
+    local group=$1 gid user uid
+    gid=$(getent group "$group" 2>/dev/null | awk -F: 'NR == 1 {print $3}')
+    [ -n "$gid" ] || return 0
+    getent passwd | while IFS=: read -r user _ uid _; do
+        [ "$uid" -ge 1000 ] || continue
+        if id -G "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$gid"; then
+            printf '%s\n' "$user"
+        fi
+    done
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --member)
@@ -62,7 +74,8 @@ getent passwd "$MEMBER" >/dev/null 2>&1 || { printf '[fail] unknown member: %s\n
 have nvidia-smi || { printf '[fail] nvidia-smi not found\n'; exit 1; }
 have stat || { printf '[fail] stat not found\n'; exit 1; }
 have su || { printf '[fail] su not found\n'; exit 1; }
-have udevadm || { printf '[fail] udevadm not found; cannot verify the nvidia subsystem\n'; exit 1; }
+have udevadm || { printf '[fail] udevadm not found; cannot verify the nvidia* udev rule\n'; exit 1; }
+have getfacl || { printf '[fail] getfacl not found; cannot verify device ACLs\n'; exit 1; }
 
 member_run() {
     su -s /bin/bash "$MEMBER" -c "$1"
@@ -98,11 +111,19 @@ for index in $(seq 0 $((EXPECTED_GPUS - 1))); do
 done
 
 section "GPU group membership"
-GPU_MEMBERS=$(getent group udc-gpu 2>/dev/null | awk -F: '{print $4}')
+GPU_MEMBERS=$(effective_members udc-gpu | tr '\n' ' ')
 if [ -n "$GPU_MEMBERS" ]; then
-    fail "udc-gpu still contains members: $GPU_MEMBERS"
+    fail "udc-gpu still contains effective members: $GPU_MEMBERS"
 else
-    ok "udc-gpu has no members"
+    ok "udc-gpu has no effective members"
+fi
+
+section "udev rule"
+UDEV_RULE=/etc/udev/rules.d/99-udc-gpu.rules
+if [ -r "$UDEV_RULE" ] && grep -Fq 'KERNEL=="nvidia*"' "$UDEV_RULE"; then
+    ok "$UDEV_RULE matches every nvidia* kernel name"
+else
+    fail "$UDEV_RULE is missing or does not use KERNEL==\"nvidia*\""
 fi
 
 section "NVIDIA device nodes"
@@ -140,20 +161,28 @@ for device in "${DEVICES[@]}"; do
         fail "$device permissions are $meta (expected 660 root:udc-gpu)"
     fi
     subsystem=$(udevadm info --query=property --name="$device" 2>/dev/null | sed -n 's/^SUBSYSTEM=//p')
-    if [ "$subsystem" = "nvidia" ]; then
-        ok "$device udev subsystem: nvidia"
+    case "$subsystem" in
+        nvidia)
+            ok "$device udev subsystem: nvidia"
+            ;;
+        misc)
+            # nvidia-uvm, nvidia-uvm-tools, and nvidia-modeset are misc
+            # devices. The installed rule matches KERNEL=="nvidia*" so these
+            # nodes still receive the broker-only ownership.
+            ok "$device udev subsystem: misc (matched by KERNEL=nvidia*)"
+            ;;
+        "")
+            warn "$device udev subsystem is unavailable; verify udevadm info output"
+            ;;
+        *)
+            warn "$device udev subsystem is '$subsystem'; verify the KERNEL-based rule"
+            ;;
+    esac
+    acl=$(getfacl -cp "$device" 2>/dev/null | grep -E '^(user|group):[^:]+:' || true)
+    if [ -n "$acl" ]; then
+        fail "$device has an unexpected ACL: $acl"
     else
-        fail "$device udev subsystem is '${subsystem:-unknown}', expected nvidia"
-    fi
-    if have getfacl; then
-        acl=$(getfacl -cp "$device" 2>/dev/null | grep -E '^(user|group):[^:]+:' || true)
-        if [ -n "$acl" ]; then
-            fail "$device has an unexpected ACL: $acl"
-        else
-            ok "$device has no extra user/group ACL"
-        fi
-    else
-        warn "getfacl not installed; cannot inspect $device ACLs"
+        ok "$device has no extra user/group ACL"
     fi
     if member_run "test -r $(printf '%q' "$device")"; then
         fail "$MEMBER can read $device"

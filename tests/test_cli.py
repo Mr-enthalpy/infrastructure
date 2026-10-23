@@ -24,6 +24,16 @@ class FakeClient:
         return self.response
 
 
+class SequenceClient(FakeClient):
+    def __init__(self, responses: list[dict]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def request(self, command_name: str, **args):
+        self.calls.append((command_name, args))
+        return self.responses.pop(0)
+
+
 def _invoke(monkeypatch, fake: FakeClient, args: list[str]):
     monkeypatch.setattr(cli, "_make_client", lambda config: fake)
     return runner.invoke(cli.app, ["--config", str(CONFIG), *args])
@@ -75,6 +85,127 @@ def test_apply_parses_gpu_indices(monkeypatch):
     assert args["memory_gb"] == 32
     assert args["hours"] == 12
     assert args["note"] == ""
+
+
+def test_apply_no_queue_flag_is_forwarded(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "id": "alloc-1",
+                "status": "active",
+                "gpus": [3],
+                "expires_at": "2026-10-23T00:00:00+00:00",
+                "workspace": "/data1/udc-users/alice",
+            },
+        }
+    )
+    result = _invoke(
+        monkeypatch,
+        fake,
+        ["apply", "--gpus", "3", "--cpus", "8", "--memory", "32", "--no-queue", "--json"],
+    )
+    assert result.exit_code == 0
+    command, args = fake.calls[0]
+    assert command == "apply"
+    assert args["queue"] is False
+
+
+def test_apply_wait_json_prints_one_envelope(monkeypatch):
+    fake = SequenceClient(
+        [
+            {
+                "ok": True,
+                "data": {
+                    "queue_id": "q-1",
+                    "status": "queued",
+                    "owner": "alice",
+                    "gpus": [3],
+                    "cpus": 8.0,
+                    "memory_gb": 32,
+                    "hours": 1,
+                    "workspace": "/data1/udc-users/alice",
+                    "created_at": "2026-10-22T12:00:00+00:00",
+                    "expires_at": "2026-10-23T12:00:00+00:00",
+                    "position": 1,
+                },
+            },
+            {
+                "ok": True,
+                "data": {
+                    "queue": {
+                        "queue_id": "q-1",
+                        "status": "admitted",
+                        "allocation_id": "alloc-1",
+                    },
+                    "allocation": {
+                        "id": "alloc-1",
+                        "status": "active",
+                        "gpus": [3],
+                    },
+                },
+            },
+        ]
+    )
+    result = _invoke(
+        monkeypatch,
+        fake,
+        [
+            "apply",
+            "--gpus",
+            "3",
+            "--cpus",
+            "8",
+            "--memory",
+            "32",
+            "--wait",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["allocation"]["id"] == "alloc-1"
+    assert [call[0] for call in fake.calls] == ["apply", "queue_get"]
+
+
+def test_queue_list_and_cancel_commands(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "queue": [
+                    {
+                        "queue_id": "q-1",
+                        "owner": "alice",
+                        "status": "queued",
+                        "position": 1,
+                        "gpus": [3],
+                        "cpus": 8.0,
+                        "memory_gb": 32,
+                        "remaining_seconds": 3600,
+                    }
+                ]
+            },
+        }
+    )
+    result = _invoke(monkeypatch, fake, ["queue", "list", "--history", "--json"])
+    assert result.exit_code == 0
+    assert fake.calls == [("queue_list", {"all": False, "include_finished": True})]
+
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "queue_id": "q-1",
+                "status": "cancelled",
+            },
+        }
+    )
+    result = _invoke(monkeypatch, fake, ["queue", "cancel", "q-1", "--reason", "done"])
+    assert result.exit_code == 0
+    assert fake.calls == [("queue_cancel", {"id": "q-1", "reason": "done"})]
+    assert "cancelled: q-1" in result.output
 
 
 def test_broker_error_maps_to_exit_code(monkeypatch):

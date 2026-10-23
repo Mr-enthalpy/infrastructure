@@ -44,6 +44,18 @@ ok() { printf '[ok]   %s\n' "$1"; }
 section() { printf '\n== %s ==\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+effective_members() {
+    local group=$1 gid user uid
+    gid=$(getent group "$group" 2>/dev/null | awk -F: 'NR == 1 {print $3}')
+    [ -n "$gid" ] || return 0
+    getent passwd | while IFS=: read -r user _ uid _; do
+        [ "$uid" -ge 1000 ] || continue
+        if id -G "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$gid"; then
+            printf '%s\n' "$user"
+        fi
+    done
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --member)
@@ -121,7 +133,16 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 section "legacy access audit"
-if bash "$SCRIPT_DIR/audit_legacy.sh"; then
+AUDIT_SCRIPT=/usr/local/libexec/udc-resource/audit_legacy.sh
+[ -x "$AUDIT_SCRIPT" ] || AUDIT_SCRIPT="$SCRIPT_DIR/audit_legacy.sh"
+AUDIT_ARGS=(--production)
+CONFIG_ALLOW_ROOT_KEYS=$(UDC_RESOURCE_CONFIG="$CONFIG" "$VENV/bin/python" -c \
+    'import os; from udc_resource.config import load_config; print("true" if load_config(os.environ["UDC_RESOURCE_CONFIG"]).policy.allow_root_ssh_keys else "false")' \
+    2>/dev/null || printf 'false')
+if [ "$CONFIG_ALLOW_ROOT_KEYS" = "true" ]; then
+    AUDIT_ARGS+=(--allow-root-ssh-keys)
+fi
+if bash "$AUDIT_SCRIPT" "${AUDIT_ARGS[@]}"; then
     ok "legacy audit passed"
 else
     fail "legacy audit found critical findings"
@@ -143,10 +164,11 @@ for forbidden in sudo docker udc-gpu video render udc-admins; do
         ok "member is not in forbidden group: $forbidden"
     fi
 done
-if getent group udc-gpu 2>/dev/null | awk -F: '$4 != "" {found=1} END {exit found ? 0 : 1}'; then
-    fail "udc-gpu has members"
+GPU_MEMBERS=$(effective_members udc-gpu | tr '\n' ' ')
+if [ -n "$GPU_MEMBERS" ]; then
+    fail "udc-gpu has effective members: $GPU_MEMBERS"
 else
-    ok "udc-gpu has no members"
+    ok "udc-gpu has no effective members"
 fi
 
 section "broker and socket"

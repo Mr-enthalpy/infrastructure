@@ -27,5 +27,8 @@ def active_config(monitor_config: LabConfig, tmp_path: Path) -> LabConfig:
             deployment_allowed=True,
             file_transfer_enabled=True,
             min_free_gb=0,
+            # Most broker tests focus on lifecycle behavior. The dedicated
+            # audit-gate tests re-enable this and inject a runner.
+            legacy_audit_required=False,
         ),
     )

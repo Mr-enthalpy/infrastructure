@@ -82,6 +82,7 @@ uv.lock              # 锁定依赖版本
 ## 文档
 
 - [docs/acceptance.md](docs/acceptance.md)：active 模式破坏性验收（包含 job 断线/重连/重启持久化）。
+- [docs/queue.md](docs/queue.md)：排队状态、预算准入、取消/等待与运维语义。
 - [docs/jobs-and-transfer.md](docs/jobs-and-transfer.md)：detached tmux 训练任务与受限文件传输。
 - [docs/legacy-access-revocation.md](docs/legacy-access-revocation.md)：旧管理员权限撤销与验证清单。
 
@@ -92,7 +93,8 @@ uv.lock              # 锁定依赖版本
 - P2 已完成：真实 Docker driver、GPU/CPU/RAM 限制、workspace 创建、release、到期 worker、重启对账、未纳管资源展示；detached tmux job 与受限文件传输。
 - P3 已完成：幂等安装脚本、成员/管理员账号脚本、udev/sshd/systemd 模板、只读 monitor-only 安全验收脚本。
 - P4 已完成：本地 Web GUI、GPU 总览/申请/release/logs、管理员页、未纳管只读页、内嵌 xterm.js 终端。
-- P5 待实现：训练结束后的实机 monitor-only → CPU → 单 GPU 验收；四项 active 验收脚本见 `docs/acceptance.md`。
+- P5 待实现：训练结束后的实机 monitor-only → CPU → 单 GPU 验收；五项 active 验收脚本见 `docs/acceptance.md`。
+- 本轮 hardening 已完成本地实现与测试：active 启动/切换强制 legacy 审计、全局/每分配/每用户预算拆分、全 NVIDIA 节点与有效组验收、队列准入/取消/等待。实机 amax 验收仍等待训练结束和明确批准。
 - Linux-only 的 UDS/`SO_PEERCRED` 集成测试在 Windows 本地跳过，由 Ubuntu CI 执行。
 - 真实 Docker 集成测试需 `UDC_RUN_DOCKER_TESTS=1`，默认跳过。
 - amax 仍在训练，**禁止部署**。
@@ -105,6 +107,12 @@ udc-resource list --json
 udc-resource status [allocation-id] --json
 udc-resource apply --gpus 3,5 --cpus 16 --memory 64 --hours 12 --json
 udc-resource apply --cpus 4 --memory 8 --hours 1 --json   # CPU-only
+udc-resource apply --gpus 7 --cpus 8 --memory 32 --wait --wait-timeout 3600
+udc-resource apply --gpus 7 --cpus 8 --memory 32 --no-queue  # fail immediately if busy
+udc-resource queue list --json
+udc-resource queue list --history --all --json               # admin
+udc-resource queue cancel <queue-id> --reason "no longer needed"
+udc-resource queue wait <queue-id> --timeout 3600
 udc-resource release <allocation-id> --json
 udc-resource logs <allocation-id> --tail 200
 udc-resource shell <allocation-id>
@@ -135,7 +143,7 @@ udc-resource gui --server amax --admin-server amax-admin
 
 ```bash
 bash deploy/preflight.sh
-bash deploy/audit_legacy.sh
+bash deploy/audit_legacy.sh --production
 bash deploy/install_server.sh --dry-run --skip-preflight
 bash deploy/install_server.sh --yes
 bash deploy/create_user.sh --yes --ssh-key /path/to/key.pub udc-alice
@@ -143,7 +151,22 @@ systemctl start udc-resource-broker
 bash deploy/verify_monitor_only.sh --member udc-alice
 ```
 
-`install_server.sh` 幂等、支持 `--dry-run`，真实修改必须显式 `--yes`；默认只安装、不启动，启动后强制 `monitor` 模式。`verify_monitor_only.sh` 只读，不会停止容器。
+`install_server.sh` 幂等、支持 `--dry-run`，真实修改必须显式 `--yes`；默认只安装、不启动，启动后强制 `monitor` 模式。安装器会把严格审计脚本装到
+`/usr/local/libexec/udc-resource/audit_legacy.sh`。active 配置必须通过
+`audit_legacy.sh --production`，且 Broker 在启动和每次切换到 active 前都会重新执行审计；
+`/root/.ssh/authorized_keys` 非空默认阻断，只有显式设置 `allow_root_ssh_keys=true`
+才降级为告警。`verify_monitor_only.sh` 只读，不会停止容器。
+
+NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-uvm`、
+`nvidia-uvm-tools`、`nvidia-modeset` 等可能在 `misc` 子系统的节点；验收脚本会检查
+所有 `/dev/nvidia*` 节点、有效组成员关系、ACL，以及成员 UID 的实际读写和
+`nvidia-smi` 拒绝结果。
+
+预算拆分为 `global_max_cpus` / `global_max_memory_gb`、每分配上限
+`max_cpus_per_allocation` / `max_memory_gb_per_allocation`、每用户上限
+`max_cpus_per_user` / `max_memory_gb_per_user`。旧的 `max_cpus` / `max_memory_gb`
+仍被接受，但只作为每分配上限。GPU、CPU 或内存不足时默认进入队列；运行中的
+分配释放、到期或 Broker 启动后，队列会在检测到真实空闲 GPU 后按顺序准入。
 
 ## 快速检查
 
@@ -156,7 +179,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python -m ruff check .
 .\.venv\Scripts\python -m ruff format --check .
 .\.venv\Scripts\python -m mypy src
-.\.venv\Scripts\python -c "from udc_resource.config import load_config; c=load_config('lab/resources.example.toml'); print(c.server.name, c.policy.default_hours, c.policy.max_cpus)"
+.\.venv\Scripts\python -c "from udc_resource.config import load_config; c=load_config('lab/resources.example.toml'); print(c.server.name, c.policy.default_hours, c.policy.global_max_cpus, c.policy.max_cpus_per_user)"
 ```
 
 依赖更新后运行 `uv lock`；部署前运行 `bash deploy/preflight.sh`（只读）。不要在没有管理员批准和训练结束确认的情况下执行任何会修改主机的 `deploy/` 脚本。
