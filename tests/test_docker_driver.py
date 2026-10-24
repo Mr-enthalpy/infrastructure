@@ -1,8 +1,10 @@
+import os
 import struct
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from docker.errors import NotFound
@@ -242,7 +244,7 @@ def test_storage_preflight_rejects_non_overlay_driver(monkeypatch, active_config
     fake_client = FakeClient()
     fake_client.info_data = {"Driver": "vfs", "DockerRootDir": "/var/lib/docker"}
     driver._client = fake_client
-    monkeypatch.setattr(docker_driver.os, "name", "posix")
+    monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
     passed, detail = driver.storage_preflight()
     assert passed is False
     assert "overlay2" in detail
@@ -264,7 +266,7 @@ def test_storage_preflight_accepts_overlay_on_xfs_prjquota(monkeypatch, active_c
     fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": "/var/lib/docker"}
     driver._client = fake_client
     Path(config.server.workspace_root).mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(docker_driver.os, "name", "posix")
+    monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
     monkeypatch.setattr(docker_driver.shutil, "which", lambda name: "/usr/bin/findmnt")
 
     def fake_run(command, **kwargs):
@@ -297,7 +299,7 @@ def test_storage_preflight_requires_nosuid_workspace(monkeypatch, active_config)
     fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": "/var/lib/docker"}
     driver._client = fake_client
     Path(config.server.workspace_root).mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(docker_driver.os, "name", "posix")
+    monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
     monkeypatch.setattr(docker_driver.shutil, "which", lambda name: "/usr/bin/findmnt")
 
     def fake_run(command, **kwargs):
