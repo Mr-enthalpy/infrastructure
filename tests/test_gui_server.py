@@ -43,6 +43,25 @@ class FakeRunner:
             }
         elif args[:1] == ["logs"]:
             data = {"id": args[1], "logs": "hello logs\n"}
+        elif args[:2] == ["queue", "list"]:
+            data = {
+                "queue": [
+                    {
+                        "queue_id": "queue-1",
+                        "status": "queued",
+                        "position": 1,
+                        "gpus": [3],
+                        "cpus": 8,
+                        "memory_gb": 32,
+                    }
+                ]
+            }
+        elif args[:2] == ["queue", "cancel"]:
+            data = {"queue_id": args[2], "status": "cancelled"}
+        elif args[:2] == ["job", "list"]:
+            data = {"jobs": [{"name": "train", "session": "udc-train", "log": "/tmp/x"}]}
+        elif args[:2] == ["job", "stop"]:
+            data = {"name": args[3], "stopped": True}
         elif args[:2] == ["admin", "users"]:
             data = {"users": [{"uid": 1000, "username": "alice", "role": "member"}]}
         elif args[:2] == ["admin", "resources"]:
@@ -89,6 +108,8 @@ async def test_index_contains_token_and_server(monitor_config):
         text = await response.text()
         assert "test-token" in text
         assert monitor_config.server.name in text
+        assert "my-queue" in text
+        assert "my-jobs" in text
     finally:
         await client.close()
 
@@ -142,6 +163,83 @@ async def test_apply_builds_cli_arguments(monitor_config):
             "--note",
             "test",
         ]
+    finally:
+        await client.close()
+
+
+async def test_apply_no_queue_flag(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.post(
+            "/api/apply",
+            headers=_headers(),
+            data=json.dumps(
+                {
+                    "gpus": [],
+                    "cpus": 4,
+                    "memory_gb": 8,
+                    "hours": 2,
+                    "queue": False,
+                }
+            ),
+        )
+        assert response.status == 200
+        assert runner.calls[0][1][-1] == "--no-queue"
+    finally:
+        await client.close()
+
+
+async def test_queue_endpoints(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        listed = await client.get("/api/queue", headers=_headers())
+        assert listed.status == 200
+        payload = await listed.json()
+        assert payload["data"]["queue"][0]["queue_id"] == "queue-1"
+        cancelled = await client.post(
+            "/api/queue/cancel",
+            headers=_headers(),
+            data=json.dumps({"id": "queue-1", "reason": "done"}),
+        )
+        assert cancelled.status == 200
+        assert runner.calls == [
+            ("member-alias", ["queue", "list"]),
+            ("member-alias", ["queue", "cancel", "queue-1", "--reason", "done"]),
+        ]
+    finally:
+        await client.close()
+
+
+async def test_jobs_endpoints(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        listed = await client.get("/api/jobs/alloc-1", headers=_headers())
+        payload = await listed.json()
+        assert payload["data"]["jobs"][0]["name"] == "train"
+        stopped = await client.post(
+            "/api/jobs/alloc-1/stop",
+            headers=_headers(),
+            data=json.dumps({"name": "train"}),
+        )
+        assert stopped.status == 200
+        assert runner.calls == [
+            ("member-alias", ["job", "list", "alloc-1"]),
+            ("member-alias", ["job", "stop", "alloc-1", "--name", "train"]),
+        ]
+    finally:
+        await client.close()
+
+
+async def test_config_exposes_vscode_policy(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.get("/api/config", headers=_headers())
+        payload = await response.json()
+        assert payload["data"]["vscode_enabled"] is False
     finally:
         await client.close()
 

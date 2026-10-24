@@ -30,6 +30,8 @@ LOGIN_WRAPPER=/usr/local/bin/udc-resource-login
 CLI_LINK=/usr/local/bin/udc-resource
 LIBEXEC_DIR=/usr/local/libexec/udc-resource
 AUDIT_INSTALL=$LIBEXEC_DIR/audit_legacy.sh
+GPU_VERIFY_INSTALL=$LIBEXEC_DIR/verify_gpu_permissions.sh
+MEMBER_SHELL_INSTALL=$LIBEXEC_DIR/member-shell
 UDC_GROUPS=(udc-members udc-cli udc-admins udc-gpu)
 
 DRY_RUN=0
@@ -38,6 +40,7 @@ SKIP_PREFLIGHT=0
 START=0
 ALLOW_ACTIVE=0
 FORCE_CONFIG=0
+ENABLE_TIMERS=1
 AUDIT_FAILED=0
 CONFIG_SOURCE=""
 PYTHON_BIN=${PYTHON_BIN:-}
@@ -66,6 +69,7 @@ Options:
                         A fresh database still starts in monitor; existing active
                         leases are preserved only when deployment_allowed=true.
   --force-config        Overwrite an existing /etc/udc-resource/config.toml.
+  --no-timers           Do not enable the disk-alert and log-rotation timers.
   --config-source PATH  TOML config to install (default: lab/resources.local.toml
                         if present, otherwise lab/resources.example.toml).
   --python PATH         Python >= 3.11 used to create the venv.
@@ -221,6 +225,7 @@ while [ "$#" -gt 0 ]; do
         --start) START=1 ;;
         --allow-active) ALLOW_ACTIVE=1 ;;
         --force-config) FORCE_CONFIG=1 ;;
+        --no-timers) ENABLE_TIMERS=0 ;;
         --config-source)
             shift
             [ "$#" -gt 0 ] || fail "--config-source requires a path"
@@ -253,16 +258,6 @@ fi
 [ -f "$REPO_ROOT/uv.lock" ] || fail "uv.lock not found at $REPO_ROOT"
 [ -f "$SCRIPT_DIR/preflight.sh" ] || fail "preflight.sh not found"
 
-if [ "$SKIP_PREFLIGHT" -eq 0 ]; then
-    if [ "$DRY_RUN" -eq 1 ]; then
-        note "would run $SCRIPT_DIR/preflight.sh"
-    else
-        bash "$SCRIPT_DIR/preflight.sh" || fail "preflight failed"
-    fi
-else
-    warn "preflight skipped by explicit request"
-fi
-
 if [ -z "$CONFIG_SOURCE" ]; then
     if [ -f "$REPO_ROOT/lab/resources.local.toml" ]; then
         CONFIG_SOURCE=$REPO_ROOT/lab/resources.local.toml
@@ -271,6 +266,16 @@ if [ -z "$CONFIG_SOURCE" ]; then
     fi
 fi
 [ -f "$CONFIG_SOURCE" ] || fail "config source not found: $CONFIG_SOURCE"
+
+if [ "$SKIP_PREFLIGHT" -eq 0 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        note "would run $SCRIPT_DIR/preflight.sh --config $CONFIG_SOURCE"
+    else
+        bash "$SCRIPT_DIR/preflight.sh" --config "$CONFIG_SOURCE" || fail "preflight failed"
+    fi
+else
+    warn "preflight skipped by explicit request"
+fi
 
 if [ -z "$PYTHON_BIN" ]; then
     for candidate in python3.12 python3.11 python3; do
@@ -406,6 +411,18 @@ fi
 run install -d -o root -g root -m 0755 "$LIBEXEC_DIR"
 install_file 0755 "$SCRIPT_DIR/audit_legacy.sh" "$AUDIT_INSTALL"
 ok "legacy audit installed: $AUDIT_INSTALL"
+install_file 0755 "$SCRIPT_DIR/verify_gpu_permissions.sh" "$GPU_VERIFY_INSTALL"
+ok "GPU permission verifier installed: $GPU_VERIFY_INSTALL"
+install_file 0755 "$SCRIPT_DIR/member-shell.sh" "$MEMBER_SHELL_INSTALL"
+ok "root-owned member shell installed: $MEMBER_SHELL_INSTALL"
+for member in $(effective_members udc-members); do
+    current_shell=$(getent passwd "$member" | cut -d: -f7)
+    if [ "$current_shell" = "$MEMBER_SHELL_INSTALL" ]; then
+        ok "member $member already uses the restricted login shell"
+    else
+        warn "member $member still uses $current_shell; run deploy/create_user.sh --yes $member before active mode"
+    fi
+done
 
 run install -d -o root -g root -m 0755 "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ] && [ "$FORCE_CONFIG" -ne 1 ]; then
@@ -540,9 +557,6 @@ if [ -e "$LEGACY_LOGROTATE" ]; then
     warn "removed legacy copytruncate rule: $LEGACY_LOGROTATE"
 fi
 run systemctl daemon-reload
-note "enable job-log rotation with: systemctl enable --now udc-resource-logrotate.timer"
-note "enable disk alerts with: systemctl enable --now udc-resource-disk-check.timer"
-ok "symlink-safe job-log rotation and disk-alert units installed (timers not enabled)"
 
 if [ ! -r /etc/ssh/sshd_config ]; then
     warn "/etc/ssh/sshd_config is not readable; skipping sshd drop-in"
@@ -606,6 +620,22 @@ else
     if [ "$DRY_RUN" -eq 0 ] && systemctl is-active --quiet udc-resource-broker.service; then
         warn "broker is already running; restart it to apply the installed files"
     fi
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$ENABLE_TIMERS" -eq 1 ]; then
+        note "would enable and start log-rotation and disk-alert timers"
+    else
+        note "would leave log-rotation and disk-alert timers disabled"
+    fi
+elif [ "$ENABLE_TIMERS" -eq 1 ]; then
+    # Enable timers only after the pre-activation audit and any broker start
+    # attempt have succeeded, so a failed active install leaves no timer links.
+    run systemctl enable --now udc-resource-logrotate.timer
+    run systemctl enable --now udc-resource-disk-check.timer
+    ok "job-log rotation and disk-alert timers enabled"
+else
+    note "timers left disabled by --no-timers"
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then

@@ -26,6 +26,16 @@ def test_job_and_file_commands_are_allowed():
         "abc",
         "data.bin",
     ]
+    assert parse_command("udc-resource queue list") == [
+        "udc-resource",
+        "queue",
+        "list",
+    ]
+    assert parse_command("udc-resource tunnel abc") == [
+        "udc-resource",
+        "tunnel",
+        "abc",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -43,6 +53,23 @@ def test_job_and_file_commands_are_allowed():
 def test_shell_and_unknown_commands_are_rejected(raw):
     with pytest.raises(ValueError):
         parse_command(raw)
+
+
+def test_main_forces_installed_policy_config(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("SSH_ORIGINAL_COMMAND", "udc-resource list --json")
+    monkeypatch.setenv("UDC_RESOURCE_CONFIG", "/tmp/member-controlled.toml")
+    monkeypatch.setattr(login_wrapper, "cli_path", lambda: "/usr/local/bin/udc-resource")
+    monkeypatch.setattr(
+        login_wrapper.os,
+        "execv",
+        lambda path, argv: captured.update(path=path, argv=argv),
+    )
+
+    login_wrapper.main()
+
+    assert captured["argv"][:2] == ["udc-resource", "list"]
+    assert login_wrapper.os.environ["UDC_RESOURCE_CONFIG"] == ("/etc/udc-resource/config.toml")
 
 
 def test_cli_path_prefers_interpreter_sibling(tmp_path, monkeypatch):

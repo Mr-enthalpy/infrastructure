@@ -38,19 +38,32 @@ max_active_allocations_per_user = 4
 file_transfer_enabled = false
 max_upload_bytes = 21474836480
 min_free_gb = 50
-max_workspace_gb = 0
+max_workspace_gb = 200
+workspace_quota_required = true
 pids_limit = 4096
 container_user = "member"
-container_read_only = true
+container_read_only = false
+container_profile = "development"
+container_sudo = true
+writable_layer_gb = 40
+container_home = ""
 userns_mode = ""
 legacy_audit_required = true
 legacy_audit_script = "/usr/local/libexec/udc-resource/audit_legacy.sh"
 legacy_audit_timeout = 120
+gpu_audit_required = true
+gpu_audit_script = "/usr/local/libexec/udc-resource/verify_gpu_permissions.sh"
+gpu_audit_timeout = 180
+gpu_audit_interval = 300
 allow_root_ssh_keys = false
 queue_enabled = true
 max_queue_length = 100
 max_queued_allocations_per_user = 4
 max_queue_hours = 24
+# Enable only after the target-host container-sshd and tunnel acceptance tests pass.
+vscode_enabled = false
+vscode_max_tunnels = 8
+vscode_identity_file = ""
 
 [groups]
 members = "udc-members"
@@ -60,6 +73,7 @@ gpu = "udc-gpu"
 
 [image]
 base = "udc-base:2026.10"
+allowlist = []
 
 [deployment]
 reason = "amax is still training; deploy only after explicit approval"

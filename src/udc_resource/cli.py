@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import select
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -42,6 +47,8 @@ app.add_typer(admin_app, name="admin")
 app.add_typer(job_app, name="job")
 app.add_typer(file_app, name="file")
 app.add_typer(queue_app, name="queue")
+
+ALLOCATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _config_path(path: Path | None) -> Path:
@@ -180,6 +187,393 @@ def _run_shell_loop(sock: Any) -> None:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         signal.signal(signal.SIGWINCH, old_handler)
+
+
+def _relay_stdio_socket(sock: socket.socket) -> None:
+    if os.name != "posix":
+
+        def pump_input() -> None:
+            try:
+                stream: Any = sys.stdin.buffer
+                while True:
+                    data = stream.read1(65536)
+                    if not data:
+                        break
+                    sock.sendall(data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        def pump_output() -> None:
+            try:
+                while True:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+            except OSError:
+                pass
+
+        threads = [
+            threading.Thread(target=pump_input, daemon=True),
+            threading.Thread(target=pump_output, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        # The output side always terminates when the socket closes. The input
+        # side may stay blocked on an idle console/pipe, so do not wait forever
+        # for it; it is a daemon thread and dies with the process.
+        threads[1].join()
+        threads[0].join(timeout=1)
+        return
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    fds = [stdin_fd, sock]
+    stdin_open = True
+    try:
+        while True:
+            readable, _, _ = select.select(fds, [], [])
+            if sock in readable:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                os.write(stdout_fd, data)
+            if stdin_open and stdin_fd in readable:
+                data = os.read(stdin_fd, 65536)
+                if not data:
+                    stdin_open = False
+                    fds = [fd for fd in fds if fd != stdin_fd]
+                    try:
+                        sock.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                else:
+                    sock.sendall(data)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _default_identity() -> Path | None:
+    for name in ("id_ed25519", "id_ecdsa", "id_rsa"):
+        candidate = Path.home() / ".ssh" / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _managed_block(
+    allocation_id: str,
+    host: str,
+    port: int,
+    username: str,
+    identity: Path | None,
+) -> str:
+    lines = [
+        f"# BEGIN UDC VSCODE {allocation_id}",
+        f"Host {host}",
+        "  HostName 127.0.0.1",
+        f"  Port {port}",
+        f"  User {username}",
+        "  StrictHostKeyChecking no",
+        "  UserKnownHostsFile none",
+        "  LogLevel ERROR",
+        "  ServerAliveInterval 30",
+        "  ServerAliveCountMax 3",
+    ]
+    if identity is not None:
+        identity_text = identity.as_posix().replace('"', '\\"')
+        lines.extend(
+            [
+                f'  IdentityFile "{identity_text}"',
+                "  IdentitiesOnly yes",
+            ]
+        )
+    lines.append(f"# END UDC VSCODE {allocation_id}")
+    return "\n".join(lines)
+
+
+def _atomic_config_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".udc-tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        try:
+            os.chmod(temp_name, 0o600)
+        except OSError:
+            pass
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _config_target(path: Path) -> Path:
+    """Follow a user's dotfile symlink instead of replacing the link."""
+    return path.resolve() if path.is_symlink() else path
+
+
+def _install_managed_block(
+    path: Path,
+    allocation_id: str,
+    block: str,
+) -> bool:
+    path = _config_target(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    existing = path.read_text(encoding="utf-8") if existed else ""
+    pattern = re.compile(
+        rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
+        rf"{re.escape(allocation_id)}\n?"
+    )
+    existing = pattern.sub("", existing)
+    updated = existing.rstrip()
+    if updated:
+        updated += "\n\n"
+    updated += block.rstrip() + "\n"
+    _atomic_config_write(path, updated)
+    return not existed
+
+
+def _remove_managed_block(path: Path, allocation_id: str, *, created: bool) -> None:
+    path = _config_target(path)
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    pattern = re.compile(
+        rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
+        rf"{re.escape(allocation_id)}\n?"
+    )
+    updated = pattern.sub("", existing)
+    try:
+        if not updated.strip() and created:
+            path.unlink(missing_ok=True)
+            return
+        if updated != existing:
+            _atomic_config_write(path, updated)
+    except OSError:
+        pass
+
+
+async def _wait_for_tunnel_ready(process: asyncio.subprocess.Process) -> tuple[bool, str]:
+    assert process.stderr is not None
+    lines: list[str] = []
+    while True:
+        try:
+            line = await asyncio.wait_for(process.stderr.readline(), timeout=20)
+        except TimeoutError:
+            return False, "timed out waiting for the remote tunnel"
+        if not line:
+            return False, "".join(lines).strip() or "remote tunnel closed before it was ready"
+        text = line.decode("utf-8", errors="replace").strip()
+        if text == "TUNNEL-READY":
+            return True, ""
+        if text:
+            lines.append(text)
+        if len(lines) >= 20:
+            return False, "\n".join(lines)
+
+
+async def _drain_stderr(process: asyncio.subprocess.Process) -> None:
+    if process.stderr is None:
+        return
+    try:
+        while await process.stderr.read(65536):
+            pass
+    except OSError:
+        pass
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate a child and make sure it is reaped."""
+
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+        return
+    except (TimeoutError, OSError):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except (TimeoutError, OSError):
+        pass
+
+
+async def _serve_vscode_tunnel(
+    *,
+    config: LabConfig,
+    allocation_id: str,
+    username: str,
+    ssh_alias: str,
+    host: str,
+    requested_port: int,
+    ssh_config: Path,
+    identity: Path | None,
+    launch_code: bool,
+) -> None:
+    ssh_command = shlex.join(["udc-resource", "tunnel", allocation_id])
+    ssh_argv = [
+        *_ssh_base(config),
+        "-T",
+        "-o",
+        "LogLevel=ERROR",
+        ssh_alias,
+        ssh_command,
+    ]
+    children: set[asyncio.subprocess.Process] = set()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signal_name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signal_name, None)
+        if signum is None:
+            continue
+        try:
+            loop.add_signal_handler(signum, stop.set)
+        except (NotImplementedError, RuntimeError):
+            break
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        process = await asyncio.create_subprocess_exec(
+            *ssh_argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        children.add(process)
+        try:
+            ready, error = await _wait_for_tunnel_ready(process)
+            if not ready:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+                await _terminate_process(process)
+                typer.echo(f"tunnel failed: {error}", err=True)
+                return
+            assert process.stdin is not None
+            assert process.stdout is not None
+            process_stdin = process.stdin
+            process_stdout = process.stdout
+
+            async def client_to_tunnel() -> None:
+                while True:
+                    data = await reader.read(65536)
+                    if not data:
+                        break
+                    process_stdin.write(data)
+                    await process_stdin.drain()
+                try:
+                    process_stdin.close()
+                except OSError:
+                    pass
+
+            async def tunnel_to_client() -> None:
+                while True:
+                    data = await process_stdout.read(65536)
+                    if not data:
+                        break
+                    writer.write(data)
+                    await writer.drain()
+
+            drain = asyncio.create_task(_drain_stderr(process))
+            tasks = [
+                asyncio.create_task(client_to_tunnel()),
+                asyncio.create_task(tunnel_to_client()),
+            ]
+            try:
+                _done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+            finally:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
+                await _terminate_process(process)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+        finally:
+            # On cancellation leave the child in the shared set so the
+            # top-level shutdown path still terminates and reaps it.
+            current_task = asyncio.current_task()
+            if (
+                process.returncode is not None
+                or current_task is None
+                or not current_task.cancelled()
+            ):
+                await _terminate_process(process)
+                children.discard(process)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", requested_port)
+    sockets: list[Any] = list(server.sockets or [])
+    if not sockets:
+        server.close()
+        raise RuntimeError("could not bind the local VS Code tunnel")
+    port = int(sockets[0].getsockname()[1])
+    block = _managed_block(allocation_id, host, port, username, identity)
+    created = _install_managed_block(ssh_config, allocation_id, block)
+    typer.echo(f"local tunnel: 127.0.0.1:{port} -> {host} (allocation {allocation_id})")
+    typer.echo(f"ssh config: {ssh_config}")
+    remote_uri = f"vscode-remote://ssh-remote+{host}/workspace"
+    try:
+        if launch_code:
+            code = shutil.which("code")
+            if code is None:
+                typer.echo(
+                    f"VS Code CLI not found. Open this folder URI manually:\n  {remote_uri}",
+                    err=True,
+                )
+            else:
+                typer.echo(f"opening: {remote_uri}")
+                command = [code, "--folder-uri", remote_uri]
+                if os.name == "nt" and Path(code).suffix.lower() in {".cmd", ".bat"}:
+                    command = ["cmd", "/c", *command]
+                await asyncio.to_thread(
+                    subprocess.run,
+                    command,
+                    check=False,
+                )
+        else:
+            typer.echo(f"VS Code folder URI: {remote_uri}")
+        typer.echo("Press Ctrl-C to close the tunnel.")
+        await stop.wait()
+    finally:
+        server.close()
+        for process in list(children):
+            await _terminate_process(process)
+        _remove_managed_block(ssh_config, allocation_id, created=created)
 
 
 def _parse_gpu_indices(raw: str) -> list[int]:
@@ -520,6 +914,107 @@ def apply_command(
     typer.echo(f"gpus: {data['gpus']}")
     typer.echo(f"expires: {data['expires_at']}")
     typer.echo(f"workspace: {data['workspace']}")
+
+
+@app.command("menu")
+def menu_command(ctx: typer.Context) -> None:
+    """Small interactive menu for members; never exposes a host shell."""
+
+    config = _load(ctx)
+    client = _make_client(config)
+    while True:
+        typer.echo("")
+        typer.echo("UDC resource menu")
+        typer.echo("  1) list resources")
+        typer.echo("  2) my allocations")
+        typer.echo("  3) queue")
+        typer.echo("  4) apply")
+        typer.echo("  5) release")
+        typer.echo("  6) help / commands")
+        typer.echo("  0) exit")
+        choice = typer.prompt("choice", default="0").strip()
+        if choice in {"0", "q", "quit", "exit"}:
+            return
+        if choice == "1":
+            data = _request(client, "list", False)
+            for gpu in data.get("gpus", []):
+                typer.echo(f"GPU {gpu['index']}: {gpu['state']} ({gpu.get('state_reason', '')})")
+        elif choice == "2":
+            data = _request(client, "status", False)
+            allocations = data.get("allocations", [])
+            if not allocations:
+                typer.echo("no allocations")
+            for allocation in allocations:
+                typer.echo(
+                    f"{allocation['id']}  {allocation['status']}  "
+                    f"gpus={allocation['gpus']}  expires={allocation['expires_at']}"
+                )
+        elif choice == "3":
+            data = _request(
+                client,
+                "queue_list",
+                False,
+                all=False,
+                include_finished=False,
+            )
+            requests = data.get("queue", [])
+            if not requests:
+                typer.echo("no queued requests")
+            for request in requests:
+                typer.echo(
+                    f"{request['queue_id']}  position={request.get('position')}  "
+                    f"gpus={request['gpus']}  remaining="
+                    f"{_format_remaining(request.get('remaining_seconds'))}"
+                )
+        elif choice == "4":
+            gpus = typer.prompt("GPU indices (comma-separated, empty for CPU)", default="")
+            cpus = typer.prompt("CPUs", default="8")
+            memory = typer.prompt("memory GiB", default="32")
+            hours = typer.prompt("hours", default=str(config.policy.default_hours))
+            data = _request(
+                client,
+                "apply",
+                False,
+                gpus=_parse_gpu_indices(gpus),
+                cpus=float(cpus),
+                memory_gb=int(memory),
+                hours=int(hours),
+                queue=True,
+            )
+            if "queue_id" in data:
+                _print_queue(data)
+            else:
+                _print_allocation(data)
+        elif choice == "5":
+            allocation_id = typer.prompt("allocation id")
+            data = _request(client, "release", False, id=allocation_id)
+            typer.echo(f"released: {data['id']}  status={data['status']}")
+        elif choice == "6":
+            typer.echo(
+                "Use udc-resource --help, or: list, status, apply, shell, logs, "
+                "job, queue, release."
+            )
+        else:
+            typer.echo("unknown choice")
+
+
+@app.command("maintenance")
+def maintenance_command(
+    ctx: typer.Context,
+    disable: bool = typer.Option(
+        False,
+        "--disable",
+        help="Leave maintenance mode and return to active mode.",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Put the broker into maintenance mode (admin only)."""
+
+    config = _load(ctx)
+    mode = "active" if disable else "maintenance"
+    data = _request(_make_client(config), "admin_mode", json_output, mode=mode)
+    if not json_output:
+        typer.echo(f"mode: {data['mode']}")
 
 
 @queue_app.command("list")
@@ -950,6 +1445,7 @@ def pull_command(
 def shell_command(
     ctx: typer.Context,
     allocation_id: str = typer.Argument(..., help="Allocation id."),
+    job: str | None = typer.Option(None, "--job", help="Attach to a job session."),
 ) -> None:
     """Open an interactive shell inside the allocation container."""
     if os.name != "posix":
@@ -962,6 +1458,7 @@ def shell_command(
             allocation_id,
             size.columns,
             size.lines,
+            job=job,
         )
     except UdcError as exc:
         _fail(exc.code, exc.message, False)
@@ -983,6 +1480,141 @@ def shell_command(
         _fail("internal", f"shell connection failed: {exc}", False)
     finally:
         sock.close()
+
+
+@app.command("tunnel")
+def tunnel_command(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id."),
+) -> None:
+    """Relay a raw byte tunnel to the container sshd (used by VS Code)."""
+
+    config = _load(ctx)
+    if not ALLOCATION_ID_RE.fullmatch(allocation_id):
+        _fail("bad_request", "invalid allocation id", False)
+    client = _make_client(config)
+    try:
+        sock, response = client.connect_tunnel(allocation_id)
+    except UdcError as exc:
+        _fail(exc.code, exc.message, False)
+    if not response.get("ok"):
+        sock.close()
+        error = response.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        _fail(
+            str(error.get("code", "internal")),
+            str(error.get("message", "could not open tunnel")),
+            False,
+        )
+    sys.stderr.write("TUNNEL-READY\n")
+    sys.stderr.flush()
+    try:
+        _relay_stdio_socket(sock)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+@app.command("vscode")
+def vscode_command(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Active allocation id."),
+    server: str | None = typer.Option(
+        None,
+        "--server",
+        help="SSH alias for the member account (default: config ssh_alias).",
+    ),
+    identity: Path | None = typer.Option(
+        None,
+        "--identity",
+        help="SSH private key used by VS Code Remote-SSH.",
+    ),
+    ssh_config: Path | None = typer.Option(
+        None,
+        "--ssh-config",
+        help="SSH config file to update (default: ~/.ssh/config).",
+    ),
+    port: int = typer.Option(0, "--port", min=0, max=65535, help="Local tunnel port."),
+    code: bool = typer.Option(
+        True,
+        "--code/--no-code",
+        help="Launch the VS Code CLI after the tunnel is ready.",
+    ),
+) -> None:
+    """Open a container through a Broker-mediated SSH tunnel in VS Code."""
+
+    config = _load(ctx)
+    if not ALLOCATION_ID_RE.fullmatch(allocation_id):
+        _fail("bad_request", "invalid allocation id", False)
+    if not config.policy.vscode_enabled:
+        _fail("forbidden", "VS Code support is disabled by policy", False)
+    alias = server or config.server.ssh_alias
+    remote = shlex.join(["udc-resource", "status", allocation_id, "--json"])
+    try:
+        status = subprocess.run(
+            [*_ssh_base(config), alias, remote],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=config.gui.connect_timeout + 15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _fail("ssh_unavailable", f"cannot query allocation: {exc}", False)
+    if status.returncode != 0:
+        _fail(
+            "ssh_error",
+            status.stderr.strip() or "could not inspect the allocation",
+            False,
+        )
+    try:
+        envelope = json.loads(status.stdout)
+        allocation = envelope["data"]["allocation"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        _fail("protocol", "server returned an invalid allocation response", False)
+    if not isinstance(allocation, dict) or allocation.get("status") != "active":
+        _fail("conflict", "allocation is not active", False)
+    username = str(allocation.get("owner") or "")
+    if not username:
+        _fail("protocol", "allocation owner is missing", False)
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+        _fail("protocol", "allocation owner name is not supported by the tunnel", False)
+    configured_identity = config.policy.vscode_identity_file.strip()
+    identity_path = identity
+    if identity_path is None and configured_identity:
+        identity_path = Path(configured_identity).expanduser()
+    if identity_path is None:
+        identity_path = _default_identity()
+    if identity_path is not None and not identity_path.is_file():
+        _fail("bad_request", f"SSH identity file not found: {identity_path}", False)
+    config_path = (
+        ssh_config.expanduser() if ssh_config is not None else Path.home() / ".ssh" / "config"
+    )
+    host = f"udc-{allocation_id}"
+    try:
+        asyncio.run(
+            _serve_vscode_tunnel(
+                config=config,
+                allocation_id=allocation_id,
+                username=username,
+                ssh_alias=alias,
+                host=host,
+                requested_port=port,
+                ssh_config=config_path,
+                identity=identity_path,
+                launch_code=code,
+            )
+        )
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        _fail("internal", f"could not start the VS Code tunnel: {exc}", False)
+    except RuntimeError as exc:
+        _fail("internal", f"could not start the VS Code tunnel: {exc}", False)
 
 
 @app.command("gui")
@@ -1007,6 +1639,7 @@ def gui_command(
 ) -> None:
     """Start the local Web GUI."""
     config = _load(ctx)
+    os.environ["UDC_RESOURCE_CONFIG"] = str(Path(ctx.obj))
     from .gui.server import run_gui
 
     run_gui(

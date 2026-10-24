@@ -7,6 +7,9 @@
     config: null,
     overview: null,
     my: null,
+    queue: [],
+    jobs: [],
+    jobsRefreshedAt: 0,
     adminEnabled: false,
     offline: false,
     selectedGpus: new Set(),
@@ -141,14 +144,104 @@
 
   async function refreshMy() {
     try {
-      const payload = await api("/api/status");
-      if (!payload.ok) throw new Error(payload?.error?.message || "status failed");
-      state.my = payload.data;
+      const [statusPayload, queuePayload] = await Promise.all([
+        api("/api/status"),
+        api("/api/queue"),
+      ]);
+      if (!statusPayload.ok) throw new Error(statusPayload?.error?.message || "status failed");
+      state.my = statusPayload.data;
+      state.queue = queuePayload.ok ? (queuePayload.data.queue || []) : [];
       renderMyAllocations();
+      renderMyQueue();
+      // Job inspection costs one SSH/Docker round trip per active allocation.
+      // Keep it off the 5-second status poll.
+      if (!state.jobsRefreshedAt || Date.now() - state.jobsRefreshedAt >= 30000) {
+        await refreshJobs();
+      }
     } catch (error) {
       $("#my-allocations").className = "allocation-list empty";
       $("#my-allocations").textContent = `Unable to load: ${error.message || error}`;
     }
+  }
+
+  async function refreshJobs() {
+    const allocations = (state.my?.allocations || []).filter((item) => item.status === "active");
+    const target = $("#my-jobs");
+    if (!allocations.length) {
+      state.jobs = [];
+      target.className = "allocation-list empty";
+      target.textContent = "No active allocations.";
+      return;
+    }
+    const results = await Promise.all(
+      allocations.map(async (allocation) => {
+        try {
+          const payload = await api(`/api/jobs/${encodeURIComponent(allocation.id)}`);
+          if (!payload.ok) return [];
+          return (payload.data.jobs || []).map((job) => ({ ...job, allocation_id: allocation.id }));
+        } catch {
+          return [];
+        }
+      }),
+    );
+    state.jobs = results.flat();
+    state.jobsRefreshedAt = Date.now();
+    renderJobs();
+  }
+
+  function renderMyQueue() {
+    const target = $("#my-queue");
+    const requests = state.queue || [];
+    if (!requests.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "No queued requests.";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = requests.map((request) => `
+      <div class="allocation-item">
+        <div>
+          <div class="id">${esc(request.queue_id)}</div>
+          <div class="muted">position ${esc(request.position)} · ${statusBadge(request.status || "queued")}</div>
+        </div>
+        <div class="muted">GPU: <b>${esc((request.gpus || []).join(",") || "CPU-only")}</b><br>CPU/RAM: ${esc(request.cpus)} / ${esc(request.memory_gb)} GiB</div>
+        <div class="muted">remaining ${formatRemaining(request.remaining_seconds)}</div>
+        <div class="row-actions">
+          <button data-action="queue-cancel" data-id="${esc(request.queue_id)}">cancel</button>
+        </div>
+      </div>
+    `).join("");
+    target.querySelectorAll('button[data-action="queue-cancel"]').forEach((button) => {
+      button.addEventListener("click", () => cancelQueue(button.dataset.id));
+    });
+  }
+
+  function renderJobs() {
+    const target = $("#my-jobs");
+    const jobs = state.jobs || [];
+    if (!jobs.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "No jobs.";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = jobs.map((job) => `
+      <div class="allocation-item">
+        <div><div class="id">${esc(job.name)}</div><div class="muted">${esc(job.allocation_id)}</div></div>
+        <div class="muted">${esc(job.session)}<br>${esc(job.log || "")}</div>
+        <div class="muted">${esc(job.log_bytes ?? 0)} bytes</div>
+        <div class="row-actions">
+          <button data-action="job-attach" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">attach</button>
+          <button data-action="job-stop" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">stop</button>
+        </div>
+      </div>
+    `).join("");
+    target.querySelectorAll("button[data-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (button.dataset.action === "job-attach") openTerminal(button.dataset.id, button.dataset.job);
+        if (button.dataset.action === "job-stop") stopJob(button.dataset.id, button.dataset.job);
+      });
+    });
   }
 
   function renderOverview() {
@@ -287,7 +380,10 @@
       : "";
     const shell = active ? `<button data-action="shell" data-id="${id}">shell</button>` : "";
     const logs = allocation.container_id ? `<button data-action="logs" data-id="${id}">logs</button>` : "";
-    return `${shell}${logs}${release}`;
+    const vscode = active && state.config?.vscode_enabled
+      ? `<button data-action="vscode" data-id="${id}">VS Code</button>`
+      : "";
+    return `${shell}${vscode}${logs}${release}`;
   }
 
   function bindActions(root) {
@@ -299,6 +395,7 @@
         if (action === "release") releaseAllocation(id);
         if (action === "shell") openTerminal(id);
         if (action === "logs") openLogs(id);
+        if (action === "vscode") openVscode(id);
       });
     });
   }
@@ -379,6 +476,43 @@
     }
   }
 
+  async function cancelQueue(id) {
+    if (!window.confirm(`Cancel queued request ${id}?`)) return;
+    try {
+      const payload = await api("/api/queue/cancel", { method: "POST", body: { id } });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(`Cancelled ${id}`, "ok");
+      await refresh();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function stopJob(allocationId, name) {
+    if (!window.confirm(`Stop job ${name}?`)) return;
+    try {
+      const payload = await api(`/api/jobs/${encodeURIComponent(allocationId)}/stop`, {
+        method: "POST",
+        body: { name },
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(`Stopped ${name}`, "ok");
+      await refreshJobs();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function openVscode(id) {
+    try {
+      const payload = await api(`/api/vscode/${encodeURIComponent(id)}`, { method: "POST" });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash("VS Code tunnel started; check the VS Code window.", "ok");
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
   async function openLogs(id) {
     closeTerminal();
     $("#terminal-modal").hidden = true;
@@ -402,7 +536,7 @@
     $("#logs-content").textContent = "";
   }
 
-  function openTerminal(id) {
+  function openTerminal(id, job = "") {
     closeTerminal();
     if (!window.Terminal || !window.FitAddon) {
       flash("xterm.js assets are missing", "error");
@@ -441,7 +575,8 @@
     fit.fit();
     term.focus();
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${protocol}//${window.location.host}/ws/shell/${encodeURIComponent(id)}?token=${encodeURIComponent(token)}&cols=${term.cols}&rows=${term.rows}`;
+    const jobQuery = job ? `&job=${encodeURIComponent(job)}` : "";
+    const url = `${protocol}//${window.location.host}/ws/shell/${encodeURIComponent(id)}?token=${encodeURIComponent(token)}&cols=${term.cols}&rows=${term.rows}${jobQuery}`;
     const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
     state.terminal = { term, fit, socket };
@@ -607,6 +742,7 @@
         cpus: Number(data.get("cpus")),
         memory_gb: Number(data.get("memory_gb")),
         hours: Number(data.get("hours")),
+        queue: data.get("queue") === "on",
       };
       const image = String(data.get("image") || "").trim();
       const note = String(data.get("note") || "").trim();
@@ -615,7 +751,11 @@
       try {
         const payload = await api("/api/apply", { method: "POST", body });
         if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-        flash(`Allocation ready: ${payload.data.id}`, "ok");
+        if (payload.data.queue_id) {
+          flash(`Queued: ${payload.data.queue_id} (position ${payload.data.position})`, "ok");
+        } else {
+          flash(`Allocation ready: ${payload.data.id}`, "ok");
+        }
         state.selectedGpus.clear();
         form.reset();
         activateTab("allocations");
@@ -649,6 +789,7 @@
   function bindControls() {
     $$(".tab").forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tab)));
     $("#refresh-my").addEventListener("click", refreshMy);
+    $("#refresh-jobs").addEventListener("click", refreshJobs);
     $("#mode-monitor").addEventListener("click", () => changeBrokerMode("monitor"));
     $("#mode-maintenance").addEventListener("click", () => changeBrokerMode("maintenance"));
     $("#mode-active").addEventListener("click", () => changeBrokerMode("active"));

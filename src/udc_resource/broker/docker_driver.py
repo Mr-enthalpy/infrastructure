@@ -8,9 +8,11 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import struct
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 import docker
@@ -27,6 +29,22 @@ LABEL_MANAGED = "udc.managed"
 LABEL_OWNER = "udc.owner"
 LABEL_ALLOCATION = "udc.allocation"
 LABEL_GPUS = "udc.gpus"
+LABEL_PROFILE = "udc.profile"
+
+# sudo inside the disposable development container needs a small set of
+# capabilities. Nothing here grants host privileges or host namespaces.
+DEV_CAPABILITIES = (
+    "AUDIT_WRITE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +95,20 @@ class DockerBackend(Protocol):
     def create_container(self, allocation: Allocation) -> ContainerRef: ...
 
     def remove_container(self, container_id: str) -> None: ...
+
+    def storage_preflight(self) -> tuple[bool, str]: ...
+
+    def prepare_container_ssh(
+        self,
+        container_id: str,
+        uid: int,
+        gid: int,
+        username: str,
+        public_keys: list[str],
+        home: str,
+    ) -> None: ...
+
+    def open_tunnel(self, container_id: str) -> ShellSession: ...
 
     def open_shell(
         self,
@@ -133,11 +165,82 @@ class DockerShellSession:
     def close(self) -> None:
         try:
             self.sock.shutdown(2)
-        except OSError:
+        except (AttributeError, OSError):
             pass
         try:
             self.sock.close()
-        except OSError:
+        except (AttributeError, OSError):
+            pass
+
+
+class DockerTunnelSession:
+    """Duplex byte stream over a Docker exec without allocating a TTY.
+
+    Docker multiplexes stdout and stderr with an 8-byte header when ``tty`` is
+    false. The tunnel only exposes stdout (the SSH protocol); stderr is kept for
+    diagnostics.
+    """
+
+    def __init__(self, sock: Any) -> None:
+        self.sock = sock
+        self._buffer = bytearray()
+        self._stderr = bytearray()
+
+    def _recv_exact(self, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.sock.recv(size - len(data))
+            if not chunk:
+                return b""
+            data.extend(chunk)
+        return bytes(data)
+
+    def _fill(self) -> bool:
+        header = self._recv_exact(8)
+        if len(header) != 8:
+            return False
+        stream = header[0]
+        length = struct.unpack(">I", header[4:])[0]
+        if length == 0:
+            return True
+        payload = self._recv_exact(length)
+        if len(payload) != length:
+            return False
+        if stream == 2:
+            if len(self._stderr) < 64 * 1024:
+                self._stderr.extend(payload[: 64 * 1024 - len(self._stderr)])
+        else:
+            self._buffer.extend(payload)
+        return True
+
+    def read(self, size: int = 65536) -> bytes:
+        # Return after one stdout frame (or whatever is already buffered). SSH
+        # is interactive: waiting for `size` bytes would deadlock until the peer
+        # replies, because the banner and key-exchange packets are much smaller.
+        while not self._buffer:
+            try:
+                if not self._fill():
+                    return b""
+            except OSError:
+                return b""
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def write(self, data: bytes) -> None:
+        self.sock.sendall(data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        del cols, rows
+
+    def close(self) -> None:
+        try:
+            self.sock.shutdown(2)
+        except (AttributeError, OSError):
+            pass
+        try:
+            self.sock.close()
+        except (AttributeError, OSError):
             pass
 
 
@@ -345,6 +448,33 @@ class DockerDriver:
             gid = allocation.owner_uid
         return f"{allocation.owner_uid}:{gid}"
 
+    @staticmethod
+    def _split_user(user: str) -> tuple[int, int]:
+        try:
+            uid_text, gid_text = user.split(":", 1)
+            return int(uid_text), int(gid_text)
+        except (ValueError, AttributeError):
+            return 0, 0
+
+    def _development_home(self, allocation: Allocation) -> str:
+        configured = self.config.policy.container_home.strip()
+        if configured:
+            home = configured
+        else:
+            safe_name = re.sub(r"[^a-z0-9_-]", "-", allocation.owner_name.lower())
+            home = f"/home/{safe_name or allocation.owner_uid}"
+        normalized = PurePosixPath(home)
+        if (
+            ".." in normalized.parts
+            or not home.startswith("/home/")
+            or home == "/home/"
+            or home == "/"
+            or home == "/workspace"
+            or home.startswith("/workspace/")
+        ):
+            raise DockerError("development container HOME must be under /home")
+        return home
+
     def _gpu_group_id(self) -> int | None:
         if self.config.policy.container_user != "member" or os.name != "posix":
             return None
@@ -356,14 +486,25 @@ class DockerDriver:
             return None
 
     def create_container(self, allocation: Allocation) -> ContainerRef:
+        dev_profile = self.config.policy.container_profile == "development"
         labels = {
             LABEL_MANAGED: "true",
             LABEL_OWNER: allocation.owner_name,
             LABEL_ALLOCATION: allocation.id,
             LABEL_GPUS: ",".join(allocation.gpus),
+            LABEL_PROFILE: self.config.policy.container_profile,
         }
         name = f"udc-{allocation.owner_name}-{allocation.id[:12]}"
         container_user = self._container_user(allocation)
+        uid, gid = self._split_user(container_user)
+        home = self._development_home(allocation) if dev_profile else "/workspace"
+        tmpfs = {
+            "/tmp": "rw,nosuid,nodev,size=1g",
+            "/run": "rw,nosuid,nodev,size=64m",
+            "/var/tmp": "rw,nosuid,nodev,size=256m",
+        }
+        if dev_profile:
+            tmpfs[home] = f"rw,nosuid,nodev,size=1g,uid={uid},gid={gid},mode=0700"
         kwargs: dict[str, Any] = {
             "command": ["sleep", "infinity"],
             "detach": True,
@@ -382,22 +523,23 @@ class DockerDriver:
             "working_dir": "/workspace",
             "environment": {
                 "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
-                "HOME": "/workspace",
+                "HOME": home,
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
-            "security_opt": ["no-new-privileges"],
             "cap_drop": ["ALL"],
-            "read_only": self.config.policy.container_read_only,
-            "tmpfs": {
-                "/tmp": "rw,nosuid,nodev,size=1g",
-                "/run": "rw,nosuid,nodev,size=64m",
-                "/var/tmp": "rw,nosuid,nodev,size=256m",
-            },
+            "read_only": False if dev_profile else self.config.policy.container_read_only,
+            "tmpfs": tmpfs,
             "init": True,
             "privileged": False,
             "network_mode": "bridge",
             "user": container_user,
         }
+        if dev_profile:
+            kwargs["cap_add"] = list(DEV_CAPABILITIES)
+            if self.config.policy.writable_layer_gb > 0:
+                kwargs["storage_opt"] = {"size": f"{self.config.policy.writable_layer_gb}G"}
+        else:
+            kwargs["security_opt"] = ["no-new-privileges"]
         if self.config.policy.userns_mode:
             kwargs["userns_mode"] = self.config.policy.userns_mode
         if allocation.gpus:
@@ -415,6 +557,206 @@ class DockerDriver:
         except DockerException as exc:
             raise DockerError(f"docker run failed: {exc}") from exc
         return ContainerRef(id=str(container.id), name=str(container.name))
+
+    def storage_preflight(self) -> tuple[bool, str]:
+        """Check that Docker writable-layer quotas are enforceable.
+
+        ``storage-opt size`` works only with the overlay2 driver on XFS mounted
+        with project quotas. Anything else must fail closed.
+        """
+
+        policy = self.config.policy
+        if policy.container_profile != "development" or policy.writable_layer_gb <= 0:
+            return True, "writable-layer quota is not required"
+        if os.name != "posix":
+            return False, "Docker storage preflight is only supported on Linux"
+        try:
+            info = self.client.info()
+        except DockerException as exc:
+            return False, f"cannot inspect Docker storage: {exc}"
+        driver = str(info.get("Driver", ""))
+        docker_root = str(info.get("DockerRootDir", ""))
+        if driver != "overlay2":
+            return False, f"Docker storage driver is {driver or 'unknown'}, expected overlay2"
+        findmnt = shutil.which("findmnt")
+        if findmnt is None:
+            return False, "findmnt is not installed"
+        try:
+            completed = subprocess.run(
+                [findmnt, "-no", "FSTYPE,OPTIONS", "-T", docker_root],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"cannot inspect Docker root filesystem: {exc}"
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return False, f"cannot inspect Docker root filesystem: {completed.stderr.strip()}"
+        parts = completed.stdout.strip().split(None, 1)
+        fstype = parts[0] if parts else ""
+        options = set(parts[1].split(",")) if len(parts) > 1 else set()
+        if fstype != "xfs":
+            return False, f"Docker root filesystem is {fstype or 'unknown'}, expected XFS"
+        if not {"prjquota", "pquota"} & options:
+            return False, "Docker root XFS filesystem is not mounted with prjquota"
+        # Container root is host root without a user namespace. The workspace is
+        # the only writable host bind mount, so it must never honor host setuid
+        # bits or file capabilities written by the container's sudo.
+        workspace_root = self.config.server.workspace_root.strip()
+        if not workspace_root or not os.path.isabs(workspace_root):
+            return False, "server.workspace_root must be an absolute path; cannot verify nosuid"
+        if workspace_root.rstrip("/") == "":
+            return False, "server.workspace_root must not be the filesystem root"
+        if not Path(workspace_root).is_dir():
+            return False, f"workspace root does not exist: {workspace_root}"
+        try:
+            workspace_mount = subprocess.run(
+                [findmnt, "-no", "OPTIONS", "-T", workspace_root],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"cannot inspect workspace filesystem: {exc}"
+        if workspace_mount.returncode != 0 or not workspace_mount.stdout.strip():
+            return False, ("cannot inspect workspace filesystem: " + workspace_mount.stderr.strip())
+        workspace_options = {item.strip() for item in workspace_mount.stdout.strip().split(",")}
+        if "nosuid" not in workspace_options:
+            return False, (
+                f"workspace filesystem {workspace_root} must be mounted nosuid "
+                "so container root cannot create host setuid files"
+            )
+        return True, "overlay2 on XFS with project quotas and a nosuid workspace are available"
+
+    def _exec_capture(
+        self,
+        container_id: str,
+        argv: list[str],
+        *,
+        user: str | None = None,
+    ) -> tuple[int, str, str]:
+        try:
+            exec_id = self.client.api.exec_create(
+                container_id,
+                cmd=argv,
+                stdin=False,
+                stdout=True,
+                stderr=True,
+                tty=False,
+                user=user,
+            )["Id"]
+            output = self.client.api.exec_start(exec_id, tty=False, stream=False)
+            info = self.client.api.exec_inspect(exec_id)
+        except DockerException as exc:
+            raise DockerError(f"docker exec failed: {exc}") from exc
+        text = (
+            output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+        )
+        return int(info.get("ExitCode", -1)), text, ""
+
+    def prepare_container_ssh(
+        self,
+        container_id: str,
+        uid: int,
+        gid: int,
+        username: str,
+        public_keys: list[str],
+        home: str,
+    ) -> None:
+        """Install a per-allocation SSH identity inside a dev container."""
+
+        if self.config.policy.container_profile != "development":
+            raise DockerError("VS Code tunnels require the development container profile")
+        if not public_keys:
+            raise DockerError("member has no SSH public keys to authorize")
+        if uid <= 0:
+            raise DockerError("VS Code tunnels require a non-root member UID")
+        safe_name = re.sub(r"[^a-z0-9_-]", "-", username.lower()) or f"udc{uid}"
+        if ".." in PurePosixPath(home).parts or not home.startswith("/home/") or home == "/home/":
+            raise DockerError("invalid container home for SSH")
+        keys = "\n".join(key.strip() for key in public_keys if key.strip())
+        script = f"""
+set -eu
+home={shlex.quote(home)}
+group_entry="udc-{safe_name}:x:{gid}:"
+# Serialize concurrent tunnel preparation when util-linux is available.
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/udc-ssh.lock
+    flock 9
+fi
+# Base images commonly already use UID 1000 for an "ubuntu" account. Reuse the
+# entry for the member UID instead of failing SSH login, and drop a conflicting
+# image account with the same name when it is a regular user account.
+awk -F: -v OFS=: -v uid="{uid}" -v gid="{gid}" -v name="{safe_name}" -v home="$home" '
+    $1 == name && $3 != uid {{
+        if ($3 + 0 < 1000) {{
+            printf "conflicting system user %s has UID %s\\n", $1, $3 > "/dev/stderr"
+            failed = 1
+            exit 1
+        }}
+        next
+    }}
+    $3 == uid {{
+        if (done) next
+        $1 = name
+        $4 = gid
+        $5 = "UDC member"
+        $6 = home
+        $7 = "/bin/bash"
+        print
+        done = 1
+        next
+    }}
+    {{ print }}
+    END {{
+        if (failed) exit 1
+        if (!done) print name ":x:" uid ":" gid ":UDC member:" home ":/bin/bash"
+    }}
+' /etc/passwd > /etc/passwd.udc
+chmod 0644 /etc/passwd.udc
+mv /etc/passwd.udc /etc/passwd
+grep -q "^[^:]*:[^:]*:{gid}:" /etc/group || echo "$group_entry" >> /etc/group
+mkdir -p "$home/.ssh"
+chmod 700 "$home" "$home/.ssh"
+printf '%s\\n' {shlex.quote(keys)} > "$home/.ssh/authorized_keys"
+chmod 600 "$home/.ssh/authorized_keys"
+chown {uid}:{gid} "$home" "$home/.ssh" "$home/.ssh/authorized_keys"
+# /run is a fresh tmpfs at container start, so the image's /run/sshd is gone.
+mkdir -p /run/sshd
+chmod 0755 /run/sshd
+# Create any missing host keys without replacing keys that already exist.
+ssh-keygen -A >/dev/null
+"""
+        code, output, _err = self._exec_capture(
+            container_id,
+            ["/bin/sh", "-c", script],
+            user="0:0",
+        )
+        if code != 0:
+            raise DockerError(f"cannot prepare container SSH: {output.strip()}")
+
+    def open_tunnel(self, container_id: str) -> ShellSession:
+        """Open a byte tunnel to the container's inetd-mode sshd."""
+
+        if self.config.policy.container_profile != "development":
+            raise DockerError("VS Code tunnels require the development container profile")
+        try:
+            exec_id = self.client.api.exec_create(
+                container_id,
+                cmd=["/usr/sbin/sshd", "-i", "-e", "-f", "/etc/ssh/sshd_config"],
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                tty=False,
+                user="0:0",
+            )["Id"]
+            sock = self.client.api.exec_start(exec_id, tty=False, socket=True)
+            sock.settimeout(None)
+        except DockerException as exc:
+            raise DockerError(f"cannot open container SSH tunnel: {exc}") from exc
+        return DockerTunnelSession(sock)
 
     def remove_container(self, container_id: str) -> None:
         if not container_id:
@@ -462,29 +804,6 @@ class DockerDriver:
         except DockerException as exc:
             raise DockerError(f"cannot open shell in {container_id}: {exc}") from exc
         return DockerShellSession(self.client, str(exec_id), sock)
-
-    def _exec_capture(
-        self,
-        container_id: str,
-        argv: list[str],
-    ) -> tuple[int, str, str]:
-        try:
-            exec_id = self.client.api.exec_create(
-                container_id,
-                cmd=argv,
-                stdin=False,
-                stdout=True,
-                stderr=True,
-                tty=False,
-            )["Id"]
-            output = self.client.api.exec_start(exec_id, tty=False, stream=False)
-            info = self.client.api.exec_inspect(exec_id)
-        except DockerException as exc:
-            raise DockerError(f"docker exec failed: {exc}") from exc
-        text = (
-            output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
-        )
-        return int(info.get("ExitCode", -1)), text, ""
 
     def _exec_detached(self, container_id: str, argv: list[str]) -> None:
         try:

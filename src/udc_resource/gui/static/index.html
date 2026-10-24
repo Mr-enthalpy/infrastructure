@@ -69,6 +69,10 @@
           <label>备注
             <input name="note" type="text" maxlength="500" placeholder="可选">
           </label>
+          <label class="inline-check">
+            <input name="queue" type="checkbox" checked>
+            资源不足时进入队列（不会插队）
+          </label>
           <div class="actions">
             <button type="submit" class="primary">提交申请</button>
             <span id="apply-error" class="error-text"></span>
@@ -83,6 +87,13 @@
         <button id="refresh-my" class="ghost">刷新</button>
       </div>
       <div id="my-allocations" class="allocation-list empty">No allocations.</div>
+      <h2>Queued requests</h2>
+      <div id="my-queue" class="allocation-list empty">No queued requests.</div>
+      <div class="section-head">
+        <h2>Jobs</h2>
+        <button id="refresh-jobs" class="ghost">刷新</button>
+      </div>
+      <div id="my-jobs" class="allocation-list empty">No jobs.</div>
     </section>
 
     <section id="tab-unmanaged" class="tab-panel">

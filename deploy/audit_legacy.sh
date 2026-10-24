@@ -11,6 +11,7 @@ FAIL=0
 WARN=0
 FAILURES=()
 WARNINGS=()
+MEMBER_SHELL=/usr/local/libexec/udc-resource/member-shell
 
 usage() {
     cat <<'EOF'
@@ -138,6 +139,32 @@ while IFS=: read -r name _ uid gid _ home shell; do
     fi
 done < <(getent passwd)
 
+section "member login shell"
+if [ -x "$MEMBER_SHELL" ]; then
+    shell_meta=$(stat -c '%a %U %G' "$MEMBER_SHELL" 2>/dev/null || true)
+    if [ "$shell_meta" = "755 root root" ]; then
+        ok "member shell is root-owned and not writable: $MEMBER_SHELL"
+    else
+        fail "member shell has unsafe ownership/mode: $shell_meta"
+    fi
+else
+    if [ "$PRODUCTION" -eq 1 ]; then
+        fail "root-owned member shell is missing: $MEMBER_SHELL"
+    else
+        warn "root-owned member shell is not installed yet: $MEMBER_SHELL"
+    fi
+fi
+for user in $(effective_members udc-members); do
+    shell=$(getent passwd "$user" | cut -d: -f7)
+    if [ "$shell" = "$MEMBER_SHELL" ]; then
+        ok "member $user uses the restricted login shell"
+    elif [ "$PRODUCTION" -eq 1 ]; then
+        fail "member $user shell is $shell, expected $MEMBER_SHELL"
+    else
+        warn "member $user shell is $shell; re-run deploy/create_user.sh before active mode"
+    fi
+done
+
 section "privileged groups"
 for group in sudo docker udc-gpu video render wheel; do
     members=$(effective_members "$group")
@@ -220,6 +247,34 @@ if [ -x "$SSHD_BIN" ]; then
             warn "effective sshd policy permits password authentication"
         fi
     fi
+    for user in $(effective_members udc-members); do
+        member_policy=$("$SSHD_BIN" -T -C "user=$user,host=localhost,addr=127.0.0.1" 2>/dev/null || true)
+        if [ -z "$member_policy" ]; then
+            fail "cannot verify effective SSH policy for member $user"
+            continue
+        fi
+        while IFS='|' read -r key expected; do
+            if printf '%s\n' "$member_policy" | grep -qE "^${key}[[:space:]]+${expected}$"; then
+                ok "member $user effective sshd: $key $expected"
+            else
+                fail "member $user effective sshd is missing '$key $expected'"
+            fi
+        done <<'POLICY'
+forcecommand|/usr/local/bin/udc-resource-login
+passwordauthentication|no
+kbdinteractiveauthentication|no
+pubkeyauthentication|yes
+authenticationmethods|publickey
+permituserrc|no
+allowtcpforwarding|no
+allowstreamlocalforwarding|no
+allowagentforwarding|no
+permittunnel|no
+x11forwarding|no
+permituserenvironment|no
+permittty|yes
+POLICY
+    done
 fi
 
 DROPIN=/etc/ssh/sshd_config.d/60-udc-resource.conf

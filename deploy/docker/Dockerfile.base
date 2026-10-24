@@ -4,13 +4,24 @@ FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-venv python3-pip git curl ca-certificates tmux \
+    python3 python3-venv python3-pip git curl ca-certificates tmux \
+    sudo openssh-server openssh-client procps less vim-tiny nano \
+    libc-bin findutils util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3.11 -m pip install --no-cache-dir --upgrade pip \
-    && python3.11 -m pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+    && python3 -m pip install --no-cache-dir \
        torch==2.7.1 torchvision==0.22.1 \
        --index-url https://download.pytorch.org/whl/cu128
+
+COPY sshd_config /etc/ssh/sshd_config
+COPY bootstrap.sh /usr/local/bin/bootstrap.sh
+RUN chmod 0755 /usr/local/bin/bootstrap.sh \
+    && mkdir -p /run/sshd /etc/sudoers.d \
+    && printf 'ALL ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/udc-member \
+    && chmod 0440 /etc/sudoers.d/udc-member \
+    && visudo -cf /etc/sudoers.d/udc-member \
+    && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

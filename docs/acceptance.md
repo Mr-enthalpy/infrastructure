@@ -62,7 +62,8 @@ container on exit. It does not delete workspaces or other users' containers.
      profile. Private contact fields must not appear in the response.
 
 2. **Concurrent same-GPU apply**
-   - two members apply for the same test GPU at the same time;
+   - two members apply for the same test GPU at the same time with
+     `--no-queue`;
    - exactly one receives `ok=true`;
    - the other receives `gpu_busy`;
    - the winner is released and the GPU returns to `free`.
@@ -105,6 +106,65 @@ container on exit. It does not delete workspaces or other users' containers.
       rejected for a member and accepted for an admin;
     - queue admission must pause (not guess) when live GPU detection fails.
 
+## Development container and VS Code acceptance
+
+Run this only on a dedicated test allocation after the five checks and only
+when the host is not serving other users. It must not stop, restart, or alter
+training containers.
+
+1. **Storage and image preflight**
+   - `preflight.sh --config <config>` reports the development profile as valid:
+     `overlay2`, XFS DockerRootDir with `prjquota`/`pquota`, `xfs_quota`,
+     workspace project quotas, and a workspace filesystem mounted `nosuid`.
+     Confirm the last point with `findmnt -no OPTIONS -T /data1/udc-users`;
+     container root is host root without a user namespace, so a setuid file
+     written through the workspace bind must not be honored by the host.
+   - The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`
+     are installed.
+   - After `configure_quotas.sh` (or after adding a member), confirm the test
+     member's workspace directory has the configured project hard limit with
+     `xfs_quota -x -c 'report -p -b -h' <mount>` (XFS) or `repquota -P <mount>`
+     (ext4). A quota gate that only sees mount support is not enough.
+   - Build `deploy/docker/Dockerfile.base` on the target host and record the
+     image digest; do not use a floating tag for acceptance.
+2. **Container privilege boundary**
+   - Apply for the test GPU with the development profile and wait for active.
+   - Inside the container, `id` shows the member UID; `sudo -n true` succeeds;
+     `sudo -n cat /etc/shadow` succeeds only inside the container.
+   - From the host, the member still cannot run a host shell, `docker`, or
+     `nvidia-smi`; host root is never reachable from the container.
+   - Inspect the container: no `Privileged`, no `/var/run/docker.sock`, no host
+     PID/network namespace, no host system mounts, and `storage_opt` is present.
+3. **Disposable versus persistent state**
+   - Write a marker under `/workspace` and a marker under `$HOME`.
+   - Release and re-apply; the `/workspace` marker survives and the `$HOME`
+     marker is gone (fresh tmpfs).
+   - Confirm the writable-layer quota rejects growth beyond the configured
+     `writable_layer_gb` without affecting `/workspace`.
+4. **Broker-mediated VS Code tunnel**
+   - With `vscode_enabled = true`, run `udc-resource vscode <allocation-id>`;
+     VS Code connects as the member UID and opens `/workspace`.
+   - The local listener is bound to `127.0.0.1` only. The generated SSH config
+     disables host-key verification for the loopback-only alias; confirm no
+     non-loopback listener and document that the trust boundary is the local
+     account, not the container host key.
+   - Host SSH forwarding remains disabled; the host login wrapper still rejects
+     arbitrary commands and a direct `ssh -L` attempt. The container sshd may
+     allow local TCP forwarding for Remote-SSH, but no remote/Unix-socket
+     forwarding, agent forwarding, or tun devices.
+   - Opening more than `vscode_max_tunnels` connections is refused, including
+     concurrent attempts that race the slot check.
+   - Release and expiry cancel the tunnel; the container sshd process and Docker
+     exec session exit, and no worker thread remains blocked.
+5. **Gates remain closed**
+   - File transfer stays disabled until TOCTOU-safe handling and quota tests
+     pass.
+   - A failed GPU audit, workspace quota check, or storage preflight blocks new
+     allocations while existing tasks continue and can still be released.
+
+Retain the image digest, `docker inspect` security fields, preflight output,
+tunnel logs, and the before/after workspace and HOME marker results.
+
 ## Evidence to retain
 
 Save the script output plus:
@@ -117,7 +177,10 @@ Save the script output plus:
 - queue request before/after release and cancellation, including `queue list
   --history --json`;
 - `audit_legacy.sh --production` JSON output (or human output) and
-  `verify_gpu_permissions.sh` output before/after reboot.
+  `verify_gpu_permissions.sh` output before/after reboot;
+- development-profile preflight output, image digest, and `docker inspect`
+  security fields;
+- VS Code tunnel logs and cancellation evidence.
 
 Abort immediately if an unmanaged container is touched, a GPU is double
 allocated, a non-owner can release, or another user's container/workspace is

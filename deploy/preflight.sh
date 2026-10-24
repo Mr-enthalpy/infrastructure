@@ -5,6 +5,7 @@ set -o pipefail
 
 FAIL=0
 WARN=0
+CONFIG_FILE=""
 
 section() { printf '\n== %s ==\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
@@ -24,17 +25,24 @@ effective_members() {
     done
 }
 
-case "${1:-}" in
-    -h|--help)
-        printf 'usage: %s\n\nRead-only preflight for the udc-resource host.\n' "$0"
-        exit 0
-        ;;
-    "") ;;
-    *)
-        printf 'unknown argument: %s\n' "$1" >&2
-        exit 2
-        ;;
-esac
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            printf 'usage: %s [--config PATH]\n\nRead-only preflight for the udc-resource host.\n' "$0"
+            exit 0
+            ;;
+        --config)
+            shift
+            [ "$#" -gt 0 ] || { printf 'missing --config value\n' >&2; exit 2; }
+            CONFIG_FILE=$1
+            ;;
+        *)
+            printf 'unknown argument: %s\n' "$1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
 
 section "host"
 if have uname; then
@@ -80,6 +88,69 @@ else
     warn "uv is not installed; the installer must provide Python 3.12 another way"
 fi
 
+section "configuration profile"
+CONTAINER_PROFILE=""
+WRITABLE_LAYER_GB=0
+MODE=""
+WORKSPACE_ROOT=""
+MAX_WORKSPACE_GB=0
+WORKSPACE_QUOTA_REQUIRED=false
+VSCODE_ENABLED=false
+CONFIG_PYTHON=""
+for candidate in python3.12 python3.11 python3; do
+    if have "$candidate" && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+        CONFIG_PYTHON=$candidate
+        break
+    fi
+done
+if [ -n "$CONFIG_FILE" ]; then
+    if [ ! -r "$CONFIG_FILE" ]; then
+        fail "configuration is not readable: $CONFIG_FILE"
+    elif [ -z "$CONFIG_PYTHON" ]; then
+        fail "Python 3.11+ with tomllib is required to inspect $CONFIG_FILE"
+    else
+        PROFILE_DATA=$(
+            "$CONFIG_PYTHON" - "$CONFIG_FILE" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+policy = data.get("policy", {})
+server = data.get("server", {})
+print(f"container_profile={policy.get('container_profile', 'restricted')}")
+print(f"writable_layer_gb={policy.get('writable_layer_gb', 0)}")
+print(f"mode={policy.get('mode', 'monitor')}")
+print(f"workspace_root={server.get('workspace_root', '/data1/udc-users')}")
+print(f"max_workspace_gb={policy.get('max_workspace_gb', 0)}")
+print(
+    "workspace_quota_required="
+    + ("true" if policy.get("workspace_quota_required", False) else "false")
+)
+print(f"vscode_enabled={'true' if policy.get('vscode_enabled', False) else 'false'}")
+PY
+        ) || fail "could not parse configuration: $CONFIG_FILE"
+        while IFS='=' read -r key value; do
+            case "$key" in
+                container_profile) CONTAINER_PROFILE=$value ;;
+                writable_layer_gb) WRITABLE_LAYER_GB=$value ;;
+                mode) MODE=$value ;;
+                workspace_root) WORKSPACE_ROOT=$value ;;
+                max_workspace_gb) MAX_WORKSPACE_GB=$value ;;
+                workspace_quota_required) WORKSPACE_QUOTA_REQUIRED=$value ;;
+                vscode_enabled) VSCODE_ENABLED=$value ;;
+            esac
+        done <<< "$PROFILE_DATA"
+        ok "mode: ${MODE:-unknown}"
+        ok "container profile: ${CONTAINER_PROFILE:-restricted}"
+        if [ "$CONTAINER_PROFILE" = "development" ]; then
+            ok "writable-layer quota request: ${WRITABLE_LAYER_GB} GiB"
+        fi
+    fi
+else
+    warn "no --config supplied; skipping profile-specific storage/quota checks"
+fi
+
 section "docker"
 if have docker; then
     if docker version >/dev/null 2>&1; then
@@ -105,6 +176,72 @@ if have docker; then
     else
         ok "no running containers have udc.managed=true"
     fi
+    if [ "$CONTAINER_PROFILE" = "development" ]; then
+        if [ "${WRITABLE_LAYER_GB:-0}" -le 0 ]; then
+            fail "development profile requires a positive writable_layer_gb"
+        fi
+        DRIVER=$(docker info --format '{{.Driver}}' 2>/dev/null || true)
+        DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+        if [ "$DRIVER" = "overlay2" ]; then
+            ok "Docker storage driver: overlay2"
+        else
+            fail "development profile requires the overlay2 driver, found: ${DRIVER:-unknown}"
+        fi
+        if [ -z "$DOCKER_ROOT" ]; then
+            fail "could not determine DockerRootDir"
+        elif ! have findmnt; then
+            fail "findmnt is required to verify DockerRootDir filesystem"
+        else
+            DOCKER_FS=$(findmnt -no FSTYPE,OPTIONS -T "$DOCKER_ROOT" 2>/dev/null || true)
+            DOCKER_FSTYPE=$(printf '%s' "$DOCKER_FS" | awk '{print $1}')
+            DOCKER_OPTIONS=$(printf '%s' "$DOCKER_FS" | awk '{print $2}')
+            if [ "$DOCKER_FSTYPE" = "xfs" ]; then
+                if printf '%s' ",$DOCKER_OPTIONS," | grep -Eq ',(prjquota|pquota),'; then
+                    ok "DockerRootDir XFS has project quotas enabled: $DOCKER_ROOT"
+                else
+                    fail "DockerRootDir XFS is not mounted with prjquota/pquota: $DOCKER_ROOT"
+                fi
+            else
+                fail "development profile requires XFS for DockerRootDir, found: ${DOCKER_FSTYPE:-unknown}"
+            fi
+            if have xfs_quota; then
+                ok "xfs_quota is available"
+            else
+                fail "xfs_quota is required for writable-layer quotas"
+            fi
+        fi
+        if [ -z "$WORKSPACE_ROOT" ]; then
+            fail "development profile workspace root is not configured"
+        elif ! have findmnt; then
+            fail "findmnt is required to verify the workspace no-suid mount"
+        elif [ "${WORKSPACE_ROOT#/}" = "$WORKSPACE_ROOT" ] \
+            || [ "$WORKSPACE_ROOT" = "/" ] \
+            || [ "${WORKSPACE_ROOT#//}" != "$WORKSPACE_ROOT" ]; then
+            fail "development profile workspace root must be an absolute, non-root path: $WORKSPACE_ROOT"
+        elif case "$WORKSPACE_ROOT" in *"/../"*|*/..) true ;; *) false ;; esac; then
+            fail "development profile workspace root must not contain '..': $WORKSPACE_ROOT"
+        else
+            # The installer creates the workspace root after preflight, so check
+            # the nearest existing ancestor rather than requiring the leaf first.
+            WORKSPACE_CHECK=$WORKSPACE_ROOT
+            while [ ! -e "$WORKSPACE_CHECK" ] && [ "$WORKSPACE_CHECK" != "/" ]; do
+                WORKSPACE_CHECK=$(dirname "$WORKSPACE_CHECK")
+            done
+            if [ ! -e "$WORKSPACE_CHECK" ]; then
+                fail "cannot resolve workspace filesystem for: $WORKSPACE_ROOT"
+            else
+                WORKSPACE_OPTS=$(findmnt -no OPTIONS -T "$WORKSPACE_CHECK" 2>/dev/null || true)
+                if printf '%s' ",$WORKSPACE_OPTS," | grep -q ',nosuid,'; then
+                    ok "workspace filesystem is mounted nosuid: $WORKSPACE_CHECK"
+                else
+                    fail "workspace filesystem must be mounted nosuid so container root cannot create host setuid files: $WORKSPACE_CHECK"
+                fi
+            fi
+        fi
+        if [ "$VSCODE_ENABLED" = "true" ]; then
+            warn "VS Code tunneling requires the container image with sshd and bootstrap.sh"
+        fi
+    fi
 else
     fail "docker is not installed"
 fi
@@ -124,6 +261,13 @@ if have nvidia-smi; then
 else
     fail "nvidia-smi is not installed"
 fi
+for tool in stat su getent udevadm getfacl; do
+    if have "$tool"; then
+        ok "GPU audit tool available: $tool"
+    else
+        fail "$tool is required for the GPU permission audit"
+    fi
+done
 if have nvidia-container-cli; then
     ok "nvidia-container-cli: $(nvidia-container-cli --version 2>/dev/null | head -n 1 || true)"
 else
@@ -203,6 +347,38 @@ for path in /data1 /var/lib /run; do
 done
 if have df; then
     df -h /data1 /var/lib 2>/dev/null || warn "could not read disk usage"
+fi
+if [ "${MAX_WORKSPACE_GB:-0}" -gt 0 ] || [ "$WORKSPACE_QUOTA_REQUIRED" = "true" ]; then
+    QUOTA_TARGET=${WORKSPACE_ROOT:-/data1/udc-users}
+    while [ ! -e "$QUOTA_TARGET" ] && [ "$QUOTA_TARGET" != "/" ]; do
+        QUOTA_TARGET=$(dirname "$QUOTA_TARGET")
+    done
+    if ! have findmnt; then
+        fail "findmnt is required to verify workspace project quotas"
+    else
+        WS_FS=$(findmnt -no FSTYPE,OPTIONS -T "$QUOTA_TARGET" 2>/dev/null || true)
+        WS_FSTYPE=$(printf '%s' "$WS_FS" | awk '{print $1}')
+        WS_OPTIONS=$(printf '%s' "$WS_FS" | awk '{print $2}')
+        if [ "$WS_FSTYPE" = "xfs" ] && printf '%s' ",$WS_OPTIONS," | grep -Eq ',(prjquota|pquota),'; then
+            if have xfs_quota; then
+                ok "workspace filesystem supports project quotas: $QUOTA_TARGET"
+            else
+                fail "xfs_quota is missing for workspace project quotas"
+            fi
+        elif [ "$WS_FSTYPE" = "ext4" ] && printf '%s' ",$WS_OPTIONS," | grep -Eq ',(prjquota|pquota),'; then
+            if have repquota && have setquota && have chattr; then
+                ok "workspace filesystem supports ext4 project quotas: $QUOTA_TARGET"
+            else
+                fail "repquota/setquota/chattr are required for ext4 project quotas"
+            fi
+        else
+            if [ "$MODE" = "active" ]; then
+                fail "active mode requires project quotas on $QUOTA_TARGET (found ${WS_FSTYPE:-unknown})"
+            else
+                warn "workspace project quotas are unavailable on $QUOTA_TARGET (found ${WS_FSTYPE:-unknown}); active mode will be blocked"
+            fi
+        fi
+    fi
 fi
 if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
     ok "cgroup v2 is available"

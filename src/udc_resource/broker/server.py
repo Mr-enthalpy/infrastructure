@@ -32,6 +32,7 @@ from ..errors import (
     NotFound,
     UdcError,
 )
+from ..gpu_audit import GpuAuditResult, GpuAuditRunner, device_fingerprint
 from ..identity import (
     Identity,
     IdentityResolver,
@@ -50,6 +51,7 @@ from ..stream import (
     read_frame,
     write_frame,
 )
+from ..workspace_quota import QuotaCheckResult, check_workspace_quota
 from . import workspace_io
 from .docker_driver import (
     ContainerInfo,
@@ -96,6 +98,8 @@ class Broker:
         docker: DockerBackend | None = None,
         identity_resolver: IdentityResolverProtocol | None = None,
         legacy_audit: Callable[[], LegacyAuditResult] | None = None,
+        gpu_audit: Callable[[], GpuAuditResult] | None = None,
+        quota_check: Callable[[], QuotaCheckResult] | None = None,
         clock: Callable[[], datetime] | None = None,
         expiry_interval: float = 30.0,
         reconcile_interval: float = 300.0,
@@ -110,12 +114,28 @@ class Broker:
             timeout=config.policy.legacy_audit_timeout,
             allow_root_ssh_keys=config.policy.allow_root_ssh_keys,
         )
+        self.gpu_audit = gpu_audit or GpuAuditRunner(
+            config.policy.gpu_audit_script,
+            timeout=config.policy.gpu_audit_timeout,
+            expected_gpus=config.hardware.gpu_count,
+        )
+        self.quota_check = quota_check or (
+            lambda: check_workspace_quota(
+                config.server.workspace_root,
+                config.policy.max_workspace_gb,
+            )
+        )
         self.clock = clock or store.utcnow
         self.expiry_interval = expiry_interval
         self.reconcile_interval = reconcile_interval
         self._mode = config.policy.mode
         self._server: asyncio.AbstractServer | None = None
         self._expiry_task: asyncio.Task[None] | None = None
+        self._gpu_audit_failure: str | None = None
+        self._quota_failure: str | None = None
+        self._storage_failure: str | None = None
+        self._gpu_fingerprint = device_fingerprint()
+        self._tunnels: dict[str, set[asyncio.Task[None]]] = {}
 
     @contextmanager
     def _connection(self) -> Iterator[Any]:
@@ -128,10 +148,97 @@ class Broker:
     def _now(self) -> datetime:
         return self.clock()
 
+    def _allocation_map(self, connection: Any, now: datetime) -> dict[str, dict[str, Any]]:
+        rows = store.list_allocations(
+            connection,
+            statuses=("pending", "active"),
+            now=now,
+        )
+        return {str(row["id"]): row for row in rows}
+
     def _legacy_audit_result(self) -> LegacyAuditResult:
         if not self.config.policy.legacy_audit_required:
             return LegacyAuditResult(True, "legacy audit disabled by configuration")
         return self.legacy_audit()
+
+    def _run_gpu_audit(self) -> str | None:
+        if not self.config.policy.gpu_audit_required:
+            self._gpu_audit_failure = None
+            return None
+        try:
+            result = self.gpu_audit()
+        except Exception as exc:
+            self._gpu_audit_failure = f"audit runner crashed: {exc}"
+            logger.exception("GPU permission audit crashed")
+            return self._gpu_audit_failure
+        self._gpu_fingerprint = result.fingerprint or self._gpu_fingerprint
+        if not result.passed:
+            self._gpu_audit_failure = result.failure_message()
+            logger.error("GPU permission audit failed: %s", self._gpu_audit_failure)
+            return self._gpu_audit_failure
+        self._gpu_audit_failure = None
+        return None
+
+    def _run_quota_check(self) -> str | None:
+        required = self.config.policy.workspace_quota_required or (
+            self.config.policy.max_workspace_gb > 0
+        )
+        if not required:
+            self._quota_failure = None
+            return None
+        try:
+            result = self.quota_check()
+        except Exception as exc:
+            self._quota_failure = f"quota checker crashed: {exc}"
+            logger.exception("workspace quota gate crashed")
+            return self._quota_failure
+        if not result.passed:
+            self._quota_failure = result.failure_message()
+            logger.error("workspace quota gate failed: %s", self._quota_failure)
+            return self._quota_failure
+        self._quota_failure = None
+        return None
+
+    def _run_storage_check(self) -> str | None:
+        if self.config.policy.container_profile != "development":
+            self._storage_failure = None
+            return None
+        try:
+            passed, detail = self.docker.storage_preflight()
+        except Exception as exc:
+            passed, detail = False, str(exc)
+        if not passed:
+            self._storage_failure = detail
+            logger.error("Docker storage preflight failed: %s", detail)
+            return detail
+        self._storage_failure = None
+        return None
+
+    def _refresh_runtime_gates(self, *, include_storage: bool = True) -> str | None:
+        failures: list[str] = []
+        gpu_failure = self._run_gpu_audit()
+        if gpu_failure:
+            failures.append(f"GPU permission audit: {gpu_failure}")
+        quota_failure = self._run_quota_check()
+        if quota_failure:
+            failures.append(f"workspace quota: {quota_failure}")
+        if include_storage:
+            storage_failure = self._run_storage_check()
+            if storage_failure:
+                failures.append(f"Docker storage: {storage_failure}")
+        if failures:
+            return "; ".join(failures)
+        return None
+
+    def _gate_failure(self) -> str | None:
+        parts: list[str] = []
+        if self._gpu_audit_failure:
+            parts.append(f"GPU permission audit: {self._gpu_audit_failure}")
+        if self._quota_failure:
+            parts.append(f"workspace quota: {self._quota_failure}")
+        if self._storage_failure:
+            parts.append(f"Docker storage: {self._storage_failure}")
+        return "; ".join(parts) if parts else None
 
     def _live_resources(self) -> LiveResources:
         try:
@@ -168,22 +275,43 @@ class Broker:
             unknown = True
         return resolved, unknown
 
+    def _managed_container_matches(
+        self,
+        container: ContainerInfo,
+        allocations: dict[str, dict[str, Any]],
+        gpus: list[dict[str, Any]],
+    ) -> bool:
+        if container.labels.get("udc.managed") != "true":
+            return False
+        allocation_id = container.labels.get("udc.allocation")
+        if not allocation_id:
+            return False
+        allocation = allocations.get(allocation_id)
+        if allocation is None:
+            return False
+        expected_container = str(allocation.get("container_id") or "")
+        if not expected_container or container.id != expected_container:
+            return False
+        if container.labels.get("udc.owner") != allocation.get("owner"):
+            return False
+        resolved, unknown = self._resolve_gpu_refs(container.gpu_refs, gpus)
+        if unknown:
+            return False
+        expected_gpus = {str(item) for item in allocation.get("gpu_uuids", [])}
+        return resolved == expected_gpus
+
     def _container_gpu_holders(
         self,
         containers: list[ContainerInfo],
         gpus: list[dict[str, Any]],
-        active_allocation_ids: set[str],
+        allocations: dict[str, dict[str, Any]],
     ) -> tuple[dict[str, list[ContainerInfo]], bool]:
         holders: dict[str, list[ContainerInfo]] = {}
         unknown = False
         for container in containers:
             if container.status not in ACTIVE_GPU_HOLDER_STATUSES:
                 continue
-            managed_active = (
-                container.labels.get("udc.managed") == "true"
-                and container.labels.get("udc.allocation") in active_allocation_ids
-            )
-            if managed_active:
+            if self._managed_container_matches(container, allocations, gpus):
                 continue
             resolved, bad_ref = self._resolve_gpu_refs(container.gpu_refs, gpus)
             unknown = unknown or bad_ref
@@ -195,7 +323,7 @@ class Broker:
         self,
         db_gpus: list[dict[str, Any]],
         live: LiveResources,
-        active_allocation_ids: set[str],
+        allocations: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         live_by_uuid = {gpu.uuid: gpu for gpu in live.gpus}
         processes_by_uuid: dict[str, list[GPUProcess]] = {}
@@ -204,7 +332,7 @@ class Broker:
         holders, unknown_refs = self._container_gpu_holders(
             live.containers,
             db_gpus,
-            active_allocation_ids,
+            allocations,
         )
         result: list[dict[str, Any]] = []
         known_uuids: set[str] = set()
@@ -278,29 +406,33 @@ class Broker:
         try:
             self._mode = store.get_mode(connection, self.config.policy.mode)
             leases = store.active_lease_count(connection)
-            queued = store.queue_request_count(connection)
+            queued = store.queue_request_count(connection, now=self._now())
             target = self._mode
             audit_failure = ""
+            runtime_failure = ""
             if self._mode == "active" and self.config.policy.legacy_audit_required:
                 audit = self._legacy_audit_result()
                 if not audit.passed:
                     audit_failure = audit.failure_message()
+            if self._mode == "active":
+                runtime_failure = self._refresh_runtime_gates() or ""
             if self._mode == "monitor" and (leases or queued):
                 target = "maintenance"
             elif self._mode == "active" and not self.config.policy.deployment_allowed:
                 target = "maintenance" if (leases or queued) else "monitor"
-            elif self._mode == "active" and audit_failure:
+            elif self._mode == "active" and (audit_failure or runtime_failure):
                 target = "maintenance" if (leases or queued) else "monitor"
             if target != self._mode:
                 logger.warning(
                     "adjusting persisted mode %s -> %s "
-                    "(leases=%d queued=%d deployment_allowed=%s audit=%s)",
+                    "(leases=%d queued=%d deployment_allowed=%s audit=%s runtime=%s)",
                     self._mode,
                     target,
                     leases,
                     queued,
                     self.config.policy.deployment_allowed,
                     audit_failure or "passed",
+                    runtime_failure or "passed",
                 )
                 store.set_mode(
                     connection,
@@ -376,17 +508,45 @@ class Broker:
         with self._connection() as connection:
             expired = expire_allocations(connection, self.docker, now=self._now())
             store.expire_queue_requests(connection, now=self._now())
-            return expired
+        for allocation_id in expired:
+            self._cancel_tunnels(allocation_id)
+        return expired
 
     async def _expiry_loop(self) -> None:
         elapsed = 0.0
+        audit_elapsed = 0.0
         while True:
             await asyncio.sleep(self.expiry_interval)
             elapsed += self.expiry_interval
+            audit_elapsed += self.expiry_interval
+            try:
+                fingerprint = await asyncio.to_thread(device_fingerprint)
+            except Exception:
+                logger.exception("could not fingerprint GPU device nodes")
+                fingerprint = self._gpu_fingerprint
+            due = self.config.policy.gpu_audit_required and (
+                audit_elapsed >= self.config.policy.gpu_audit_interval
+                or fingerprint != self._gpu_fingerprint
+            )
+            if due:
+                audit_elapsed = 0.0
+                try:
+                    failure = await asyncio.to_thread(self._run_gpu_audit)
+                    if failure:
+                        logger.error(
+                            "continuous GPU audit failed; new allocations are blocked: %s",
+                            failure,
+                        )
+                    else:
+                        logger.info("continuous GPU audit passed")
+                except Exception:
+                    self._gpu_audit_failure = "continuous GPU audit crashed"
+                    logger.exception("continuous GPU audit crashed")
             if elapsed >= self.reconcile_interval:
                 elapsed = 0.0
                 try:
                     summary = await asyncio.to_thread(self.reconcile_once)
+                    self._cancel_inactive_tunnels()
                     logger.info("periodic reconcile: %s", summary)
                 except Exception:
                     logger.exception("periodic reconcile failed")
@@ -405,6 +565,8 @@ class Broker:
                     logger.exception("queue scheduling failed")
 
     async def stop(self) -> None:
+        for allocation_id in list(self._tunnels):
+            self._cancel_tunnels(allocation_id)
         if self._expiry_task is not None:
             self._expiry_task.cancel()
             try:
@@ -485,6 +647,15 @@ class Broker:
                     "file_get",
                 }:
                     await self._handle_file(
+                        payload,
+                        reader=reader,
+                        writer=writer,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    break
+                if isinstance(payload, dict) and payload.get("cmd") == "tunnel":
+                    await self._handle_tunnel(
                         payload,
                         reader=reader,
                         writer=writer,
@@ -834,7 +1005,10 @@ class Broker:
             for task in pending:
                 task.cancel()
         finally:
-            await asyncio.to_thread(session.close)
+            try:
+                await asyncio.to_thread(session.close)
+            except Exception:
+                logger.warning("could not close shell session", exc_info=True)
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
@@ -844,6 +1018,248 @@ class Broker:
         if not 1 <= raw <= 1000:
             raise BadRequest(f"{name} is out of range")
         return raw
+
+    def _container_home(self, username: str, uid: int) -> str:
+        configured = self.config.policy.container_home.strip()
+        if configured:
+            home = configured
+        else:
+            safe = re.sub(r"[^a-z0-9_-]", "-", username.lower())
+            home = f"/home/{safe or uid}"
+        if ".." in PurePosixPath(home).parts or not home.startswith("/home/") or home == "/home/":
+            raise Conflict("development container HOME must be under /home")
+        return home
+
+    @staticmethod
+    def _member_public_keys(username: str) -> list[str]:
+        if os.name != "posix":
+            return []
+        try:
+            import pwd
+
+            record = pwd.getpwnam(username)
+            home = record.pw_dir
+        except (ImportError, KeyError):
+            return []
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = os.O_RDONLY | os.O_DIRECTORY | nofollow
+        home_fd = ssh_fd = key_fd = -1
+        try:
+            home_fd = os.open(home, directory)
+            ssh_fd = os.open(".ssh", directory, dir_fd=home_fd)
+            key_fd = os.open("authorized_keys", os.O_RDONLY | nofollow, dir_fd=ssh_fd)
+            info = os.fstat(key_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 256 * 1024:
+                return []
+            if info.st_uid not in {record.pw_uid, 0}:
+                return []
+            with os.fdopen(key_fd, "r", encoding="utf-8", errors="replace") as handle:
+                key_fd = -1
+                text = handle.read()
+        except OSError:
+            return []
+        finally:
+            for fd in (key_fd, ssh_fd, home_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        keys: list[str] = []
+        key_types = ("ssh-", "ecdsa-", "sk-ssh-", "sk-ecdsa-")
+        for line in text.splitlines():
+            parts = line.strip().split()
+            if not parts or parts[0].startswith("#"):
+                continue
+            for index, token in enumerate(parts):
+                if token.startswith(key_types) and index + 1 < len(parts):
+                    key = f"{token} {parts[index + 1]}"
+                    if key not in keys:
+                        keys.append(key)
+                    break
+        return keys[:20]
+
+    def _cancel_tunnels(self, allocation_id: str) -> None:
+        for task in list(self._tunnels.pop(allocation_id, set())):
+            task.cancel()
+
+    def _cancel_inactive_tunnels(self) -> None:
+        """Close tunnels whose allocation is no longer active after reconcile."""
+
+        if not self._tunnels:
+            return
+        try:
+            with self._connection() as connection:
+                active = {
+                    str(row["id"])
+                    for row in store.list_allocations(
+                        connection,
+                        statuses=("active",),
+                        now=self._now(),
+                    )
+                }
+        except Exception:
+            logger.exception("could not check active allocations for tunnel cleanup")
+            return
+        for allocation_id in list(self._tunnels):
+            if allocation_id not in active:
+                logger.info("closing tunnels for inactive allocation %s", allocation_id)
+                self._cancel_tunnels(allocation_id)
+
+    async def _handle_tunnel(
+        self,
+        payload: Any,
+        *,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        uid: int,
+        gid: int,
+    ) -> None:
+        task = asyncio.current_task()
+        allocation_id = ""
+        session: ShellSession | None = None
+        try:
+            try:
+                if not self.config.policy.vscode_enabled:
+                    raise Forbidden("VS Code tunnels are disabled by policy")
+                if self.config.policy.container_profile != "development":
+                    raise Conflict("VS Code tunnels require the development container profile")
+                try:
+                    identity = self.identity_resolver.resolve(uid, gid)
+                except (KeyError, RuntimeError) as exc:
+                    raise Forbidden(f"peer identity failed: {exc}") from exc
+                with self._connection() as connection:
+                    store.ensure_user(
+                        connection,
+                        uid=identity.uid,
+                        username=identity.username,
+                        role=identity.role,
+                        now=self._now(),
+                    )
+                command, args = self._parse_request(payload)
+                if command != "tunnel":
+                    raise BadRequest("expected tunnel command")
+                self._check_args(args, {"id"})
+                raw_id = args.get("id")
+                if not isinstance(raw_id, str) or not raw_id:
+                    raise BadRequest("id must be a non-empty string")
+                allocation_id = raw_id
+                with self._connection() as connection:
+                    allocation = store.get_allocation(
+                        connection,
+                        allocation_id,
+                        now=self._now(),
+                    )
+                if allocation["owner_uid"] != identity.uid and not identity.is_admin:
+                    raise Forbidden("only the owner or an admin may open this tunnel")
+                if allocation["status"] != "active":
+                    raise Conflict(f"allocation is {allocation['status']}, not active")
+                container_id = str(allocation["container_id"])
+                if not container_id:
+                    raise NotFound("allocation has no container")
+
+                # Reserve the slot before the first blocking call. The check and
+                # insert are synchronous in the event loop, so concurrent
+                # connections cannot all observe the same free count.
+                active = self._tunnels.setdefault(allocation_id, set())
+                if task is not None:
+                    active.discard(task)
+                if len(active) >= self.config.policy.vscode_max_tunnels:
+                    raise Conflict("too many open VS Code tunnels for this allocation")
+                if task is not None:
+                    active.add(task)
+
+                owner_uid, owner_gid = self._allocation_owner_ids(allocation)
+                # Use the allocation owner for the container passwd entry and
+                # HOME. The CLI connects as this user; an administrator opening
+                # the tunnel acts as the owner and only contributes a key.
+                container_user = str(allocation["owner"])
+                if not container_user:
+                    raise NotFound("allocation owner is missing")
+                if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", container_user):
+                    raise Conflict(
+                        "allocation owner name is not supported by the container SSH profile"
+                    )
+                keys = await asyncio.to_thread(self._member_public_keys, identity.username)
+                if not keys:
+                    raise Conflict("no SSH public keys found for this member on the host")
+                home = self._container_home(container_user, owner_uid)
+                await asyncio.to_thread(
+                    self.docker.prepare_container_ssh,
+                    container_id,
+                    owner_uid,
+                    owner_gid,
+                    container_user,
+                    keys,
+                    home,
+                )
+                session = await asyncio.to_thread(self.docker.open_tunnel, container_id)
+            except UdcError as exc:
+                await self._send(writer, _error(exc.code, exc.message))
+                return
+            except Exception:
+                logger.exception("could not open VS Code tunnel")
+                await self._send(writer, _error("internal", "could not open VS Code tunnel"))
+                return
+
+            active_session = session
+            assert active_session is not None
+            try:
+                await self._send(writer, _ok({"id": allocation_id, "protocol": "ssh"}))
+                await self._relay_tunnel(reader, writer, active_session)
+            finally:
+                try:
+                    await asyncio.to_thread(active_session.close)
+                except Exception:
+                    logger.warning("could not close VS Code tunnel session", exc_info=True)
+        finally:
+            if task is not None:
+                remaining = self._tunnels.get(allocation_id)
+                if remaining is not None:
+                    remaining.discard(task)
+                    if not remaining:
+                        self._tunnels.pop(allocation_id, None)
+
+    async def _relay_tunnel(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        session: ShellSession,
+    ) -> None:
+        async def pump_input() -> None:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    return
+                await asyncio.to_thread(session.write, data)
+
+        async def pump_output() -> None:
+            while True:
+                data = await asyncio.to_thread(session.read, 65536)
+                if not data:
+                    return
+                writer.write(data)
+                await writer.drain()
+
+        tasks = [
+            asyncio.create_task(pump_input()),
+            asyncio.create_task(pump_output()),
+        ]
+        try:
+            _done, _pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in tasks:
+                task.cancel()
+            # A blocking recv() cannot be cancelled directly. Closing the
+            # session socket unblocks the worker before we join it.
+            try:
+                await asyncio.to_thread(session.close)
+            except Exception:
+                logger.warning("could not close tunnel session", exc_info=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def handle_request(
         self,
@@ -941,7 +1357,9 @@ class Broker:
             if command == "admin_reconcile":
                 self._check_args(args)
                 self._require_admin(identity)
-                return _ok(await asyncio.to_thread(self.reconcile_once))
+                summary = await asyncio.to_thread(self.reconcile_once)
+                self._cancel_inactive_tunnels()
+                return _ok(summary)
             raise BadRequest(f"unknown command: {command}")
         except UdcError as exc:
             return _error(exc.code, exc.message)
@@ -975,7 +1393,8 @@ class Broker:
         with self._connection() as connection:
             persisted = store.get_mode(connection, self._mode)
             if persisted == "monitor" and (
-                store.active_lease_count(connection) or store.queue_request_count(connection)
+                store.active_lease_count(connection)
+                or store.queue_request_count(connection, now=now)
             ):
                 logger.warning(
                     "promoting monitor to maintenance while active/pending/queued work exists"
@@ -986,23 +1405,31 @@ class Broker:
             db_gpus = store.list_gpus(connection, now=now)
             allocations = store.list_allocations(connection, now=now)
             queue = store.list_queue_requests(connection, now=now)
-            active_ids = {
-                str(allocation["id"])
-                for allocation in store.list_allocations(
-                    connection,
-                    statuses=("pending", "active"),
-                    now=now,
-                )
-            }
+            active_allocations = self._allocation_map(connection, now)
         data: dict[str, Any] = {
             "server": self.config.server.name,
             "mode": self._mode,
             "now": now.isoformat(),
             "detection_error": live.error,
-            "gpus": self._merge_gpus(db_gpus, live, active_ids),
+            "gpus": self._merge_gpus(db_gpus, live, active_allocations),
             "allocations": allocations,
             "queue": queue,
-            "unmanaged": self._unmanaged(db_gpus, active_ids, live),
+            "unmanaged": self._unmanaged(db_gpus, active_allocations, live),
+            "gpu_audit": {
+                "required": self.config.policy.gpu_audit_required,
+                "ok": self._gpu_audit_failure is None,
+                "message": self._gpu_audit_failure or "",
+            },
+            "workspace_quota": {
+                "required": self.config.policy.workspace_quota_required,
+                "ok": self._quota_failure is None,
+                "message": self._quota_failure or "",
+            },
+            "storage": {
+                "required": self.config.policy.container_profile == "development",
+                "ok": self._storage_failure is None,
+                "message": self._storage_failure or "",
+            },
         }
         self._add_member_identity(data)
         return data
@@ -1059,7 +1486,7 @@ class Broker:
     def _unmanaged(
         self,
         gpus: list[dict[str, Any]],
-        active_allocation_ids: set[str],
+        allocations: dict[str, dict[str, Any]],
         live: LiveResources,
     ) -> dict[str, list[dict[str, Any]]]:
         container_by_uuid = {
@@ -1069,10 +1496,7 @@ class Broker:
         unmanaged_containers: list[dict[str, Any]] = []
         for container in live.containers:
             allocation_id = container.labels.get("udc.allocation")
-            if (
-                container.labels.get("udc.managed") == "true"
-                and allocation_id in active_allocation_ids
-            ):
+            if self._managed_container_matches(container, allocations, gpus):
                 continue
             resolved, unknown_ref = self._resolve_gpu_refs(container.gpu_refs, gpus)
             indices = sorted({int(gpu["index"]) for gpu in gpus if str(gpu["uuid"]) in resolved})
@@ -1224,6 +1648,20 @@ class Broker:
 
     async def _apply(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
         self._require_active()
+        if self.config.policy.gpu_audit_required:
+            gpu_failure = await asyncio.to_thread(self._run_gpu_audit)
+            if gpu_failure:
+                raise Conflict(f"new allocations blocked by GPU permission audit: {gpu_failure}")
+        if self.config.policy.workspace_quota_required or self.config.policy.max_workspace_gb > 0:
+            quota_failure = await asyncio.to_thread(self._run_quota_check)
+            if quota_failure:
+                raise Conflict(f"new allocations blocked by workspace quota: {quota_failure}")
+        storage_failure = await asyncio.to_thread(self._run_storage_check)
+        if storage_failure:
+            raise Conflict(f"new allocations blocked by Docker storage: {storage_failure}")
+        gate_failure = self._gate_failure()
+        if gate_failure:
+            raise Conflict(f"new allocations blocked by host safety gate: {gate_failure}")
         gpus = self._parse_gpus(args.get("gpus", []))
         cpus = self._parse_positive_float(args.get("cpus"), "cpus")
         memory_gb = self._parse_positive_int(args.get("memory_gb"), "memory_gb")
@@ -1248,8 +1686,8 @@ class Broker:
         image = args.get("image", self.config.image.base)
         if not isinstance(image, str) or not image:
             raise BadRequest("image must be a non-empty string")
-        if not identity.is_admin and image != self.config.image.base:
-            raise Forbidden("members may only use the configured base image")
+        if not identity.is_admin and not self.config.image.image_allowed(image):
+            raise Forbidden("members may only use images on the configured allowlist")
         note = args.get("note", "")
         if not isinstance(note, str):
             raise BadRequest("note must be a string")
@@ -1262,16 +1700,9 @@ class Broker:
             with self._connection() as connection:
                 db_gpus = store.list_gpus(connection, now=now)
                 gpu_rows = store.gpus_for_indices(connection, gpus)
-                active_ids = {
-                    str(allocation["id"])
-                    for allocation in store.list_allocations(
-                        connection,
-                        statuses=("pending", "active"),
-                        now=now,
-                    )
-                }
+                active_allocations = self._allocation_map(connection, now)
             live = await asyncio.to_thread(self._live_resources)
-            merged = self._merge_gpus(db_gpus, live, active_ids)
+            merged = self._merge_gpus(db_gpus, live, active_allocations)
             by_index = {int(gpu["index"]): gpu for gpu in merged}
             for index in gpus:
                 gpu = by_index.get(index)
@@ -1301,12 +1732,32 @@ class Broker:
                     f"workspace disk has only {free_gb} GiB free; "
                     f"policy.min_free_gb is {self.config.policy.min_free_gb}"
                 )
-        try:
-            await asyncio.to_thread(self._ensure_workspace, workspace, identity)
-        except UdcError:
-            raise
-        except Exception as exc:
-            raise InternalError(f"workspace creation failed: {exc}") from exc
+        with self._connection() as connection:
+            pending_before = store.queue_request_count(connection, now=self._now())
+        if pending_before:
+            if not self.config.policy.queue_enabled:
+                raise Conflict(
+                    "queued requests are pending while queue_enabled is false; "
+                    "an administrator must resolve the queue"
+                )
+            await self._schedule_queue_safely("direct_apply")
+            with self._connection() as connection:
+                pending_after = store.queue_request_count(connection, now=self._now())
+            if pending_after:
+                reason = busy_reason or "queued requests are pending"
+                if not queue_requested:
+                    raise GpuBusy(f"{reason}; --no-queue cannot bypass queued requests")
+                return await self._enqueue_allocation(
+                    identity,
+                    gpus=gpus,
+                    cpus=cpus,
+                    memory_gb=memory_gb,
+                    hours=hours,
+                    image=image,
+                    workspace=workspace,
+                    note=note,
+                    reason=reason,
+                )
         if busy_reason is not None:
             if not (self.config.policy.queue_enabled and queue_requested):
                 raise GpuBusy(busy_reason)
@@ -1499,8 +1950,18 @@ class Broker:
         if self._mode != "active" or not self.config.policy.queue_enabled:
             return []
         with self._connection() as connection:
-            if store.queue_request_count(connection) == 0:
+            if store.queue_request_count(connection, now=self._now()) == 0:
                 return []
+        # Re-check the nosuid/quota storage gate at admission time instead of
+        # relying only on the value cached at startup or the last direct apply.
+        storage_failure = await asyncio.to_thread(self._run_storage_check)
+        if storage_failure:
+            logger.warning("queue scheduling paused by Docker storage gate: %s", storage_failure)
+            return []
+        gate_failure = self._gate_failure()
+        if gate_failure:
+            logger.warning("queue scheduling paused by host safety gate: %s", gate_failure)
+            return []
         admitted: list[str] = []
         while True:
             live = await asyncio.to_thread(self._live_resources)
@@ -1510,15 +1971,8 @@ class Broker:
             now = self._now()
             with self._connection() as connection:
                 db_gpus = store.list_gpus(connection, now=now)
-                active_ids = {
-                    str(allocation["id"])
-                    for allocation in store.list_allocations(
-                        connection,
-                        statuses=("pending", "active"),
-                        now=now,
-                    )
-                }
-                merged = self._merge_gpus(db_gpus, live, active_ids)
+                active_allocations = self._allocation_map(connection, now)
+                merged = self._merge_gpus(db_gpus, live, active_allocations)
                 available_gpu_uuids = {str(gpu["uuid"]) for gpu in merged if gpu["state"] == "free"}
                 allocation_id = store.admit_next_queued(
                     connection,
@@ -1591,6 +2045,7 @@ class Broker:
                 now=self._now(),
             )
             released = store.get_allocation(connection, allocation_id, now=self._now())
+        self._cancel_tunnels(allocation_id)
         await self._schedule_queue_safely("release")
         return released
 
@@ -1759,13 +2214,6 @@ class Broker:
             "logs": content,
         }
 
-    def _ensure_workspace(self, path: str, identity: Identity) -> None:
-        workspace_io.ensure_workspace(
-            path,
-            owner_uid=identity.uid,
-            owner_gid=identity.gid,
-        )
-
     def _admin_users(self) -> dict[str, Any]:
         with self._connection() as connection:
             return {"users": store.list_users(connection)}
@@ -1794,7 +2242,7 @@ class Broker:
         if mode == "monitor":
             with self._connection() as connection:
                 leases = store.active_lease_count(connection)
-                queued = store.queue_request_count(connection)
+                queued = store.queue_request_count(connection, now=self._now())
             if leases or queued:
                 raise Conflict(
                     "cannot switch to monitor while active/pending leases or queued "
@@ -1820,22 +2268,18 @@ class Broker:
                 raise Conflict(
                     "active mode blocked by legacy access audit: " + audit.failure_message()
                 )
+            runtime_failure = await asyncio.to_thread(self._refresh_runtime_gates)
+            if runtime_failure:
+                raise Conflict(f"active mode blocked by host safety gate: {runtime_failure}")
             now = self._now()
             with self._connection() as connection:
                 db_gpus = store.list_gpus(connection, now=now)
-                active_ids = {
-                    str(allocation["id"])
-                    for allocation in store.list_allocations(
-                        connection,
-                        statuses=("pending", "active"),
-                        now=now,
-                    )
-                }
+                active_allocations = self._allocation_map(connection, now)
             live = await asyncio.to_thread(self._live_resources)
             if live.error:
                 raise Conflict(f"active mode blocked: live GPU detection failed: {live.error}")
-            merged = self._merge_gpus(db_gpus, live, active_ids)
-            unmanaged = self._unmanaged(db_gpus, active_ids, live)
+            merged = self._merge_gpus(db_gpus, live, active_allocations)
+            unmanaged = self._unmanaged(db_gpus, active_allocations, live)
             blocking_gpus = [
                 f"GPU {gpu['index']} ({gpu['state']}: {gpu['state_reason']})"
                 for gpu in merged

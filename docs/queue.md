@@ -29,6 +29,11 @@ Broker 只在 `active` 模式调度队列，且必须满足以下所有条件：
 顺序为 `priority DESC, created_at ASC, id`。准入后立即创建容器并激活 allocation；
 容器创建或 workspace 准备失败会把 allocation 标为 `failed` 并释放 claim。
 
+所有 `apply` 都必须尊重队列：存在未过期的 queued 请求时，先触发调度；若队首仍无法
+准入，直接申请必须入队，或按 `--no-queue` 拒绝，不能插队。只有队列为空且资源可用时，
+申请才直接创建 allocation。`--no-queue` 只表示“不等待、不保留请求”。GPU 权限审计、
+workspace 配额或 Docker 存储预检失败时，队列调度暂停并保留请求。
+
 调度触发点：Broker 启动、`release`、到期 worker，以及切换到 `active` 模式。准入
 成功后继续尝试下一条，直到没有符合条件的请求。`monitor` 或 `maintenance` 模式不会
 自动准入。
@@ -61,4 +66,5 @@ max_queue_hours = 24
 ```
 
 `max_queue_hours` 从请求创建时开始计时，与 allocation 的 `hours` 租期独立。
-workspace 在申请阶段创建；请求取消或过期后不会自动删除，便于用户复用已有文件。
+workspace 只在 allocation 真正创建（直接申请或队列准入）时创建；取消或过期的排队请求
+不会留下空 workspace，已存在的 workspace 也不会自动删除，便于用户复用已有文件。

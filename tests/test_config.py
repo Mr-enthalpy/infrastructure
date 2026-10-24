@@ -2,9 +2,19 @@ from pathlib import Path
 
 import pytest
 
-from udc_resource.config import load_config
+from udc_resource.config import ImageConfig, load_config
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _variant(tmp_path: Path, *replacements: tuple[str, str]) -> Path:
+    text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
+    for old, new in replacements:
+        assert old in text, old
+        text = text.replace(old, new)
+    path = tmp_path / "variant.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def test_example_config_is_valid():
@@ -31,8 +41,33 @@ def test_example_config_is_valid():
     assert cfg.policy.max_upload_bytes == 21474836480
     assert cfg.policy.pids_limit == 4096
     assert cfg.policy.container_user == "member"
-    assert cfg.policy.container_read_only is True
+    assert cfg.policy.container_read_only is False
+    assert cfg.policy.container_profile == "development"
+    assert cfg.policy.container_sudo is True
+    assert cfg.policy.writable_layer_gb == 40
+    assert cfg.policy.gpu_audit_required is True
+    assert cfg.policy.workspace_quota_required is True
+    assert cfg.policy.max_workspace_gb == 200
+    assert cfg.policy.vscode_enabled is False
     assert cfg.server.members_file.endswith("members.toml")
+
+
+def test_workspace_root_must_be_absolute(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('workspace_root = "/data1/udc-users"', 'workspace_root = "udc-users"'),
+    )
+    with pytest.raises(ValueError, match="workspace_root"):
+        load_config(path)
+
+
+def test_workspace_root_must_not_be_filesystem_root(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('workspace_root = "/data1/udc-users"', 'workspace_root = "/"'),
+    )
+    with pytest.raises(ValueError, match="workspace_root"):
+        load_config(path)
 
 
 def test_invalid_duration_is_rejected(tmp_path):
@@ -111,3 +146,126 @@ def test_active_mode_requires_legacy_audit(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError):
         load_config(path)
+
+
+def test_active_mode_requires_gpu_audit(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('mode = "monitor"', 'mode = "active"'),
+        ("deployment_allowed = false", "deployment_allowed = true"),
+        ("gpu_audit_required = true", "gpu_audit_required = false"),
+    )
+    with pytest.raises(ValueError, match="gpu_audit_required"):
+        load_config(path)
+
+
+def test_active_mode_requires_workspace_quota(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('mode = "monitor"', 'mode = "active"'),
+        ("deployment_allowed = false", "deployment_allowed = true"),
+        ("workspace_quota_required = true", "workspace_quota_required = false"),
+    )
+    with pytest.raises(ValueError, match="workspace_quota_required"):
+        load_config(path)
+
+
+def test_restricted_profile_rejects_writable_layer_quota(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('container_profile = "development"', 'container_profile = "restricted"'),
+        ("container_read_only = false", "container_read_only = true"),
+        ("container_sudo = true", "container_sudo = false"),
+    )
+    with pytest.raises(ValueError, match="writable_layer_gb"):
+        load_config(path)
+
+
+def test_development_profile_requires_writable_layer(tmp_path):
+    path = _variant(tmp_path, ("writable_layer_gb = 40", "writable_layer_gb = 0"))
+    with pytest.raises(ValueError, match="writable_layer_gb"):
+        load_config(path)
+
+
+def test_development_profile_requires_container_sudo(tmp_path):
+    path = _variant(tmp_path, ("container_sudo = true", "container_sudo = false"))
+    with pytest.raises(ValueError, match="container_sudo"):
+        load_config(path)
+
+
+def test_development_profile_requires_member_container_user(tmp_path):
+    path = _variant(tmp_path, ('container_user = "member"', 'container_user = "root"'))
+    with pytest.raises(ValueError, match="container_user=member"):
+        load_config(path)
+
+
+def test_development_profile_requires_writable_rootfs(tmp_path):
+    path = _variant(
+        tmp_path,
+        ("container_read_only = false", "container_read_only = true"),
+    )
+    with pytest.raises(ValueError, match="container_read_only"):
+        load_config(path)
+
+
+def test_vscode_requires_development_profile(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('container_profile = "development"', 'container_profile = "restricted"'),
+        ("container_read_only = false", "container_read_only = true"),
+        ("container_sudo = true", "container_sudo = false"),
+        ("writable_layer_gb = 40", "writable_layer_gb = 0"),
+        ("vscode_enabled = false", "vscode_enabled = true"),
+    )
+    with pytest.raises(ValueError, match="vscode_enabled"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("value", ["/.", "//", "///"])
+def test_workspace_root_rejects_normalized_root(tmp_path, value):
+    path = _variant(
+        tmp_path,
+        ('workspace_root = "/data1/udc-users"', f'workspace_root = "{value}"'),
+    )
+    with pytest.raises(ValueError, match="workspace_root"):
+        load_config(path)
+
+
+def test_container_home_cannot_be_workspace(tmp_path):
+    path = _variant(tmp_path, ('container_home = ""', 'container_home = "/workspace"'))
+    with pytest.raises(ValueError, match="container_home"):
+        load_config(path)
+
+
+def test_container_home_cannot_traverse(tmp_path):
+    path = _variant(
+        tmp_path,
+        ('container_home = ""', 'container_home = "/home/../workspace"'),
+    )
+    with pytest.raises(ValueError, match="container_home"):
+        load_config(path)
+
+
+def test_container_home_must_be_under_home(tmp_path):
+    path = _variant(tmp_path, ('container_home = ""', 'container_home = "/opt/member"'))
+    with pytest.raises(ValueError, match="under /home"):
+        load_config(path)
+
+
+def test_container_home_must_not_end_with_slash(tmp_path):
+    path = _variant(tmp_path, ('container_home = ""', 'container_home = "/home/alice/"'))
+    with pytest.raises(ValueError, match="must not end with /"):
+        load_config(path)
+
+
+def test_image_allowlist_must_be_a_list_of_strings(tmp_path):
+    path = _variant(tmp_path, ("allowlist = []", 'allowlist = "extra:1"'))
+    with pytest.raises(ValueError, match="image.allowlist"):
+        load_config(path)
+
+
+def test_image_allowlist_includes_base():
+    image = ImageConfig(base="base:1", allowlist=("extra:1",))
+    assert image.image_allowed("base:1") is True
+    assert image.image_allowed("extra:1") is True
+    assert image.image_allowed("other:1") is False

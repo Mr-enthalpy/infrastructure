@@ -11,6 +11,8 @@ import re
 import secrets
 import shlex
 import shutil
+import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -28,8 +30,10 @@ CONFIG_KEY: web.AppKey[LabConfig] = web.AppKey("config", LabConfig)
 RUNNER_KEY: web.AppKey[Any] = web.AppKey("runner", Any)
 TOKEN_KEY: web.AppKey[str] = web.AppKey("token", str)
 STATIC_KEY: web.AppKey[Path] = web.AppKey("static_dir", Path)
+VSCODE_KEY: web.AppKey[list[Any]] = web.AppKey("vscode_processes", list)
 ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 ALLOCATION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+JOB_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 
 
 class SSHRunner:
@@ -148,6 +152,8 @@ def create_app(
     app[RUNNER_KEY] = runner or SSHRunner(config, member_alias, admin_alias)
     app[TOKEN_KEY] = token or secrets.token_urlsafe(32)
     app[STATIC_KEY] = static_dir
+    app[VSCODE_KEY] = []
+    app.on_cleanup.append(_cleanup_vscode)
     app.router.add_get("/", _index)
     app.router.add_static("/static/", static_dir)
     app.router.add_get("/api/config", _api_config)
@@ -155,8 +161,13 @@ def create_app(
     app.router.add_get("/api/status", _api_status)
     app.router.add_get("/api/status/{allocation_id}", _api_status)
     app.router.add_post("/api/apply", _api_apply)
+    app.router.add_get("/api/queue", _api_queue)
+    app.router.add_post("/api/queue/cancel", _api_queue_cancel)
     app.router.add_post("/api/release", _api_release)
     app.router.add_get("/api/logs/{allocation_id}", _api_logs)
+    app.router.add_get("/api/jobs/{allocation_id}", _api_jobs)
+    app.router.add_post("/api/jobs/{allocation_id}/stop", _api_job_stop)
+    app.router.add_post("/api/vscode/{allocation_id}", _api_vscode)
     app.router.add_get("/api/admin/users", _api_admin_users)
     app.router.add_get("/api/admin/resources", _api_admin_resources)
     app.router.add_get("/api/admin/audit", _api_admin_audit)
@@ -191,6 +202,7 @@ async def _api_config(request: web.Request) -> web.Response:
                 "server_name": request.app[CONFIG_KEY].server.name,
                 "member_alias": runner.member_alias,
                 "admin_enabled": bool(runner.admin_alias),
+                "vscode_enabled": request.app[CONFIG_KEY].policy.vscode_enabled,
             },
         }
     )
@@ -249,6 +261,30 @@ async def _api_apply(request: web.Request) -> web.Response:
     note = body.get("note")
     if isinstance(note, str) and note:
         args.extend(["--note", note])
+    if body.get("queue") is False:
+        args.append("--no-queue")
+    return await _remote(request, args)
+
+
+async def _api_queue(request: web.Request) -> web.Response:
+    history = request.query.get("history") == "1"
+    args = ["queue", "list"]
+    if history:
+        args.append("--history")
+    return await _remote(request, args)
+
+
+async def _api_queue_cancel(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    queue_id = body.get("id")
+    reason = body.get("reason", "")
+    if not isinstance(queue_id, str) or not queue_id:
+        return _json(_error("bad_request", "id is required"), 400)
+    if not isinstance(reason, str):
+        return _json(_error("bad_request", "reason must be a string"), 400)
+    args = ["queue", "cancel", queue_id]
+    if reason:
+        args.extend(["--reason", reason])
     return await _remote(request, args)
 
 
@@ -267,6 +303,98 @@ async def _api_logs(request: web.Request) -> web.Response:
     except ValueError:
         return _json(_error("bad_request", "tail must be an integer"), 400)
     return await _remote(request, ["logs", allocation_id, "--tail", str(tail)])
+
+
+async def _api_jobs(request: web.Request) -> web.Response:
+    allocation_id = request.match_info["allocation_id"]
+    if not ALLOCATION_RE.fullmatch(allocation_id):
+        return _json(_error("bad_request", "invalid allocation id"), 400)
+    return await _remote(request, ["job", "list", allocation_id])
+
+
+async def _api_job_stop(request: web.Request) -> web.Response:
+    allocation_id = request.match_info["allocation_id"]
+    if not ALLOCATION_RE.fullmatch(allocation_id):
+        return _json(_error("bad_request", "invalid allocation id"), 400)
+    body = await _json_body(request)
+    name = body.get("name")
+    if not isinstance(name, str) or not JOB_RE.fullmatch(name):
+        return _json(_error("bad_request", "invalid job name"), 400)
+    return await _remote(request, ["job", "stop", allocation_id, "--name", name])
+
+
+async def _api_vscode(request: web.Request) -> web.Response:
+    allocation_id = request.match_info["allocation_id"]
+    if not ALLOCATION_RE.fullmatch(allocation_id):
+        return _json(_error("bad_request", "invalid allocation id"), 400)
+    config: LabConfig = request.app[CONFIG_KEY]
+    if not config.policy.vscode_enabled:
+        return _json(_error("forbidden", "VS Code support is disabled by policy"), 403)
+    executable = shutil.which("udc-resource")
+    base = [executable] if executable is not None else [sys.executable, "-m", "udc_resource.cli"]
+    argv = [*base]
+    config_path = os.environ.get("UDC_RESOURCE_CONFIG", "").strip()
+    if config_path:
+        argv.extend(["--config", config_path])
+    runner: SSHRunner = request.app[RUNNER_KEY]
+    if not ALIAS_RE.fullmatch(runner.member_alias):
+        return _json(_error("internal", "invalid SSH alias"), 500)
+    argv.extend(["vscode", allocation_id, "--server", runner.member_alias, "--code"])
+    processes: list[Any] = request.app[VSCODE_KEY]
+    processes[:] = [process for process in processes if process.poll() is None]
+    try:
+        if os.name == "posix":
+            process = await asyncio.to_thread(
+                subprocess.Popen,
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            process = await asyncio.to_thread(
+                subprocess.Popen,
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+    except OSError as exc:
+        return _json(_error("internal", f"could not start VS Code: {exc}"), 500)
+    await asyncio.sleep(0.3)
+    if process.poll() is not None:
+        try:
+            await asyncio.to_thread(process.wait, 1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return _json(_error("internal", "VS Code tunnel process exited immediately"), 500)
+    processes.append(process)
+    return _json({"ok": True, "data": {"pid": process.pid, "id": allocation_id}})
+
+
+async def _stop_vscode_process(process: Any) -> None:
+    try:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.to_thread(process.wait, 5)
+            return
+        except subprocess.TimeoutExpired:
+            process.kill()
+        try:
+            await asyncio.to_thread(process.wait, 5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    except OSError:
+        pass
+
+
+async def _cleanup_vscode(app: web.Application) -> None:
+    processes: list[Any] = app[VSCODE_KEY]
+    for process in list(processes):
+        await _stop_vscode_process(process)
+    processes.clear()
 
 
 async def _api_admin_users(request: web.Request) -> web.Response:
@@ -355,6 +483,13 @@ async def _ws_shell(request: web.Request) -> web.StreamResponse:
             kwargs["known_hosts"] = os.path.expanduser(known_hosts)
         connection = await asyncssh.connect(runner.member_alias, **kwargs)
         command = f"udc-resource shell {shlex.quote(allocation_id)}"
+        job = request.query.get("job", "").strip()
+        if job:
+            if not JOB_RE.fullmatch(job):
+                await ws.send_str(json.dumps({"type": "error", "message": "invalid job name"}))
+                await ws.close()
+                return ws
+            command += f" --job {shlex.quote(job)}"
         process = await connection.create_process(
             command,
             term_type="xterm-256color",

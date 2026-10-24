@@ -61,6 +61,10 @@ class FakeDocker:
         self.jobs: dict[str, dict[str, dict[str, str]]] = {}
         self.fail_create = fail_create
         self.fail_remove = fail_remove
+        self.storage_ok = True
+        self.storage_detail = "storage preflight passed"
+        self.prepared_ssh: list[dict[str, object]] = []
+        self.tunnels: list[str] = []
         self._next_id = 1
 
     def list_gpus(self) -> list[GPU]:
@@ -98,6 +102,7 @@ class FakeDocker:
                 "udc.owner": allocation.owner_name,
                 "udc.allocation": allocation.id,
                 "udc.gpus": ",".join(allocation.gpus),
+                "udc.profile": "restricted",
             },
         )
         return ContainerRef(id=container_id, name=name)
@@ -107,6 +112,33 @@ class FakeDocker:
             raise RuntimeError("simulated docker remove failure")
         self.removed.append(container_id)
         self.containers.pop(container_id, None)
+
+    def storage_preflight(self) -> tuple[bool, str]:
+        return self.storage_ok, self.storage_detail
+
+    def prepare_container_ssh(
+        self,
+        container_id: str,
+        uid: int,
+        gid: int,
+        username: str,
+        public_keys: list[str],
+        home: str,
+    ) -> None:
+        self.prepared_ssh.append(
+            {
+                "container_id": container_id,
+                "uid": uid,
+                "gid": gid,
+                "username": username,
+                "public_keys": list(public_keys),
+                "home": home,
+            }
+        )
+
+    def open_tunnel(self, container_id: str) -> FakeShellSession:
+        self.tunnels.append(container_id)
+        return FakeShellSession()
 
     def open_shell(
         self,

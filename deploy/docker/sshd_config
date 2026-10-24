@@ -1,0 +1,33 @@
+# In-container sshd used only through the Broker's Docker exec tunnel.
+# The container is disposable; host SSH remains ForceCommand-only.
+Port 22
+Protocol 2
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+PidFile none
+UsePAM no
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+PermitUserRC no
+AuthorizedKeysFile .ssh/authorized_keys
+# VS Code Remote-SSH needs local TCP forwarding for its remote server.
+# Remote forwarding, Unix-socket forwarding, agent forwarding, and tun devices
+# stay disabled.
+AllowTcpForwarding local
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+X11Forwarding no
+PermitUserEnvironment no
+PrintMotd no
+PrintLastLog no
+LoginGraceTime 20
+MaxAuthTries 3
+MaxSessions 8
+ClientAliveInterval 30
+ClientAliveCountMax 3
+Subsystem sftp internal-sftp

@@ -9,9 +9,17 @@ administrator approval.
 
 ## Order
 
-1. Run `bash deploy/preflight.sh` and `bash deploy/audit_legacy.sh` (both read-only):
+1. Run `bash deploy/preflight.sh --config lab/resources.local.toml` and
+   `bash deploy/audit_legacy.sh` (both read-only):
    Docker, systemd, NVIDIA runtime, udev, sshd, groups, cgroup, disk,
    `/dev/nvidia*` permissions, legacy root/sudo/SSH/privileged-container access.
+   For the development profile, preflight also requires the `overlay2` driver,
+   an XFS DockerRootDir mounted with `prjquota`/`pquota`, `xfs_quota`, and a
+   workspace root mounted `nosuid` (container root is host root without a user
+   namespace, so setuid files written through the workspace bind must be
+   ignored by the host).
+   The GPU permission gate also requires `stat`, `su`, `getent`, `udevadm`, and
+   `getfacl` (the `acl` package); preflight fails if any is missing.
 2. Install Python 3.12 (uv or deadsnakes), then run:
 
    ```bash
@@ -36,19 +44,27 @@ administrator approval.
    bash deploy/create_user.sh --yes --ssh-key /path/to/key.pub udc-alice
    ```
 
-   Members get `udc-members` + `udc-cli` and SSH `ForceCommand`. Admins use
-   `--admin`, keep a normal shell, and must not be in `udc-members`.
+   Members get `udc-members` + `udc-cli`, SSH `ForceCommand`, and the
+   root-owned `/usr/local/libexec/udc-resource/member-shell` login shell. The
+   installer does not change existing account shells; re-run `create_user.sh`
+   for each existing member before active mode. Admins use `--admin`, keep a
+   normal shell, and must not be in `udc-members`.
 4. Install the udev rule (done by the installer) and verify host GPU access is
    denied to a test member. `verify_gpu_permissions.sh` checks every
-   `/dev/nvidia*` node, its `SUBSYSTEM=="nvidia"` udev property, mode/owner,
+   `/dev/nvidia*` node, its NVIDIA/misc udev subsystem, mode/owner,
    unexpected ACLs, forbidden groups (`udc-gpu`, `video`, `render`, Docker,
-   sudo, admins), and direct member read/write failures. Re-run it after reboot
-   and after the NVIDIA driver recreates nodes.
+   sudo, admins), and direct member read/write failures. Omit `--member` to
+   check every effective `udc-members` account, or use `--json` for the
+   Broker gate format. Re-run it after reboot and after the NVIDIA driver
+   recreates nodes.
 5. The installer selects `monitor` for a fresh install. On reinstall it keeps
    `active`/`maintenance` when leases exist, so the expiry worker cannot be
    paused accidentally.
-6. Install the sshd drop-in, run `sshd -t`, then reload. Keep an admin SSH
-   session open while changing SSH.
+6. Install the sshd drop-in, run `sshd -t`, then reload. The member match block
+   is key-only (`AuthenticationMethods publickey`, password and keyboard
+   interactive disabled), sets `PermitUserRC no`, disables forwarding/tunnels,
+   and forces the login wrapper. Keep an admin SSH session open while changing
+   SSH.
 7. Start in monitor-only mode:
 
    ```bash
@@ -77,9 +93,10 @@ destructive active-mode acceptance.
 
 - `preflight.sh` (read-only checks; run before installing anything)
 - `audit_legacy.sh` (read-only legacy root/sudo/SSH/privileged-container audit)
-- `install_server.sh` (idempotent installer; `--dry-run`, `--yes`, `--start`)
+- `install_server.sh` (idempotent installer; `--dry-run`, `--yes`, `--start`, `--no-timers`)
 - `create_user.sh` (member/admin account and optional SSH key setup)
-- `verify_gpu_permissions.sh` (read-only all-GPU/NVIDIA device permission acceptance)
+- `member-shell.sh` (root-owned member login shell installed by the installer)
+- `verify_gpu_permissions.sh` (read-only all-GPU/NVIDIA device permission acceptance; supports `--json` and no-member mode)
 - `verify_monitor_only.sh` (read-only monitor-only security acceptance)
 - `check_disk.sh` (workspace free-space alert; exit 0/1/2)
 - `configure_quotas.sh` (XFS/ext4 project quotas; dry-run by default, `--yes` to apply)
@@ -91,15 +108,26 @@ destructive active-mode acceptance.
 - `udev/99-udc-gpu.rules`
 - `sshd/60-udc-resource.conf`
 - `docker/Dockerfile.base`
+- `docker/sshd_config`
+- `docker/bootstrap.sh`
 - `../lab/members.example.toml` (public collaborator directory example)
 
 Before enabling file transfer, run `configure_quotas.sh` during a maintenance
 window and schedule `check_disk.sh --min-free-gb 50` (or a systemd timer). The
-demo config enables `container_user = "member"`, `container_read_only = true`,
-PID limits, capability drops, tmpfs scratch space, and an optional GPU group;
-`userns_mode` is empty by default and accepts `host` only for an explicit
-daemon-level decision. Validate the real image, GPU group, and namespace mode
-on the target host before active acceptance.
+example config enables the development profile with a writable rootfs,
+passwordless container `sudo`, a per-allocation tmpfs HOME, a `storage_opt`
+writable-layer quota, PID limits, and an optional GPU group. The container is
+still unprivileged at the Docker level: no privileged mode, Docker socket,
+host PID/network namespace, or host system mounts. `userns_mode` is empty by
+default and accepts `host` only for an explicit daemon-level decision.
+Validate the real image, Docker storage driver, GPU group, container sshd,
+and namespace mode on the target host before active acceptance.
+
+The development profile requires `overlay2` on XFS with project quotas; if
+`preflight.sh --config` reports any of those checks as failed, do not enable
+the profile. VS Code support additionally requires the image built from
+`deploy/docker/Dockerfile.base`; it remains gated until the target container
+sshd, tunnel teardown, and quota tests pass.
 
 The broker socket must be `root:udc-cli 0660`; members must not get Docker,
 sudo, or GPU device groups. The container must not mount the host Docker socket.
@@ -124,10 +152,10 @@ bash deploy/configure_quotas.sh --workspace-root /data1/udc-users \
 The command is a dry-run unless `--yes` is supplied. XFS/ext4 mounts must have
 `prjquota` enabled during a maintenance window; the script will not remount
 `/data1`. Schedule `deploy/check_disk.sh --path /data1/udc-users --min-free-gb 50`
-(cron or a systemd timer) for free-space alerts. The installer also installs
-`udc-resource-logrotate.timer` and `udc-resource-disk-check.timer`, but leaves
-both disabled until an administrator enables them. The log timer calls the
-descriptor-relative `rotate_job_logs.py` helper rather than logrotate's
-symlink-following copytruncate path; the disk timer runs `check_disk.sh` and
-exits non-zero for warning/critical thresholds so the failure is visible in
-`systemctl --failed` and the journal.
+(cron or a systemd timer) for free-space alerts. The installer installs and
+enables `udc-resource-logrotate.timer` and `udc-resource-disk-check.timer` by
+default; use `install_server.sh --no-timers` to leave them disabled. The log
+timer calls the descriptor-relative `rotate_job_logs.py` helper rather than
+logrotate's symlink-following copytruncate path; the disk timer runs
+`check_disk.sh` and exits non-zero for warning/critical thresholds so the
+failure is visible in `systemctl --failed` and the journal.

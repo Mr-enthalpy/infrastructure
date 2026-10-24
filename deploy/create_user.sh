@@ -10,6 +10,8 @@ USERNAME=""
 SSH_KEY=""
 SSH_KEY_STRING=""
 WORKSPACE_ROOT=${UDC_WORKSPACE_ROOT:-/data1/udc-users}
+MEMBER_SHELL=/usr/local/libexec/udc-resource/member-shell
+PYTHON_BIN=${PYTHON_BIN:-}
 
 usage() {
     cat <<'EOF'
@@ -88,6 +90,12 @@ done
 if [ "$DRY_RUN" -eq 0 ]; then
     [ "$(id -u)" -eq 0 ] || fail "run as root, or use --dry-run"
     [ "$ASSUME_YES" -eq 1 ] || fail "refusing to modify users without --yes"
+    [ -x "$MEMBER_SHELL" ] || fail "root-owned member shell is missing: $MEMBER_SHELL"
+    SHELL_META=$(stat -c '%a %U %G' "$MEMBER_SHELL" 2>/dev/null || true)
+    case "$SHELL_META" in
+        "755 root root") ;;
+        *) fail "member shell has unsafe ownership/mode: $SHELL_META" ;;
+    esac
 fi
 
 for group in udc-members udc-cli udc-admins udc-gpu; do
@@ -97,9 +105,11 @@ done
 if [ "$ADMIN" -eq 1 ]; then
     PRIMARY_GROUP=udc-admins
     FORBIDDEN_GROUPS=(udc-members)
+    TARGET_SHELL=/bin/bash
 else
     PRIMARY_GROUP=udc-members
     FORBIDDEN_GROUPS=(sudo docker udc-gpu video render udc-admins)
+    TARGET_SHELL=$MEMBER_SHELL
 fi
 
 if [ -n "$SSH_KEY" ]; then
@@ -127,10 +137,10 @@ fi
 
 if ! user_exists; then
     note "creating $([ "$ADMIN" -eq 1 ] && echo administrator || echo member): $USERNAME"
-    run useradd --create-home --shell /bin/bash --gid "$PRIMARY_GROUP" "$USERNAME"
+    run useradd --create-home --shell "$TARGET_SHELL" --gid "$PRIMARY_GROUP" "$USERNAME"
 else
     note "updating existing account: $USERNAME"
-    run usermod --shell /bin/bash "$USERNAME"
+    run usermod --shell "$TARGET_SHELL" "$USERNAME"
     if [ "$ADMIN" -eq 0 ]; then
         run usermod -aG udc-members "$USERNAME"
     else
@@ -146,57 +156,110 @@ fi
 
 if user_exists; then
     HOME_DIR=$(getent passwd "$USERNAME" | cut -d: -f6)
-    PRIMARY_GROUP_NAME=$(id -gn "$USERNAME")
 else
     HOME_DIR=/home/$USERNAME
-    PRIMARY_GROUP_NAME=$PRIMARY_GROUP
 fi
 [ -n "$HOME_DIR" ] || fail "could not determine home directory for $USERNAME"
 
-install_key_lines() {
-    local source=$1
-    local authorized=$2
-    local line
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        if [ "$DRY_RUN" -eq 1 ]; then
-            printf '[dry-run] append key to %s\n' "$authorized"
-            continue
-        fi
-        if ! grep -qxF -- "$line" "$authorized" 2>/dev/null; then
-            printf '%s\n' "$line" >> "$authorized" || fail "could not append SSH key"
-        fi
-    done < "$source"
+append_key_nofollow() {
+    local line=$1
+    "$PYTHON_BIN" - "$USERNAME" "$line" <<'PY'
+import os
+import pwd
+import stat
+import sys
+
+user, line = sys.argv[1], sys.argv[2]
+record = pwd.getpwnam(user)
+home = record.pw_dir
+uid, gid = record.pw_uid, record.pw_gid
+if not hasattr(os, "O_NOFOLLOW"):
+    raise SystemExit("O_NOFOLLOW is required to install SSH keys safely")
+dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+home_fd = os.open(home, dir_flags)
+try:
+    try:
+        ssh_fd = os.open(".ssh", dir_flags, dir_fd=home_fd)
+    except FileNotFoundError:
+        os.mkdir(".ssh", 0o700, dir_fd=home_fd)
+        ssh_fd = os.open(".ssh", dir_flags, dir_fd=home_fd)
+        os.fchown(ssh_fd, uid, gid)
+    try:
+        if os.fstat(ssh_fd).st_uid != uid:
+            raise SystemExit(f"{home}/.ssh is not owned by {user}")
+        os.fchmod(ssh_fd, 0o700)
+        file_fd = os.open(
+            "authorized_keys",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=ssh_fd,
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise SystemExit("authorized_keys is not a regular file")
+            os.fchown(file_fd, uid, gid)
+            os.fchmod(file_fd, 0o600)
+            chunks = []
+            size = 0
+            while True:
+                chunk = os.read(file_fd, 65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 4 * 1024 * 1024:
+                    raise SystemExit("authorized_keys is too large")
+                chunks.append(chunk)
+            key = line.encode("utf-8")
+            content = b"".join(chunks)
+            if key not in content.splitlines():
+                os.lseek(file_fd, 0, os.SEEK_END)
+                if content and not content.endswith(b"\n"):
+                    os.write(file_fd, b"\n")
+                os.write(file_fd, key + b"\n")
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(ssh_fd)
+finally:
+    os.close(home_fd)
+PY
 }
 
 if [ -n "$SSH_KEY" ] || [ -n "$SSH_KEY_STRING" ]; then
     SSH_DIR=$HOME_DIR/.ssh
     AUTHORIZED=$SSH_DIR/authorized_keys
-    if [ -L "$SSH_DIR" ] || [ -L "$AUTHORIZED" ]; then
-        fail "refusing to follow a symlink in $SSH_DIR"
-    fi
-    run install -d -m 0700 -o "$USERNAME" -g "$PRIMARY_GROUP_NAME" "$SSH_DIR"
-    if [ "$DRY_RUN" -eq 0 ]; then
-        touch "$AUTHORIZED" || fail "could not create $AUTHORIZED"
-        chown "$USERNAME:$PRIMARY_GROUP_NAME" "$AUTHORIZED" || fail "could not chown $AUTHORIZED"
-        chmod 0600 "$AUTHORIZED" || fail "could not chmod $AUTHORIZED"
-    fi
-    if [ -n "$SSH_KEY" ]; then
-        install_key_lines "$SSH_KEY" "$AUTHORIZED"
-    fi
-    if [ -n "$SSH_KEY_STRING" ]; then
-        if [ "$DRY_RUN" -eq 1 ]; then
-            printf '[dry-run] append literal SSH key to %s\n' "$AUTHORIZED"
-        else
-            TMP_KEY=$(mktemp) || fail "could not create temporary key file"
-            printf '%s\n' "$SSH_KEY_STRING" > "$TMP_KEY" || fail "could not write temporary key file"
-            install_key_lines "$TMP_KEY" "$AUTHORIZED"
-            rm -f "$TMP_KEY"
-        fi
-    fi
     if [ "$DRY_RUN" -eq 1 ]; then
+        if [ -n "$SSH_KEY" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                line=${line%$'\r'}
+                printf '[dry-run] append key to %s\n' "$AUTHORIZED"
+            done < "$SSH_KEY"
+        fi
+        if [ -n "$SSH_KEY_STRING" ]; then
+            printf '[dry-run] append literal SSH key to %s\n' "$AUTHORIZED"
+        fi
         note "would install SSH public key for $USERNAME"
     else
+        if [ -z "$PYTHON_BIN" ]; then
+            if [ -x /opt/udc-resource/.venv/bin/python ]; then
+                PYTHON_BIN=/opt/udc-resource/.venv/bin/python
+            else
+                PYTHON_BIN=$(command -v python3 || true)
+            fi
+        fi
+        [ -n "$PYTHON_BIN" ] || fail "python3 is required to install SSH keys safely"
+        if [ -n "$SSH_KEY" ]; then
+            [ -r "$SSH_KEY" ] || fail "cannot read SSH key file: $SSH_KEY"
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                line=${line%$'\r'}
+                append_key_nofollow "$line" || fail "could not install SSH key safely"
+            done < "$SSH_KEY"
+        fi
+        if [ -n "$SSH_KEY_STRING" ]; then
+            append_key_nofollow "$SSH_KEY_STRING" || fail "could not install SSH key safely"
+        fi
         ok "SSH public key installed for $USERNAME"
     fi
 fi
@@ -209,7 +272,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     if [ "$ADMIN" -eq 1 ]; then
         printf 'administrator: normal shell, no ForceCommand; not in udc-members\n'
     else
-        printf 'member: SSH ForceCommand, no sudo/docker/GPU device groups\n'
+        printf 'member: root-owned login shell, SSH ForceCommand, no sudo/docker/GPU device groups\n'
     fi
 else
     printf '[dry-run] account would be ready: %s\n' "$USERNAME"

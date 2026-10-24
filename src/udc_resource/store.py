@@ -689,9 +689,15 @@ def expire_queue_requests(
     return expired
 
 
-def queue_request_count(connection: sqlite3.Connection) -> int:
+def queue_request_count(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> int:
+    current = now or utcnow()
     row = connection.execute(
-        "SELECT COUNT(*) FROM queue_requests WHERE state = 'queued'"
+        "SELECT COUNT(*) FROM queue_requests WHERE state = 'queued' AND expires_at > ?",
+        (current.isoformat(),),
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -769,7 +775,10 @@ def admit_next_queued(
                     available_gpu_uuids=available_gpu_uuids,
                 )
             except (GpuBusy, InsufficientResources):
-                continue
+                # Strict queue order: a request that cannot run yet blocks
+                # later requests instead of letting them jump ahead.
+                connection.commit()
+                return None
             allocation_id = uuid.uuid4().hex
             starts_at = current
             expires_at = current + timedelta(hours=int(row["hours"]))

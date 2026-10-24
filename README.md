@@ -19,7 +19,7 @@
 - **CLI `udc-resource`**：成员和 admin 的唯一入口；业务结果使用稳定 `--json` envelope。
 - **Broker**：root systemd 服务，只监听 Unix socket，通过 `SO_PEERCRED` 识别 UID。
 - **SQLite**：allocation、GPU claim、settings 和审计事件；WAL + 显式事务。
-- **Docker driver**：整卡 GPU、CPU/RAM 限制、workspace 挂载、到期/释放/重启对账。
+- **Docker driver**：整卡 GPU、CPU/RAM 限制、workspace 挂载、到期/释放/重启对账；开发 profile 支持临时 HOME、可写层配额、容器内 SSH 与 sudo，VS Code 通过 Broker 隧道接入。
 - **Job/file**：tmux 长任务可断线重连并保留日志；文件传输只限个人 workspace。
 - **GUI**：本地 `127.0.0.1` Web UI + xterm.js；只通过 SSH 调用 CLI，不直连 Broker。
 
@@ -30,7 +30,10 @@
 - CLI 是唯一用户业务入口；GUI 的数据请求只调用 CLI `--json`，交互终端只调用 CLI `shell`。
 - GPU 整卡、12h 默认 / 36h 上限；到期停止容器，保留 workspace，不自动续租。
 - 每用户默认最多 4 张 GPU、4 个 active allocation，admin 同样受限。
-- 容器内 root，但不 privileged、不挂 host Docker socket、只挂个人 workspace。
+- 开发容器以成员 UID 运行，容器内提供 passwordless `sudo`；容器 root 不是 host root，host SSH 仍只允许 `ForceCommand` 白名单。
+- 开发容器只挂载个人 `/workspace`，临时 HOME 和系统包随 allocation 消失；禁止 privileged、Docker socket、host PID/network namespace 和 host 系统挂载。
+- Docker 可写层使用 `storage_opt` 配额；`overlay2` + XFS + pquota 预检失败时阻止开发 profile。
+- 成员 SSH 为 key-only，使用 root-owned 登录 shell 和 `PermitUserRC no`；密码、键盘交互和任意 host shell 均不可用。
 - `monitor` 只读、不碰未知容器也不暂停既有 lease；存在 active/pending lease 时使用 `maintenance`，禁止新申请但继续到期/对账。
 
 ## 本地实验室资源
@@ -58,20 +61,24 @@ src/udc_resource/
   db.py              # SQLite schema、连接 PRAGMA、settings
   store.py           # 用户/GPU/claim/allocation/event 事务
   identity.py        # UID/组身份解析与 SO_PEERCRED
+  gpu_audit.py       # 设备指纹与 GPU 权限审计 gate
+  workspace_quota.py # workspace 项目配额 gate
   errors.py          # Broker/CLI 共享错误码与退出码
   stream.py          # shell 长度前缀帧协议
-  cli.py             # CLI：list/status/apply/release/logs/shell/gui/admin/job/push/pull
+  cli.py             # CLI：list/status/apply/release/logs/shell/gui/admin/job/queue/tunnel/vscode
   client.py          # Unix socket 客户端（超时/协议错误）
   login_wrapper.py   # SSH ForceCommand 白名单包装器
   broker/            # UDS Broker、Docker driver、到期 worker、重启对账
   gui/               # 本地 Web GUI、静态资源与 vendored xterm.js
 deploy/
   preflight.sh       # 只读部署预检，不修改主机
-  install_server.sh  # 幂等安装器；--dry-run / --yes / --start
+  install_server.sh  # 幂等安装器；--dry-run / --yes / --start / --no-timers
   create_user.sh     # 成员/管理员账号与 SSH key
+  member-shell.sh    # root-owned 成员登录 shell
   verify_gpu_permissions.sh # 只读全 GPU/NVIDIA 设备权限验收
   verify_monitor_only.sh  # 只读 monitor-only 安全验收
-  systemd/udev/sshd/docker/  # 部署模板
+  docker/            # 开发容器 Dockerfile、sshd_config、bootstrap.sh
+  systemd/udev/sshd/ # 部署模板
 docs/                # 验收、legacy 权限撤销、job 与文件传输文档
 tests/               # 配置、数据库与安全规则测试
 lab/                 # 本地资源清单与说明
@@ -116,6 +123,16 @@ udc-resource queue wait <queue-id> --timeout 3600
 udc-resource release <allocation-id> --json
 udc-resource logs <allocation-id> --tail 200
 udc-resource shell <allocation-id>
+udc-resource shell <allocation-id> --job train
+udc-resource job start <allocation-id> --name train -- python train.py
+udc-resource job list <allocation-id>
+udc-resource job logs <allocation-id> --name train
+udc-resource job attach <allocation-id> --name train
+udc-resource job stop <allocation-id> --name train
+udc-resource tunnel <allocation-id>
+udc-resource vscode <allocation-id>
+udc-resource menu
+udc-resource maintenance
 udc-resource gui --server amax
 udc-resource admin users --json
 udc-resource admin resources --json
@@ -125,7 +142,9 @@ udc-resource admin release <allocation-id> --reason maintenance
 udc-resource admin reconcile --json
 ```
 
-成员通过 SSH `ForceCommand` 只能执行白名单命令；管理员账号保留普通 shell。成员只能使用配置中的基础镜像；管理员可指定其他镜像。
+成员通过 SSH `ForceCommand` 只能执行白名单命令；管理员账号保留普通 shell。成员只能使用配置中的基础镜像或 `image.allowlist` 中的镜像；管理员可指定其他镜像。
+
+`udc-resource vscode <allocation-id>` 只在开发 profile 且 `vscode_enabled=true` 时可用：本地命令通过 SSH 打开 Broker 隧道，Broker 在目标容器内启动 inetd-mode sshd，VS Code 以成员 UID 连接只属于该 allocation 的容器。host SSH 不会因此开放转发或 shell。
 
 ## 本地 GUI
 
@@ -142,7 +161,7 @@ udc-resource gui --server amax --admin-server amax-admin
 ## 部署（仅在训练结束并获批准后）
 
 ```bash
-bash deploy/preflight.sh
+bash deploy/preflight.sh --config lab/resources.local.toml
 bash deploy/audit_legacy.sh --production
 bash deploy/install_server.sh --dry-run --skip-preflight
 bash deploy/install_server.sh --yes
@@ -151,11 +170,17 @@ systemctl start udc-resource-broker
 bash deploy/verify_monitor_only.sh --member udc-alice
 ```
 
-`install_server.sh` 幂等、支持 `--dry-run`，真实修改必须显式 `--yes`；默认只安装、不启动，启动后强制 `monitor` 模式。安装器会把严格审计脚本装到
-`/usr/local/libexec/udc-resource/audit_legacy.sh`。active 配置必须通过
+`install_server.sh` 幂等、支持 `--dry-run`，真实修改必须显式 `--yes`；默认只安装、不启动，启动后强制 `monitor` 模式。默认启用磁盘告警和日志轮转 timer，可用 `--no-timers` 关闭。安装器会把严格审计脚本、GPU 权限验收脚本和 root-owned 成员 shell 装到 `/usr/local/libexec/udc-resource/`。active 配置必须通过
 `audit_legacy.sh --production`，且 Broker 在启动和每次切换到 active 前都会重新执行审计；
 `/root/.ssh/authorized_keys` 非空默认阻断，只有显式设置 `allow_root_ssh_keys=true`
 才降级为告警。`verify_monitor_only.sh` 只读，不会停止容器。
+
+开发 profile 部署前，`preflight.sh` 会检查 Docker 驱动为 `overlay2`、DockerRootDir 位于带
+`prjquota`/`pquota` 的 XFS、`xfs_quota` 可用，并检查 workspace 项目配额和
+`nosuid` 挂载；任一条件不满足时阻止可写层开发容器。容器内 sudo 得到的 root 在没有
+user namespace 时就是宿主 root，`nosuid` 防止它通过 workspace bind 写入宿主可执行的
+setuid/文件能力文件。成员 SSH 使用 key-only、root-owned 登录 shell 和 `PermitUserRC no`；
+已存在的成员需要运行 `deploy/create_user.sh --yes <user>` 迁移到新 shell，否则 active 审计会阻断。
 
 NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-uvm`、
 `nvidia-uvm-tools`、`nvidia-modeset` 等可能在 `misc` 子系统的节点；验收脚本会检查
@@ -182,4 +207,4 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python -c "from udc_resource.config import load_config; c=load_config('lab/resources.example.toml'); print(c.server.name, c.policy.default_hours, c.policy.global_max_cpus, c.policy.max_cpus_per_user)"
 ```
 
-依赖更新后运行 `uv lock`；部署前运行 `bash deploy/preflight.sh`（只读）。不要在没有管理员批准和训练结束确认的情况下执行任何会修改主机的 `deploy/` 脚本。
+依赖更新后运行 `uv lock`；部署前运行 `bash deploy/preflight.sh --config lab/resources.local.toml`（只读）。不要在没有管理员批准和训练结束确认的情况下执行任何会修改主机的 `deploy/` 脚本。

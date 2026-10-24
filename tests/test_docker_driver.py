@@ -1,3 +1,4 @@
+import struct
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -7,7 +8,7 @@ import pytest
 from docker.errors import NotFound
 
 from udc_resource.broker import docker_driver
-from udc_resource.broker.docker_driver import DockerDriver
+from udc_resource.broker.docker_driver import DockerDriver, DockerTunnelSession
 from udc_resource.errors import DockerError
 from udc_resource.models import Allocation
 
@@ -64,6 +65,61 @@ class FakeContainers:
 class FakeClient:
     def __init__(self) -> None:
         self.containers = FakeContainers()
+        self.info_data: dict = {}
+        self.api = FakeAPI()
+
+    def info(self) -> dict:
+        return self.info_data
+
+
+class FakeSocket:
+    def __init__(self, data: bytes) -> None:
+        self.data = bytearray(data)
+        self.sent = bytearray()
+        self.closed = False
+        self.shutdown_called = False
+
+    def recv(self, size: int) -> bytes:
+        chunk = bytes(self.data[:size])
+        del self.data[:size]
+        return chunk
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+    def shutdown(self, how: int) -> None:
+        self.shutdown_called = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class StrictSocket(FakeSocket):
+    """Fail if a read waits for a frame that has not arrived yet."""
+
+    def recv(self, size: int) -> bytes:
+        chunk = super().recv(size)
+        if not chunk:
+            raise AssertionError("tunnel read waited for more data")
+        return chunk
+
+
+class FakeAPI:
+    def __init__(self) -> None:
+        self.exec_create_kwargs: dict | None = None
+        self.exec_start_kwargs: dict | None = None
+        self.exit_code = 0
+
+    def exec_create(self, container_id: str, **kwargs) -> dict:
+        self.exec_create_kwargs = {"container_id": container_id, **kwargs}
+        return {"Id": "exec-1"}
+
+    def exec_start(self, exec_id: str, **kwargs) -> bytes:
+        self.exec_start_kwargs = {"exec_id": exec_id, **kwargs}
+        return b""
+
+    def exec_inspect(self, exec_id: str) -> dict:
+        return {"ExitCode": self.exit_code}
 
 
 def _allocation(tmp_path: Path) -> Allocation:
@@ -117,6 +173,7 @@ def test_create_container_uses_expected_isolation(monkeypatch, active_config, tm
         "udc.owner": "alice",
         "udc.allocation": allocation.id,
         "udc.gpus": "GPU-3,GPU-5",
+        "udc.profile": "restricted",
     }
     assert kwargs["nano_cpus"] == 8_000_000_000
     assert kwargs["mem_limit"] == "32g"
@@ -136,6 +193,235 @@ def test_create_container_uses_expected_isolation(monkeypatch, active_config, tm
     device_request = kwargs["device_requests"][0]
     assert device_request.device_ids == ["GPU-3", "GPU-5"]
     assert device_request.capabilities == [["gpu"]]
+
+
+def test_development_profile_creates_disposable_admin_container(active_config, tmp_path):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            container_home="",
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    allocation = _allocation(tmp_path)
+    driver.create_container(allocation)
+    kwargs = fake_client.containers.run_kwargs
+    assert kwargs is not None
+    assert kwargs["read_only"] is False
+    assert "security_opt" not in kwargs
+    assert kwargs["cap_drop"] == ["ALL"]
+    assert "SETUID" in kwargs["cap_add"]
+    assert "SETGID" in kwargs["cap_add"]
+    assert kwargs["storage_opt"] == {"size": "20G"}
+    assert kwargs["labels"]["udc.profile"] == "development"
+    assert kwargs["environment"]["HOME"] == "/home/alice"
+    assert "/home/alice" in kwargs["tmpfs"]
+    assert "mode=0700" in kwargs["tmpfs"]["/home/alice"]
+    assert kwargs["volumes"] == {allocation.workspace: {"bind": "/workspace", "mode": "rw"}}
+
+
+def test_storage_preflight_rejects_non_overlay_driver(monkeypatch, active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    fake_client.info_data = {"Driver": "vfs", "DockerRootDir": "/var/lib/docker"}
+    driver._client = fake_client
+    monkeypatch.setattr(docker_driver.os, "name", "posix")
+    passed, detail = driver.storage_preflight()
+    assert passed is False
+    assert "overlay2" in detail
+
+
+def test_storage_preflight_accepts_overlay_on_xfs_prjquota(monkeypatch, active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": "/var/lib/docker"}
+    driver._client = fake_client
+    Path(config.server.workspace_root).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(docker_driver.os, "name", "posix")
+    monkeypatch.setattr(docker_driver.shutil, "which", lambda name: "/usr/bin/findmnt")
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="xfs rw,relatime,prjquota,nosuid\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(docker_driver.subprocess, "run", fake_run)
+    passed, detail = driver.storage_preflight()
+    assert passed is True
+    assert "nosuid workspace" in detail
+
+
+def test_storage_preflight_requires_nosuid_workspace(monkeypatch, active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": "/var/lib/docker"}
+    driver._client = fake_client
+    Path(config.server.workspace_root).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(docker_driver.os, "name", "posix")
+    monkeypatch.setattr(docker_driver.shutil, "which", lambda name: "/usr/bin/findmnt")
+
+    def fake_run(command, **kwargs):
+        options = (
+            "xfs rw,relatime,prjquota\n"
+            if command[-1] == "/var/lib/docker"
+            else "xfs rw,relatime\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=options, stderr="")
+
+    monkeypatch.setattr(docker_driver.subprocess, "run", fake_run)
+    passed, detail = driver.storage_preflight()
+    assert passed is False
+    assert "nosuid" in detail
+
+
+def test_prepare_container_ssh_installs_keys_as_root(active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    driver.prepare_container_ssh(
+        "container-1",
+        1000,
+        1000,
+        "alice",
+        ["ssh-ed25519 AAAATEST alice@example"],
+        "/home/alice",
+    )
+    kwargs = fake_client.api.exec_create_kwargs
+    assert kwargs is not None
+    assert kwargs["user"] == "0:0"
+    script = kwargs["cmd"][2]
+    assert "ssh-ed25519 AAAATEST alice@example" in script
+    assert "authorized_keys" in script
+    assert "mkdir -p /run/sshd" in script
+    assert "ssh-keygen -A" in script
+    assert "chown 1000:1000" in script
+    assert "awk -F: -v OFS=:" in script
+    assert "$3 == uid" in script
+    assert "conflicting system user" in script
+    assert "flock 9" in script
+
+
+def test_prepare_container_ssh_rejects_root_uid(active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+        ),
+    )
+    driver = DockerDriver(config)
+    driver._client = FakeClient()
+    with pytest.raises(DockerError, match="non-root"):
+        driver.prepare_container_ssh(
+            "container-1",
+            0,
+            0,
+            "root",
+            ["ssh-ed25519 AAAATEST"],
+            "/home/root",
+        )
+
+
+def test_prepare_container_ssh_requires_development_profile(active_config):
+    driver = DockerDriver(active_config)
+    driver._client = FakeClient()
+    with pytest.raises(DockerError, match="development"):
+        driver.prepare_container_ssh(
+            "container-1",
+            1000,
+            1000,
+            "alice",
+            ["ssh-ed25519 AAAATEST"],
+            "/home/alice",
+        )
+
+
+def test_docker_tunnel_session_demultiplexes_stdout_and_stderr():
+    def frame(stream: int, payload: bytes) -> bytes:
+        return bytes([stream, 0, 0, 0]) + struct.pack(">I", len(payload)) + payload
+
+    sock = FakeSocket(frame(1, b"abc") + frame(2, b"error") + frame(1, b"def"))
+    session = DockerTunnelSession(sock)
+    assert session.read(3) == b"abc"
+    assert session.read(10) == b"def"
+    assert bytes(session._stderr) == b"error"
+    assert session.read(10) == b""
+    session.write(b"input")
+    session.resize(80, 24)
+    session.close()
+    assert bytes(sock.sent) == b"input"
+    assert sock.closed is True
+
+
+def test_docker_tunnel_session_truncated_header_closes_stream():
+    sock = FakeSocket(b"\x01\x00")
+    session = DockerTunnelSession(sock)
+    assert session.read(10) == b""
+
+
+def test_docker_tunnel_session_returns_short_stdout_frame_without_waiting():
+    def frame(stream: int, payload: bytes) -> bytes:
+        return bytes([stream, 0, 0, 0]) + struct.pack(">I", len(payload)) + payload
+
+    # Only one small SSH packet is available. A read must return it immediately
+    # instead of waiting for the next frame, which cannot arrive until the peer
+    # replies.
+    sock = StrictSocket(frame(1, b"SSH-2.0-OpenSSH_9.6\r\n"))
+    session = DockerTunnelSession(sock)
+    assert session.read(65536) == b"SSH-2.0-OpenSSH_9.6\r\n"
 
 
 def test_remove_container_stops_and_removes(active_config):

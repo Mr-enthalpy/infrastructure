@@ -8,7 +8,20 @@ import shutil
 import sys
 from pathlib import Path
 
-ALLOWED = {"list", "status", "apply", "release", "shell", "logs", "job", "file", "menu", "version"}
+ALLOWED = {
+    "list",
+    "status",
+    "apply",
+    "release",
+    "shell",
+    "logs",
+    "job",
+    "file",
+    "queue",
+    "tunnel",
+    "menu",
+    "version",
+}
 DENIED_TOKENS = {";", "&&", "||", "|", ">", ">>", "<", "&"}
 
 
@@ -44,7 +57,9 @@ def main() -> None:
     except (ValueError, FileNotFoundError) as exc:
         print(f"udc-resource: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
-    os.environ.setdefault("UDC_RESOURCE_CONFIG", "/etc/udc-resource/config.toml")
+    # Never honor a config path from the SSH session; members must use the
+    # administrator-installed policy.
+    os.environ["UDC_RESOURCE_CONFIG"] = "/etc/udc-resource/config.toml"
     os.execv(executable, argv)
 
 

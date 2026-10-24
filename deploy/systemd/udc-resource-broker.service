@@ -20,13 +20,18 @@ RestartSec=3
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
+# The broker reads member authorized_keys for container SSH and runs the GPU
+# audit as members. Home directories must stay readable, but never writable.
+ProtectHome=read-only
 ProtectSystem=strict
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 ReadWritePaths=/var/lib/udc-resource /run/udc-resource
 ReadWritePaths=-/data1/udc-users
+# Docker's Unix socket is a file path; keep it usable under ProtectSystem=strict.
+ReadWritePaths=-/run/docker.sock
+ReadWritePaths=-/var/run/docker.sock
 
 [Install]
 WantedBy=multi-user.target

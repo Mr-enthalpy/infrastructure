@@ -77,8 +77,8 @@ printf '[info] workspace root: %s\n' "$ROOT"
 printf '[info] mount: %s (%s), hard=%s GiB soft=%s GiB\n' "$MOUNT" "$FSTYPE" "$HARD_GB" "$SOFT_GB"
 
 if [ "$FSTYPE" = "xfs" ]; then
-    if ! printf '%s\n' "$OPTIONS" | grep -qx prjquota; then
-        printf '[fail] XFS mount %s lacks prjquota; add prjquota to the mount options during a maintenance window\n' "$MOUNT" >&2
+    if ! printf '%s\n' "$OPTIONS" | grep -Eq '^(prjquota|pquota)$'; then
+        printf '[fail] XFS mount %s lacks prjquota/pquota; add it to the mount options during a maintenance window\n' "$MOUNT" >&2
         exit 2
     fi
     have xfs_quota || { printf 'xfs_quota not found\n' >&2; exit 2; }
@@ -96,8 +96,8 @@ if [ "$FSTYPE" = "xfs" ]; then
         xfs_quota -x -c "limit -p bsoft=${SOFT_GB}g bhard=${HARD_GB}g $uid" "$MOUNT" || { printf '[fail] could not set quota %s\n' "$uid" >&2; exit 1; }
     done
 elif [ "$FSTYPE" = "ext4" ] || [ "$FSTYPE" = "ext3" ] || [ "$FSTYPE" = "ext2" ]; then
-    if ! printf '%s\n' "$OPTIONS" | grep -qx prjquota; then
-        printf '[fail] %s mount %s lacks prjquota; enable project quota during a maintenance window\n' "$FSTYPE" "$MOUNT" >&2
+    if ! printf '%s\n' "$OPTIONS" | grep -Eq '^(prjquota|pquota)$'; then
+        printf '[fail] %s mount %s lacks prjquota/pquota; enable project quota during a maintenance window\n' "$FSTYPE" "$MOUNT" >&2
         exit 2
     fi
     have chattr || { printf 'chattr not found\n' >&2; exit 2; }
@@ -108,13 +108,13 @@ elif [ "$FSTYPE" = "ext4" ] || [ "$FSTYPE" = "ext3" ] || [ "$FSTYPE" = "ext2" ];
         [ "$uid" -gt 0 ] || continue
         printf '[info] project %s -> %s\n' "$uid" "$path"
         if [ "$DRY_RUN" -eq 1 ]; then
-            printf '[dry-run] chattr -p %s %s\n' "$uid" "$path"
-            printf '[dry-run] chattr +P %s\n' "$path"
+            printf '[dry-run] chattr -R -p %s %s\n' "$uid" "$path"
+            printf '[dry-run] find %s -type d -exec chattr +P {} +\n' "$path"
             printf '[dry-run] setquota -P %s %s %s 0 0 %s\n' "$uid" "$((SOFT_GB * 1024 * 1024))" "$((HARD_GB * 1024 * 1024))" "$MOUNT"
             continue
         fi
-        chattr -p "$uid" "$path" || { printf '[fail] could not assign project %s\n' "$uid" >&2; exit 1; }
-        chattr +P "$path" || { printf '[fail] could not enable project inheritance on %s\n' "$path" >&2; exit 1; }
+        chattr -R -p "$uid" "$path" || { printf '[fail] could not assign project %s\n' "$uid" >&2; exit 1; }
+        find "$path" -type d -exec chattr +P {} + || { printf '[fail] could not enable project inheritance on %s\n' "$path" >&2; exit 1; }
         setquota -P "$uid" "$((SOFT_GB * 1024 * 1024))" "$((HARD_GB * 1024 * 1024))" 0 0 "$MOUNT" || { printf '[fail] could not set quota %s\n' "$uid" >&2; exit 1; }
     done
 else

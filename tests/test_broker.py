@@ -6,15 +6,17 @@ from pathlib import Path
 
 import pytest
 
-from tests.fakes import FakeDocker, FakeIdentityResolver
+from tests.fakes import FakeDocker, FakeIdentityResolver, FakeShellSession
 from udc_resource import store
 from udc_resource.broker import workspace_io
 from udc_resource.broker.docker_driver import ContainerInfo, GPUProcess
 from udc_resource.broker.server import Broker
 from udc_resource.db import connect, init_db
+from udc_resource.gpu_audit import GpuAuditResult
 from udc_resource.identity import Identity
 from udc_resource.legacy_audit import LegacyAuditResult
 from udc_resource.models import GPU
+from udc_resource.workspace_quota import QuotaCheckResult
 
 FIXED = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 ALICE = Identity(uid=1000, gid=1000, username="alice", role="member", is_admin=False)
@@ -28,6 +30,9 @@ def _broker(
     *,
     docker: FakeDocker | None = None,
     legacy_audit=None,
+    gpu_audit=None,
+    quota_check=None,
+    clock=None,
 ):
     fake_docker = docker or FakeDocker()
     resolver = FakeIdentityResolver(
@@ -44,7 +49,9 @@ def _broker(
         docker=fake_docker,
         identity_resolver=resolver,
         legacy_audit=legacy_audit,
-        clock=lambda: FIXED,
+        gpu_audit=gpu_audit,
+        quota_check=quota_check,
+        clock=clock or (lambda: FIXED),
     )
     broker.initialize()
     return broker, fake_docker
@@ -98,6 +105,259 @@ async def test_admin_active_rechecks_audit_even_after_startup(tmp_path, active_c
     assert blocked["ok"] is False
     assert "new root key appeared" in blocked["error"]["message"]
     assert calls == 2
+
+
+async def test_gpu_audit_failure_blocks_new_allocations(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, gpu_audit_required=True),
+    )
+    calls = 0
+
+    def audit():
+        nonlocal calls
+        calls += 1
+        if calls >= 3:
+            return GpuAuditResult(False, "GPU node permissions changed", fingerprint="fp")
+        return GpuAuditResult(True, "clean", fingerprint="fp")
+
+    broker, _ = _broker(tmp_path, config, gpu_audit=audit)
+    first = await _call(
+        broker,
+        "apply",
+        {"gpus": [3], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert first["ok"] is True
+    second = await _call(
+        broker,
+        "apply",
+        {"gpus": [4], "cpus": 8, "memory_gb": 32},
+        BOB,
+    )
+    assert second["ok"] is False
+    assert second["error"]["code"] == "conflict"
+    assert "GPU permission audit" in second["error"]["message"]
+    status = await _call(broker, "status", {"id": first["data"]["id"]}, ALICE)
+    assert status["data"]["allocation"]["status"] == "active"
+
+
+async def test_gpu_audit_failure_at_startup_forces_monitor(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, gpu_audit_required=True),
+    )
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        gpu_audit=lambda: GpuAuditResult(False, "bad device", fingerprint="fp"),
+    )
+    ping = await _call(broker, "ping", {}, ALICE)
+    assert ping["data"]["mode"] == "monitor"
+    blocked = await _call(broker, "admin_mode", {"mode": "active"}, ADMIN)
+    assert blocked["ok"] is False
+    assert "GPU permission audit" in blocked["error"]["message"]
+
+
+async def test_quota_failure_blocks_new_allocations(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, workspace_quota_required=True),
+    )
+    calls = 0
+
+    def quota():
+        nonlocal calls
+        calls += 1
+        if calls >= 3:
+            return QuotaCheckResult(False, "project quota is unavailable")
+        return QuotaCheckResult(True, "ok")
+
+    broker, _ = _broker(tmp_path, config, quota_check=quota)
+    first = await _call(
+        broker,
+        "apply",
+        {"gpus": [2], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert first["ok"] is True
+    second = await _call(
+        broker,
+        "apply",
+        {"gpus": [1], "cpus": 8, "memory_gb": 32},
+        BOB,
+    )
+    assert second["ok"] is False
+    assert "workspace quota" in second["error"]["message"]
+
+
+async def test_development_storage_preflight_failure_keeps_monitor(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+        ),
+    )
+    fake = FakeDocker()
+    fake.storage_ok = False
+    fake.storage_detail = "overlay2 on XFS with pquota is unavailable"
+    broker, _ = _broker(tmp_path, config, docker=fake)
+    ping = await _call(broker, "ping", {}, ALICE)
+    assert ping["data"]["mode"] == "monitor"
+    listed = await _call(broker, "list", {}, ALICE)
+    assert listed["data"]["storage"]["ok"] is False
+    assert "pquota" in listed["data"]["storage"]["message"]
+
+
+async def test_no_queue_cannot_bypass_pending_requests(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    first = await _call(
+        broker,
+        "apply",
+        {"gpus": [0], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert first["ok"] is True
+    queued = await _call(
+        broker,
+        "apply",
+        {"gpus": [0], "cpus": 8, "memory_gb": 32},
+        BOB,
+    )
+    assert queued["data"]["status"] == "queued"
+    direct = await _call(
+        broker,
+        "apply",
+        {"cpus": 4, "memory_gb": 8, "queue": False},
+        ALICE,
+    )
+    assert direct["ok"] is False
+    assert "queued requests are pending" in direct["error"]["message"]
+
+
+async def test_queue_admits_oldest_request_first(tmp_path, active_config):
+    now = [FIXED]
+
+    def clock():
+        return now[0]
+
+    broker, _ = _broker(tmp_path, active_config, clock=clock)
+    first = await _call(
+        broker,
+        "apply",
+        {"gpus": [0], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    now[0] = FIXED + timedelta(seconds=1)
+    older = await _call(
+        broker,
+        "apply",
+        {"gpus": [0], "cpus": 8, "memory_gb": 32},
+        BOB,
+    )
+    now[0] = FIXED + timedelta(seconds=2)
+    later = await _call(
+        broker,
+        "apply",
+        {"gpus": [0], "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert older["data"]["status"] == "queued"
+    assert later["data"]["status"] == "queued"
+    released = await _call(broker, "release", {"id": first["data"]["id"]}, ALICE)
+    assert released["ok"] is True
+    admitted = await _call(
+        broker,
+        "queue_get",
+        {"id": older["data"]["queue_id"]},
+        BOB,
+    )
+    assert admitted["data"]["queue"]["status"] == "admitted"
+    still_queued = await _call(
+        broker,
+        "queue_get",
+        {"id": later["data"]["queue_id"]},
+        ALICE,
+    )
+    assert still_queued["data"]["queue"]["status"] == "queued"
+
+
+def test_managed_container_match_requires_container_owner_and_gpus(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    gpus = [{"uuid": "GPU-1", "index": 1}]
+    allocations = {
+        "alloc-1": {
+            "id": "alloc-1",
+            "container_id": "container-1",
+            "owner": "alice",
+            "gpu_uuids": ["GPU-1"],
+        }
+    }
+    container = ContainerInfo(
+        id="container-1",
+        name="udc-alice",
+        image="udc-base:2026.10",
+        status="running",
+        labels={
+            "udc.managed": "true",
+            "udc.allocation": "alloc-1",
+            "udc.owner": "alice",
+        },
+        gpu_refs=("GPU-1",),
+    )
+    assert broker._managed_container_matches(container, allocations, gpus) is True
+    wrong_owner = ContainerInfo(
+        id="container-1",
+        name="udc-alice",
+        image="udc-base:2026.10",
+        status="running",
+        labels={
+            "udc.managed": "true",
+            "udc.allocation": "alloc-1",
+            "udc.owner": "bob",
+        },
+        gpu_refs=("GPU-1",),
+    )
+    assert broker._managed_container_matches(wrong_owner, allocations, gpus) is False
+    wrong_container = ContainerInfo(
+        id="container-2",
+        name="udc-alice",
+        image="udc-base:2026.10",
+        status="running",
+        labels=container.labels,
+        gpu_refs=("GPU-1",),
+    )
+    assert broker._managed_container_matches(wrong_container, allocations, gpus) is False
+    wrong_gpu = ContainerInfo(
+        id="container-1",
+        name="udc-alice",
+        image="udc-base:2026.10",
+        status="running",
+        labels=container.labels,
+        gpu_refs=("GPU-2",),
+    )
+    assert broker._managed_container_matches(wrong_gpu, allocations, gpus) is False
+
+
+async def test_relay_tunnel_closes_session_on_completion(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+
+    class Writer:
+        def write(self, data: bytes) -> None:
+            del data
+
+        async def drain(self) -> None:
+            return None
+
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    session = FakeShellSession()
+    await broker._relay_tunnel(reader, Writer(), session)  # type: ignore[arg-type]
+    assert session.closed is True
 
 
 async def test_queue_admits_after_release(tmp_path, active_config):
