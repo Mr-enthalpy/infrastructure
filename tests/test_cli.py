@@ -679,28 +679,31 @@ def test_vscode_config_install_is_locked(tmp_path):
     import threading
 
     if os.name == "posix":
-        holder = threading.Thread(target=cli._managed_config_lock(tmp_path / "c").__enter__)
-        # Acquire the lock in another thread and confirm a second attempt
-        # with a tiny timeout fails instead of silently corrupting state.
         started = threading.Event()
         release = threading.Event()
+        # Hold a reference for the thread's lifetime: a discarded context
+        # manager is closed by the garbage collector, releasing the lock.
+        holder_cm = cli._managed_config_lock(tmp_path / "c", timeout=5)
 
         def hold():
-            with cli._managed_config_lock(tmp_path / "c"):
+            with holder_cm:
                 started.set()
                 release.wait(5)
 
+        holder = threading.Thread(target=hold)
         holder.start()
-        assert started.wait(5)
-        blocked = False
         try:
-            with cli._managed_config_lock(tmp_path / "c", timeout=0.2):
-                pass
-        except OSError:
-            blocked = True
-        assert blocked
-        release.set()
-        holder.join(5)
+            assert started.wait(5)
+            blocked = False
+            try:
+                with cli._managed_config_lock(tmp_path / "c", timeout=0.2):
+                    pass
+            except OSError:
+                blocked = True
+            assert blocked
+        finally:
+            release.set()
+            holder.join(5)
         # After release the lock is acquirable again.
         with cli._managed_config_lock(tmp_path / "c", timeout=5):
             pass
