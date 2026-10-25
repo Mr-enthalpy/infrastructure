@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from udc_resource import cli
@@ -502,11 +503,62 @@ def test_remote_mode_relays_command(monkeypatch):
 
 
 def test_remote_mode_rejects_local_only_commands(monkeypatch):
-    for head in ("shell", "vscode", "gui", "tunnel", "file"):
+    for head in ("shell", "vscode", "gui", "tunnel", "file", "connect"):
         result = runner.invoke(cli.app, ["--remote", "amax", head, "alloc-1"])
         assert result.exit_code != 0, head
+
+
+def test_connect_command_builds_ssh_relay(monkeypatch):
+    import subprocess as subprocess_module
+
+    recorded = {}
+
+    def fake_run(argv, **kwargs):
+        recorded["argv"] = list(argv)
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result = _invoke(monkeypatch, FakeClient(), ["connect", "alloc-1", "--job", "train"])
+    assert result.exit_code == 0
+    assert "-t" in recorded["argv"] and recorded["argv"].count("-t") == 2
+    assert recorded["argv"][-1] == "udc-resource shell alloc-1 --job train"
+
+
+def test_connect_command_rejects_bad_job_name(monkeypatch):
+    result = _invoke(monkeypatch, FakeClient(), ["connect", "alloc-1", "--job", "bad job"])
+    assert result.exit_code != 0
 
 
 def test_remote_mode_rejects_job_attach(monkeypatch):
     result = runner.invoke(cli.app, ["--remote", "amax", "job", "attach", "alloc-1"])
     assert result.exit_code != 0
+
+
+def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
+    """A failed probe must still remove the managed SSH block."""
+    import asyncio as asyncio_module
+
+    from udc_resource.config import load_config
+
+    async def failing_probe(host, ssh_config, timeout):
+        raise RuntimeError("probe boom")
+
+    monkeypatch.setattr(cli, "_probe_container_ssh", failing_probe)
+    config = load_config(CONFIG)
+    ssh_config_path = tmp_path / "config"
+    with pytest.raises(RuntimeError, match="probe boom"):
+        asyncio_module.run(
+            cli._serve_vscode_tunnel(
+                config=config,
+                allocation_id="abc123",
+                username="alice",
+                ssh_alias="amax",
+                host="udc-abc123",
+                requested_port=0,
+                ssh_config=ssh_config_path,
+                identity=None,
+                launch_code=True,
+            )
+        )
+    text = ssh_config_path.read_text(encoding="utf-8") if ssh_config_path.exists() else ""
+    assert "udc-abc123" not in text

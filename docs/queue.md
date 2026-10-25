@@ -42,6 +42,9 @@ allocation；容器创建或 workspace 准备失败时，将 allocation 标记�
 
 - 一个被阻塞的请求（GPU 忙、预算不足）会"封锁"它所申请的 GPU；后续请求只有
   在申请的 GPU 与所有被封锁 GPU 完全不相交时才允许越过它。
+- 任何被阻塞的请求——包括 CPU-only——都会触发 backfill 门控与饥饿保护；
+  封锁的 GPU 集合只用于判断 GPU 冲突。`queue_backfill_enabled = false` 时
+  CPU-only 队首同样严格阻塞后续请求。
 - 后来的请求永远拿不到队首正在等待的资源——竞争同一 GPU 的请求保持 FIFO。
 - 饥饿保护：一旦某个被阻塞的请求等待超过
   `queue_backfill_reserve_minutes`（默认 30），backfill 完全停止，队首请求在

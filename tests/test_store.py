@@ -380,3 +380,141 @@ def test_create_allocation_cannot_bypass_pending_queue(tmp_path):
     allocation_id = _create(connection, gpus=("GPU-3",))
     assert allocation_id
     connection.close()
+
+
+def test_cpu_only_blocked_head_stops_backfill(tmp_path):
+    """A CPU-only head blocked on the CPU budget must block later requests.
+
+    The blocked head claims no GPUs, so the old blocked_gpu_uuids-only check
+    let later CPU-only requests through even with backfill disabled.
+    """
+    connection = _connection(tmp_path)
+    store.ensure_user(connection, uid=1001, username="bob", role="member", now=NOW)
+    store.ensure_user(connection, uid=1002, username="carol", role="member", now=NOW)
+    _create(connection, gpus=(), cpus=84.0, memory_gb=64, max_cpus=100.0, max_memory_gb=219)
+    head = store.create_queue_request(
+        connection,
+        owner_uid=1001,
+        owner_name="bob",
+        requested_gpus=[],
+        cpus=32.0,
+        memory_gb=32,
+        hours=12,
+        image="udc-base:2026.10",
+        workspace="/data1/udc-users/bob",
+        note="",
+        max_queue_length=10,
+        max_queued_allocations_per_user=4,
+        max_queue_hours=24,
+        now=NOW,
+    )
+    tail = store.create_queue_request(
+        connection,
+        owner_uid=1002,
+        owner_name="carol",
+        requested_gpus=[],
+        cpus=8.0,
+        memory_gb=8,
+        hours=12,
+        image="udc-base:2026.10",
+        workspace="/data1/udc-users/carol",
+        note="",
+        max_queue_length=10,
+        max_queued_allocations_per_user=4,
+        max_queue_hours=24,
+        now=NOW,
+    )
+    # With backfill disabled, the CPU-only blocked head must block later
+    # requests too: the blocked set is not GPU-specific.
+    admitted = store.admit_next_queued(
+        connection,
+        max_cpus=100.0,
+        max_memory_gb=219,
+        max_cpus_per_user=64.0,
+        max_memory_gb_per_user=192,
+        max_gpus_per_user=4,
+        max_active_allocations_per_user=4,
+        backfill_enabled=False,
+        now=NOW,
+    )
+    assert admitted is None
+    states = {
+        str(row["id"]): str(row["state"])
+        for row in connection.execute("SELECT id, state FROM queue_requests").fetchall()
+    }
+    assert states[head] == "queued"
+    assert states[tail] == "queued"
+    # Within the reserve window and with backfill enabled, the small tail may
+    # run past the blocked head (documented backfill behavior).
+    admitted = store.admit_next_queued(
+        connection,
+        max_cpus=100.0,
+        max_memory_gb=219,
+        max_cpus_per_user=64.0,
+        max_memory_gb_per_user=192,
+        max_gpus_per_user=4,
+        max_active_allocations_per_user=4,
+        backfill_enabled=True,
+        now=NOW,
+    )
+    assert admitted is not None
+    connection.close()
+
+
+def test_cpu_only_head_starvation_guard_blocks_later_requests(tmp_path):
+    connection = _connection(tmp_path)
+    store.ensure_user(connection, uid=1001, username="bob", role="member", now=NOW)
+    store.ensure_user(connection, uid=1002, username="carol", role="member", now=NOW)
+    _create(connection, gpus=(), cpus=84.0, memory_gb=64, max_cpus=100.0, max_memory_gb=219)
+    store.create_queue_request(
+        connection,
+        owner_uid=1001,
+        owner_name="bob",
+        requested_gpus=[],
+        cpus=32.0,
+        memory_gb=32,
+        hours=12,
+        image="udc-base:2026.10",
+        workspace="/data1/udc-users/bob",
+        note="",
+        max_queue_length=10,
+        max_queued_allocations_per_user=4,
+        max_queue_hours=24,
+        now=NOW,
+    )
+    tail = store.create_queue_request(
+        connection,
+        owner_uid=1002,
+        owner_name="carol",
+        requested_gpus=[],
+        cpus=8.0,
+        memory_gb=8,
+        hours=12,
+        image="udc-base:2026.10",
+        workspace="/data1/udc-users/carol",
+        note="",
+        max_queue_length=10,
+        max_queued_allocations_per_user=4,
+        max_queue_hours=24,
+        now=NOW,
+    )
+    admitted = store.admit_next_queued(
+        connection,
+        max_cpus=100.0,
+        max_memory_gb=219,
+        max_cpus_per_user=64.0,
+        max_memory_gb_per_user=192,
+        max_gpus_per_user=4,
+        max_active_allocations_per_user=4,
+        backfill_reserve_minutes=30,
+        now=NOW + timedelta(minutes=45),
+    )
+    assert admitted is None
+    state = str(
+        connection.execute(
+            "SELECT state FROM queue_requests WHERE id = ?",
+            (tail,),
+        ).fetchone()[0]
+    )
+    assert state == "queued"
+    connection.close()

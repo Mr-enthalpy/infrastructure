@@ -84,8 +84,13 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     连接配置（幂等重跑身份脚本作为防御）。
   - 默认 HOME 位于容器可写层内（受 storage_opt 配额约束、随容器销毁）；
     `container_home_tmpfs_gb > 0` 时改为等容量 tmpfs。
+  - 容器身份初始化同时建立与宿主 udc-gpu 同 GID 的容器内补充组并把成员加入
+    （sshd 登录从容器 /etc/group 重建补充组，docker group_add 只覆盖 exec 路径）；
+    验收要求两条登录路径分别检查 `id -G`、`nvidia-smi`、`torch.cuda`。
   - GUI VS Code 按钮通过 `--readiness-file` JSON 协议等待真实就绪
-    （listening/ready/error），并显式传递配置路径；不再假成功。
+    （listening/tunnel_verified/ready/error），并显式传递配置路径；不再假成功。
+    隧道全程 try/finally：探测失败也会清理 SSH 配置块、监听器和子进程。
+    code CLI 缺失时不写 ready，readiness 带 message，GUI 展示可复制的 URI。
   - GUI 提供 job 启动（整条 shell 命令原样传递，容器内以 `bash -lc` 执行）与
     `/workspace/.udc-logs/` 持久日志查看；release 后仍可列出/读取历史日志
     （`job files`、`job_logs` 不要求 active）。
@@ -161,6 +166,8 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
   `docker_storage_budget_gb`）在真实主机上的阈值行为。
 - 队列 backfill 与饥饿保护在真实多用户并发下的行为（逻辑已在 DB 层测试，但
   实机 clock/GPU 状态变化更复杂）。
+- VS Code 会话内的 GPU 设备访问：`id -G` 含 udc-gpu GID、`nvidia-smi -L`、
+  `torch.cuda.is_available()`；与 docker-exec 路径分别验收（见 acceptance 5.5）。
 
 ## 6. 下一会话执行顺序
 

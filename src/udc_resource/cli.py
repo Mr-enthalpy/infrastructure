@@ -636,36 +636,42 @@ async def _serve_vscode_tunnel(
         server.close()
         raise RuntimeError("could not bind the local VS Code tunnel")
     port = int(sockets[0].getsockname()[1])
-    block = _managed_block(allocation_id, host, port, username, identity)
-    created = _install_managed_block(ssh_config, allocation_id, block)
     remote_uri = f"vscode-remote://ssh-remote+{host}/workspace"
-    _write_readiness(
-        readiness_file,
-        "listening",
-        port=port,
-        uri=remote_uri,
-    )
-    typer.echo(f"local tunnel: 127.0.0.1:{port} -> {host} (allocation {allocation_id})")
-    typer.echo(f"ssh config: {ssh_config}")
-    probe_timeout = max(30, config.gui.connect_timeout * 2)
+    created = False
     try:
-        typer.echo("verifying container SSH connection…")
-        await _probe_container_ssh(host, ssh_config, probe_timeout)
-    except (RuntimeError, OSError, TimeoutError) as exc:
-        message = f"container SSH probe failed: {exc}"
-        _write_readiness(readiness_file, "error", code="probe_failed", message=message)
-        raise RuntimeError(str(exc)) from exc
-    _write_readiness(
-        readiness_file,
-        "tunnel_verified",
-        port=port,
-        uri=remote_uri,
-    )
-    typer.echo("container SSH verified")
-    try:
+        block = _managed_block(allocation_id, host, port, username, identity)
+        created = _install_managed_block(ssh_config, allocation_id, block)
+        _write_readiness(
+            readiness_file,
+            "listening",
+            port=port,
+            uri=remote_uri,
+        )
+        typer.echo(f"local tunnel: 127.0.0.1:{port} -> {host} (allocation {allocation_id})")
+        typer.echo(f"ssh config: {ssh_config}")
+        probe_timeout = max(30, config.gui.connect_timeout * 2)
+        try:
+            typer.echo("verifying container SSH connection…")
+            await _probe_container_ssh(host, ssh_config, probe_timeout)
+        except (RuntimeError, OSError, TimeoutError) as exc:
+            message = f"container SSH probe failed: {exc}"
+            _write_readiness(readiness_file, "error", code="probe_failed", message=message)
+            raise RuntimeError(str(exc)) from exc
+        typer.echo("container SSH verified")
+        # "ready" is reserved for the case where the IDE was actually launched;
+        # a missing code CLI leaves the stage at tunnel_verified with a message
+        # so the GUI can surface the copyable URI instead of a false success.
+        code_launched = False
         if launch_code:
             code = shutil.which("code")
             if code is None:
+                _write_readiness(
+                    readiness_file,
+                    "tunnel_verified",
+                    port=port,
+                    uri=remote_uri,
+                    message="VS Code CLI not found; open the URI manually",
+                )
                 typer.echo(
                     f"VS Code CLI not found. Open this folder URI manually:\n  {remote_uri}",
                     err=True,
@@ -680,12 +686,17 @@ async def _serve_vscode_tunnel(
                     command,
                     check=False,
                 )
+                code_launched = True
         else:
             typer.echo(f"VS Code folder URI: {remote_uri}")
-        _write_readiness(readiness_file, "ready", uri=remote_uri)
+        if not launch_code or code_launched:
+            _write_readiness(readiness_file, "ready", uri=remote_uri)
         typer.echo("Press Ctrl-C to close the tunnel.")
         await stop.wait()
     finally:
+        # Every failure path after the bind — probe failure, IDE launch
+        # problems, cancellation — must leave no managed SSH block, no
+        # listener, and no leftover children behind.
         server.close()
         for process in list(children):
             await _terminate_process(process)
@@ -745,8 +756,8 @@ def _strip_local_options(argv: list[str], names: set[str]) -> list[str]:
 
 
 # Commands that stream over the local broker socket or drive local apps cannot
-# be relayed as plain remote CLI invocations.
-LOCAL_ONLY_COMMANDS = {"shell", "vscode", "gui", "tunnel", "file", "menu"}
+# be relayed as plain remote CLI invocations. `connect` is itself the SSH path.
+LOCAL_ONLY_COMMANDS = {"shell", "vscode", "gui", "tunnel", "file", "menu", "connect"}
 
 
 def _dispatch_remote(alias: str, rest: list[str]) -> NoReturn:
@@ -1702,6 +1713,44 @@ def shell_command(
         _fail("internal", f"shell connection failed: {exc}", False)
     finally:
         sock.close()
+
+
+@app.command("connect")
+def connect_command(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Active allocation id."),
+    job: str = typer.Option("", "--job", help="Attach to a running job session instead."),
+    server: str | None = typer.Option(
+        None,
+        "--server",
+        help="SSH alias for the member account (default: config ssh_alias).",
+    ),
+) -> None:
+    """Interactive container shell over SSH, for local workstations.
+
+    Equivalent to `ssh <alias> udc-resource shell <id>`: the session streams
+    through the member's own SSH connection, so no local broker socket is
+    needed and this also works from Windows. The server-side ForceCommand
+    whitelist already permits the remote side of this command.
+    """
+
+    config = _load(ctx)
+    if not ALLOCATION_ID_RE.fullmatch(allocation_id):
+        _fail("bad_request", "invalid allocation id", False)
+    if job and (not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", job) or job in {".", ".."}):
+        _fail("bad_request", "invalid job name", False)
+    alias = server or config.server.ssh_alias
+    remote_parts = ["udc-resource", "shell", allocation_id]
+    if job:
+        remote_parts.extend(["--job", job])
+    # -t -t forces a TTY even when the local side has none; the interactive
+    # remote shell needs one.
+    argv = [*_ssh_base(config), "-t", "-t", alias, shlex.join(remote_parts)]
+    try:
+        completed = subprocess.run(argv, check=False)
+    except OSError as exc:
+        _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
+    raise SystemExit(completed.returncode)
 
 
 @app.command("tunnel")

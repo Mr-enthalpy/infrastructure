@@ -205,7 +205,28 @@ stop, restart, or alter training containers.
 - Release and expiry must cancel the tunnel. The container sshd process and the
   Docker exec session must exit, and no worker thread may remain blocked.
 
-### 5.5 Closed gates
+### 5.5 GPU device access on both login paths
+
+The container identity initialization must create a supplementary group with
+the host `udc-gpu` GID inside the container. Docker's `group_add` only applies
+to docker-exec sessions; an sshd login rebuilds supplementary groups from the
+container's `/etc/group`, so the VS Code path is the regression risk. Verify
+both paths separately, inside the same test allocation:
+
+- Via `udc-resource shell <allocation-id>` (docker-exec path):
+  1. `id -G` must list the host `udc-gpu` GID.
+  2. `nvidia-smi -L` must list the allocated GPUs (and only concerns the
+     member, not root).
+  3. If the image ships PyTorch: `python -c "import torch;
+     print(torch.cuda.is_available())"` must print `True`.
+- Via the VS Code terminal (container sshd path): repeat the same three
+  checks in the SSH login session. A failure here means the identity
+  initialization did not propagate the GPU group.
+
+Record `id -G`, `nvidia-smi -L`, and the torch output for both paths in the
+evidence. `VS Code can execute /bin/true` alone is not sufficient evidence.
+
+### 5.6 Closed gates
 
 - File transfer must remain disabled outside the controlled acceptance run until
   TOCTOU-safe handling and quota tests pass.

@@ -710,16 +710,62 @@ class DockerDriver:
         return int(info.get("ExitCode", -1)), text, ""
 
     @staticmethod
-    def _identity_script(uid: int, gid: int, username: str, home: str) -> str:
+    def _identity_script(
+        uid: int,
+        gid: int,
+        username: str,
+        home: str,
+        gpu_gid: int | None = None,
+    ) -> str:
         """Build the idempotent passwd/group/home bootstrap for a member UID.
 
         Docker happily runs a numeric UID that has no /etc/passwd entry, but
         sudo and login shells need a full identity record. This runs at
         allocation creation (not only when VS Code is opened) so the very
         first `sudo apt install` inside the container works.
+
+        When ``gpu_gid`` is set, a container group with the host's udc-gpu
+        numeric GID is ensured and the member is added to it: host NVIDIA
+        device nodes are root:<gpu-gid> 0660, and an SSH login rebuilds
+        supplementary groups from the container's /etc/group, so docker's
+        group_add alone only covers the docker-exec path.
         """
 
         safe_name = re.sub(r"[^a-z0-9_-]", "-", username.lower()) or f"udc{uid}"
+        gpu_group_block = ""
+        if gpu_gid is not None:
+            gpu_group_block = f"""# GPU device nodes are host root:{gpu_gid} 0660.
+# Reuse an existing container group with that GID if present, otherwise
+# create one, and make the member a supplementary member so sshd login
+# sessions get the same device access as docker exec (HostConfig group_add
+# does not apply to sshd sessions).
+if grep -q "^[^:]*:[^:]*:{gpu_gid}:" /etc/group; then
+    awk -F: -v OFS=: -v gid="{gpu_gid}" -v name="{safe_name}" '
+        $3 == gid {{
+            if ($4 == "") {{
+                $4 = name
+            }} else {{
+                split($4, members, ",")
+                found = 0
+                for (i in members) if (members[i] == name) found = 1
+                if (!found) $4 = $4 "," name
+            }}
+            done = 1
+        }}
+        {{ print }}
+        END {{
+            if (!done) {{
+                print "no container group has GID {gpu_gid}" > "/dev/stderr"
+                exit 1
+            }}
+        }}
+    ' /etc/group > /etc/group.udc
+    chmod 0644 /etc/group.udc
+    mv /etc/group.udc /etc/group
+else
+    printf 'udc-gpu:x:{gpu_gid}:{safe_name}\\n' >> /etc/group
+fi
+"""
         return f"""
 set -eu
 home={shlex.quote(home)}
@@ -761,7 +807,7 @@ awk -F: -v OFS=: -v uid="{uid}" -v gid="{gid}" -v name="{safe_name}" -v home="$h
 chmod 0644 /etc/passwd.udc
 mv /etc/passwd.udc /etc/passwd
 grep -q "^[^:]*:[^:]*:{gid}:" /etc/group || echo "$group_entry" >> /etc/group
-mkdir -p "$home"
+{gpu_group_block}mkdir -p "$home"
 chown {uid}:{gid} "$home"
 chmod 700 "$home"
 """
@@ -783,7 +829,17 @@ chmod 700 "$home"
         home = self._development_home(allocation)
         code, output, _err = self._exec_capture(
             container_id,
-            ["/bin/sh", "-c", self._identity_script(uid, gid, allocation.owner_name, home)],
+            [
+                "/bin/sh",
+                "-c",
+                self._identity_script(
+                    uid,
+                    gid,
+                    allocation.owner_name,
+                    home,
+                    gpu_gid=self._gpu_group_id(),
+                ),
+            ],
             user="0:0",
         )
         if code != 0:
@@ -816,7 +872,7 @@ chmod 700 "$home"
         keys = "\n".join(key.strip() for key in public_keys if key.strip())
         script = f"""
 set -eu
-{self._identity_script(uid, gid, username, home)}
+{self._identity_script(uid, gid, username, home, gpu_gid=self._gpu_group_id())}
 mkdir -p "$home/.ssh"
 chmod 700 "$home/.ssh"
 printf '%s\\n' {shlex.quote(keys)} > "$home/.ssh/authorized_keys"

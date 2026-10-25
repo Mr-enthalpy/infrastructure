@@ -497,7 +497,7 @@ async def _api_vscode(request: web.Request) -> web.Response:
                 "id": allocation_id,
                 "stage": stage_name,
             }
-            for key in ("port", "uri"):
+            for key in ("port", "uri", "message"):
                 if stage.get(key):
                     data[key] = stage[key]
             return _json({"ok": True, "data": data})

@@ -818,20 +818,22 @@ def admit_next_queued(
                     now=current,
                 )
                 continue
-            if blocked_gpu_uuids:
+            if oldest_blocked is not None:
+                # Some earlier request cannot run yet. Backfill rules apply to
+                # every later request — including CPU-only ones, whose blocked
+                # head contributes no GPU to blocked_gpu_uuids.
                 if not backfill_enabled:
                     # Strict FIFO: the first unrunnable request blocks the rest.
                     break
-                if oldest_blocked is not None:
-                    try:
-                        waited = current - oldest_blocked
-                    except (TypeError, ValueError):
-                        break
-                    if waited >= timedelta(minutes=backfill_reserve_minutes):
-                        # Starvation guard: backfilling must not delay a long
-                        # waiting request indefinitely. reserve_minutes=0
-                        # therefore disables backfill (strict FIFO).
-                        break
+                try:
+                    waited = current - oldest_blocked
+                except (TypeError, ValueError):
+                    break
+                if waited >= timedelta(minutes=backfill_reserve_minutes):
+                    # Starvation guard: backfilling must not delay a long
+                    # waiting request indefinitely. reserve_minutes=0
+                    # therefore disables backfill (strict FIFO).
+                    break
                 if blocked_gpu_uuids & set(gpu_uuids):
                     # Contended resource: keep FIFO order for it.
                     continue

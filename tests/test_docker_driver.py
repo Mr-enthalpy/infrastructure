@@ -1,4 +1,5 @@
 import os
+import shutil
 import struct
 import subprocess
 from dataclasses import replace
@@ -762,3 +763,60 @@ def test_list_and_stop_jobs(active_config):
     api.outputs["exec-2"] = (0, b"")
     driver.stop_job("container-1", "train")
     assert api.calls[1][1]["cmd"] == ["tmux", "kill-session", "-t", "udc-train"]
+
+
+def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_path, monkeypatch):
+    """SSH logins rebuild groups from the container /etc/group, so the member
+    needs a supplementary group with the host udc-gpu GID inside the container
+    as well — docker's group_add only covers the docker-exec path."""
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required to syntax-check the identity script")
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+        ),
+    )
+    driver = DockerDriver(config)
+    driver._gpu_group_id = lambda: 64000
+    fake_client = FakeClient()
+    driver._client = fake_client
+    monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
+    driver.initialize_container_identity("container-1", _allocation(tmp_path))
+    script = fake_client.api.exec_create_kwargs["cmd"][2]
+    assert "udc-gpu:x:64000:alice" in script
+    assert 'grep -q "^[^:]*:[^:]*:64000:" /etc/group' in script
+    proc = subprocess.run(
+        ["bash", "-n"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_identity_script_without_gpu_group(active_config, tmp_path, monkeypatch):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
+    driver.initialize_container_identity("container-1", _allocation(tmp_path))
+    script = fake_client.api.exec_create_kwargs["cmd"][2]
+    assert "udc-gpu" not in script

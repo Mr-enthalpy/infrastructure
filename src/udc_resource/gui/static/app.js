@@ -54,7 +54,7 @@
     return `${minutes}m ${String(secs).padStart(2, "0")}s`;
   }
 
-  function flash(message, kind = "ok") {
+  function flash(message, kind = "ok", duration = 5000) {
     const banner = $("#flash");
     banner.textContent = message;
     banner.className = `banner ${kind}`;
@@ -62,7 +62,7 @@
     window.clearTimeout(flash.timer);
     flash.timer = window.setTimeout(() => {
       banner.hidden = true;
-    }, 5000);
+    }, duration);
   }
 
 
@@ -557,9 +557,18 @@
     try {
       const payload = await api(`/api/vscode/${encodeURIComponent(id)}`, { method: "POST" });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      const stage = payload.data?.stage === "ready" ? "VS Code is opening" : "tunnel verified (container SSH reachable)";
-      const detail = payload.data?.uri ? `: ${payload.data.uri}` : "";
-      flash(`${stage}${detail}`, "ok");
+      const uri = String(payload.data?.uri || "");
+      const message = String(payload.data?.message || "");
+      if (payload.data?.stage === "ready") {
+        flash(`VS Code 已启动${uri ? `: ${uri}` : ""}`, "ok", 15000);
+      } else {
+        // The IDE window is not confirmed; surface the copyable URI instead.
+        flash(
+          `隧道已验证（容器 SSH 可达）${message ? ` — ${message}` : ""}${uri ? `。打开: ${uri}` : ""}`,
+          "ok",
+          30000,
+        );
+      }
     } catch (error) {
       flash(String(error.message || error), "error");
     }
