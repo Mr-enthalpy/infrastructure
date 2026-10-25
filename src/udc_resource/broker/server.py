@@ -223,9 +223,40 @@ class Broker:
             "docker_storage_budget_gb": self.config.policy.docker_storage_budget_gb,
         }
 
-    def _run_storage_check(self) -> str | None:
+    def _writable_layer_reservation_bytes(self, *, include_next_slot: bool) -> int:
+        """Worst-case writable-layer growth promised to live allocations.
+
+        Every pending/active/cleanup_pending allocation may still grow to its
+        full quota, and a candidate allocation adds one more slot. Used to
+        constrain admission by CURRENT free space, not filesystem capacity.
+        A database failure fails closed with the full budget.
+        """
+
+        policy = self.config.policy
+        if policy.container_profile != "development" or policy.writable_layer_gb <= 0:
+            return 0
         try:
-            passed, detail = self.docker.storage_preflight()
+            with self._connection() as connection:
+                count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM allocations "
+                        "WHERE status IN ('pending', 'active', 'cleanup_pending')"
+                    ).fetchone()[0]
+                )
+        except Exception:
+            logger.exception("could not count writable-layer reservations")
+            return policy.docker_storage_budget_gb * 1024**3
+        if include_next_slot:
+            count += 1
+        return count * policy.writable_layer_gb * 1024**3
+
+    def _run_storage_check(self, *, include_next_slot: bool = False) -> str | None:
+        try:
+            passed, detail = self.docker.storage_preflight(
+                writable_layer_entitlements_bytes=self._writable_layer_reservation_bytes(
+                    include_next_slot=include_next_slot
+                )
+            )
         except Exception as exc:
             passed, detail = False, str(exc)
         if not passed:
@@ -1720,7 +1751,10 @@ class Broker:
             quota_failure = await asyncio.to_thread(self._run_quota_check)
             if quota_failure:
                 raise Conflict(f"new allocations blocked by workspace quota: {quota_failure}")
-        storage_failure = await asyncio.to_thread(self._run_storage_check)
+        storage_failure = await asyncio.to_thread(
+            self._run_storage_check,
+            include_next_slot=True,
+        )
         if storage_failure:
             raise Conflict(f"new allocations blocked by Docker storage: {storage_failure}")
         gate_failure = self._gate_failure()
@@ -2107,7 +2141,10 @@ class Broker:
             return []
         # Re-check the nosuid/quota storage gate at admission time instead of
         # relying only on the value cached at startup or the last direct apply.
-        storage_failure = await asyncio.to_thread(self._run_storage_check)
+        storage_failure = await asyncio.to_thread(
+            self._run_storage_check,
+            include_next_slot=True,
+        )
         if storage_failure:
             logger.warning("queue scheduling paused by Docker storage gate: %s", storage_failure)
             return []

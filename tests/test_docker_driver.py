@@ -925,3 +925,37 @@ def test_storage_preflight_rejects_budget_larger_than_disk(active_config, tmp_pa
     usage.total = 1024 * 1024**3
     passed, detail = driver.storage_preflight()
     assert passed is True
+
+
+def test_storage_preflight_rejects_entitlements_beyond_free_space(
+    active_config,
+    tmp_path,
+    monkeypatch,
+):
+    """60 GiB free, 20 GiB reserve, two 40 GiB entitlements: the second must
+    not be admitted even though the budget fits the filesystem's capacity."""
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            min_free_docker_gb=20,
+            docker_storage_budget_gb=500,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": str(tmp_path)}
+    driver._client = fake_client
+    usage = SimpleNamespace(free=60 * 1024**3, total=1024 * 1024**3)
+    monkeypatch.setattr(docker_driver.shutil, "disk_usage", lambda path: usage)
+
+    blocked = driver.storage_preflight(
+        writable_layer_entitlements_bytes=80 * 1024**3,
+    )
+    assert blocked[0] is False
+    assert "could still grow by 80 GiB" in blocked[1]
+
+    allowed = driver.storage_preflight(
+        writable_layer_entitlements_bytes=40 * 1024**3,
+    )
+    assert allowed[0] is True

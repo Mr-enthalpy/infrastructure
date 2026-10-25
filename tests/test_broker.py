@@ -1852,3 +1852,35 @@ async def test_reconcile_finalizes_cleanup_pending(tmp_path, active_config):
     # can be allocated again immediately.
     freed = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, BOB)
     assert freed["data"]["status"] == "active"
+
+
+async def test_storage_gate_constrains_by_free_space_entitlements(
+    tmp_path,
+    active_config,
+):
+    """Admission must count the candidate slot against current free space:
+    the second 20 GiB allocation is refused when the headroom cannot absorb
+    both entitlements, even though the DB budget still has room."""
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=1,
+            docker_storage_budget_gb=200,
+        ),
+    )
+    docker = FakeDocker()
+    docker.storage_entitlement_limit_bytes = 1 * 20 * 1024**3
+    broker, docker = _broker(tmp_path, config, docker=docker)
+    first = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert first["ok"] is True
+    assert docker.storage_entitlement_calls[-1] == 1 * 20 * 1024**3
+
+    second = await _call(broker, "apply", {"gpus": [2], "cpus": 8, "memory_gb": 32}, BOB)
+    assert second["ok"] is False
+    assert "Docker storage" in second["error"]["message"]
+    assert docker.storage_entitlement_calls[-1] == 2 * 20 * 1024**3

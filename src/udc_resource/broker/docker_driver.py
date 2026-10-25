@@ -101,7 +101,11 @@ class DockerBackend(Protocol):
 
     def remove_container(self, container_id: str) -> None: ...
 
-    def storage_preflight(self) -> tuple[bool, str]: ...
+    def storage_preflight(
+        self,
+        *,
+        writable_layer_entitlements_bytes: int = 0,
+    ) -> tuple[bool, str]: ...
 
     def prepare_container_ssh(
         self,
@@ -593,7 +597,11 @@ class DockerDriver:
             raise DockerError(f"docker run failed: {exc}") from exc
         return ContainerRef(id=str(container.id), name=str(container.name))
 
-    def storage_preflight(self) -> tuple[bool, str]:
+    def storage_preflight(
+        self,
+        *,
+        writable_layer_entitlements_bytes: int = 0,
+    ) -> tuple[bool, str]:
         """Check Docker storage capacity and writable-layer quota enforcement.
 
         ``storage-opt size`` works only with the overlay2 driver on XFS mounted
@@ -601,6 +609,13 @@ class DockerDriver:
         the profile, the Docker root must keep ``policy.min_free_docker_gb``
         free: per-container writable-layer quotas do not stop many containers
         from together filling the disk that also holds OS and Docker metadata.
+
+        ``writable_layer_entitlements_bytes`` is the writable-layer capacity
+        already promised to active allocations plus the candidate (the caller
+        decides whether to include the candidate slot). The CURRENT free space
+        must still cover it in the worst case — a budget measured against the
+        filesystem's total capacity says nothing about space that images,
+        historical containers, and other workloads already occupy.
         """
 
         policy = self.config.policy
@@ -642,6 +657,22 @@ class DockerDriver:
                         f"Docker storage budget {policy.docker_storage_budget_gb} GiB plus "
                         f"reserve {policy.min_free_docker_gb} GiB exceeds the {total_gib} GiB "
                         f"filesystem at {docker_root}; lower docker_storage_budget_gb"
+                    )
+            if writable_layer_entitlements_bytes > 0:
+                # Worst-case admission: every live allocation may still grow to
+                # its full writable-layer quota from this point on. The free
+                # space must cover that growth plus the reserve — the budget's
+                # total-capacity check alone does not account for what images
+                # and other workloads already occupy.
+                free_gib = usage.free // 1024**3
+                headroom = usage.free - policy.min_free_docker_gb * 1024**3
+                entitlement_gib = writable_layer_entitlements_bytes // 1024**3
+                if headroom < writable_layer_entitlements_bytes:
+                    return False, (
+                        f"Docker storage {docker_root} has {free_gib} GiB free, but live "
+                        f"allocations could still grow by {entitlement_gib} GiB within "
+                        f"their writable-layer quotas; policy.min_free_docker_gb "
+                        f"({policy.min_free_docker_gb} GiB) could not be preserved"
                     )
         if policy.container_profile != "development" or policy.writable_layer_gb <= 0:
             return True, "writable-layer quota is not required"

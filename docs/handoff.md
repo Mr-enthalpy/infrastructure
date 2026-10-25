@@ -64,6 +64,10 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     相交时越过；等待超过 `queue_backfill_reserve_minutes` 后停止 backfill。
   - Docker 全局可写层预算：`docker_storage_budget_gb` 按每个 pending/active
     allocation 的 `writable_layer_gb` 预留，防止多个配额容器共同写满磁盘。
+    准入闸门同时要求当前空闲容量足以覆盖"全部存活 allocation 未来增长到
+    配额上限 + min_free_docker_gb"的最坏情况（数据库查询失败时按整个预算
+    fail-closed）；这缓解但不消除与非 UDC 工作负载共存的风险——推荐把 Docker
+    数据目录放在独立、容量明确的 XFS 文件系统上，避免与操作系统根分区争抢。
   - 严格队首阻塞；后续请求不得越过未过期队首。
   - `--no-queue` 表示不等待、不保留请求，但不得越过队列。
   - `queue_enabled = false` 仅阻止新排队请求，不允许直接申请绕过已有队列。

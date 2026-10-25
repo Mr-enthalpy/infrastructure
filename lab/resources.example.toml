@@ -56,7 +56,10 @@ container_home = ""
 container_home_tmpfs_gb = 0
 # Free space the Docker storage directory must keep before any new allocation
 # (protects the OS and Docker metadata from many quota-bounded containers
-# filling the disk together).
+# filling the disk together). Admission additionally requires that the CURRENT
+# free space can absorb the writable-layer entitlements already promised to
+# live allocations plus the candidate — the budget below is also checked
+# against the filesystem's total capacity.
 min_free_docker_gb = 20
 # Global writable-layer budget: every development allocation reserves its
 # writable_layer_gb here (pending or active), so several quota-bounded

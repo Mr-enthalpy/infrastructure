@@ -65,6 +65,8 @@ class FakeDocker:
         self.fail_remove = fail_remove
         self.storage_ok = True
         self.storage_detail = "storage preflight passed"
+        self.storage_entitlement_calls: list[int] = []
+        self.storage_entitlement_limit_bytes = 0
         self.prepared_ssh: list[dict[str, object]] = []
         self.initialized_identity: list[dict[str, object]] = []
         self.fail_identity_init = fail_identity_init
@@ -129,7 +131,20 @@ class FakeDocker:
         self.removed.append(container_id)
         self.containers.pop(container_id, None)
 
-    def storage_preflight(self) -> tuple[bool, str]:
+    def storage_preflight(
+        self,
+        *,
+        writable_layer_entitlements_bytes: int = 0,
+    ) -> tuple[bool, str]:
+        self.storage_entitlement_calls.append(writable_layer_entitlements_bytes)
+        if (
+            self.storage_entitlement_limit_bytes > 0
+            and writable_layer_entitlements_bytes > self.storage_entitlement_limit_bytes
+        ):
+            return (
+                False,
+                "simulated: writable-layer entitlements exceed the free headroom",
+            )
         return self.storage_ok, self.storage_detail
 
     def prepare_container_ssh(
