@@ -132,6 +132,7 @@ async def test_uds_shell_stream(tmp_path, active_config):
         socket_path=socket_path,
         docker=fake,
         identity_resolver=FakeIdentityResolver({uid: identity}),
+        **_uds_broker_kwargs(),
     )
     await broker.start()
     try:

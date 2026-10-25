@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -387,6 +388,28 @@ def _managed_block(
 
 def _atomic_config_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        # Windows OpenSSH refuses SSH config files carrying the OWNER RIGHTS
+        # ACE that tempfile.mkstemp adds on modern CPython. Create the temp
+        # file with plain open() instead so it inherits the parent directory's
+        # ACL (user + SYSTEM + Administrators), which ssh accepts.
+        temp_path = path.parent / f"{path.name}.{os.getpid()}.{secrets.token_hex(8)}.udc-tmp"
+        try:
+            fd = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.replace(temp_path, path)
+        except BaseException:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return
     fd, temp_name = tempfile.mkstemp(
         prefix=path.name + ".",
         suffix=".udc-tmp",
@@ -399,19 +422,6 @@ def _atomic_config_write(path: Path, text: str) -> None:
             os.chmod(temp_name, 0o600)
         except OSError:
             pass
-        if os.name == "nt":
-            # tempfile.mkstemp gives the temp file an OWNER RIGHTS ACL on
-            # Windows (CPython security hardening); Windows OpenSSH refuses
-            # config files carrying that ACE. Reset to inherited permissions.
-            try:
-                subprocess.run(
-                    ["icacls", str(temp_name), "/reset"],
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
         os.replace(temp_name, path)
     except Exception:
         try:
