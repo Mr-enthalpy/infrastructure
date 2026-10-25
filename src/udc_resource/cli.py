@@ -43,11 +43,13 @@ app = typer.Typer(no_args_is_help=True, help="Timed lab GPU resource manager.")
 config_app = typer.Typer(no_args_is_help=True, help="Inspect the local configuration.")
 admin_app = typer.Typer(no_args_is_help=True, help="Administrator commands.")
 job_app = typer.Typer(no_args_is_help=True, help="Long-running job commands.")
+me_app = typer.Typer(no_args_is_help=True, help="个人状态与公钥管理。")
 file_app = typer.Typer(no_args_is_help=True, help="Restricted workspace file transfer.")
 queue_app = typer.Typer(no_args_is_help=True, help="Queued allocation requests.")
 app.add_typer(config_app, name="config")
 app.add_typer(admin_app, name="admin")
 app.add_typer(job_app, name="job")
+app.add_typer(me_app, name="me")
 app.add_typer(file_app, name="file")
 app.add_typer(queue_app, name="queue")
 
@@ -1490,6 +1492,192 @@ def start_command(
         typer.echo("或在你自己的电脑运行 udc-resource gui。")
     elif open_with == "terminal":
         typer.echo("进入终端：udc-resource connect " + allocation_id)
+
+
+@app.command("join")
+def join_command(
+    ctx: typer.Context,
+    status_only: bool = typer.Option(False, "--status", help="查询已提交申请的状态。"),
+    portal: str = typer.Option(
+        "", "--portal", help="申请服务地址（如 https://lab.example.invalid/compute）。"
+    ),
+    invite_id: str = typer.Option("", "--invite-id", help="管理员发给你的邀请编号。"),
+    interactive: bool = typer.Option(True, "--interactive/--non-interactive"),
+    application_file: Path | None = typer.Option(
+        None, "--application-file", help="提交 JSON 申请文件（离线/非交互模式）。"
+    ),
+) -> None:
+    """新成员入口：提交加入申请或查询申请状态（无需服务器账号）。
+
+    邀请密钥与回执密钥通过受保护输入提供，绝不出现在命令行参数或日志中。
+    """
+    import urllib.error
+    import urllib.request
+
+    config = _load(ctx)
+    target = portal or config.onboarding.apply_url
+    if not target:
+        _fail(
+            "bad_request",
+            "未配置申请入口地址；请使用 --portal 或联系管理员获取",
+            False,
+        )
+    target = target.rstrip("/")
+
+    def _post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{target}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                return json.loads(exc.read().decode("utf-8"))
+            except ValueError:
+                return {"ok": False, "error": {"code": "http", "message": str(exc)}}
+        except urllib.error.URLError as exc:
+            _fail("unavailable", f"无法连接申请服务 {target}：{exc.reason}", False)
+
+    def _get(path: str) -> dict[str, Any]:
+        request = urllib.request.Request(f"{target}{path}")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                return json.loads(exc.read().decode("utf-8"))
+            except ValueError:
+                return {"ok": False, "error": {"code": "http", "message": str(exc)}}
+        except urllib.error.URLError as exc:
+            _fail("unavailable", f"无法连接申请服务 {target}：{exc.reason}", False)
+
+    if status_only:
+        import getpass
+
+        request_id = typer.prompt("申请编号")
+        receipt = getpass.getpass("回执密钥：")
+        data = _get(f"/api/requests/{request_id}?receipt={urllib.parse.quote(receipt)}")
+        if not data.get("ok"):
+            error = data.get("error", {})
+            _fail(str(error.get("code", "error")), str(error.get("message", "")), False)
+        info = data["data"]
+        typer.echo(f"申请状态：{info['status']}")
+        if info.get("public_note"):
+            typer.echo(f"管理员说明：{info['public_note']}")
+        return
+
+    import getpass
+
+    if application_file is not None and interactive:
+        _fail("bad_request", "--application-file 请配合 --non-interactive 使用", False)
+    if not interactive:
+        if application_file is None:
+            _fail("bad_request", "非交互模式需要 --application-file", False)
+        try:
+            application = json.loads(application_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            _fail("bad_request", f"申请文件无效：{exc}", False)
+        if not invite_id:
+            _fail("bad_request", "非交互模式需要 --invite-id", False)
+        invite_secret = getpass.getpass("邀请密钥：")
+    else:
+        typer.echo("=== 实验室计算资源加入申请 ===")
+        if config.onboarding.guide_url:
+            typer.echo(f"使用指南：{config.onboarding.guide_url}")
+        application = {
+            "display_name": typer.prompt("显示姓名"),
+            "username": typer.prompt("期望用户名（小写字母开头）"),
+            "affiliation": typer.prompt("实验室归属或联系人"),
+            "purpose": typer.prompt("申请用途"),
+            "contact": typer.prompt("用于核验的联系方式"),
+            "nickname": typer.prompt("昵称（可选）", default=""),
+            "public_contact": typer.prompt(
+                "是否公开协作联系方式？(y/N)", default="n"
+            ),
+            "agree_terms": "1",
+            "public_keys": [typer.prompt("SSH 公钥（.pub 文件内容，一行）")],
+        }
+        invite_id = typer.prompt("邀请编号")
+        invite_secret = getpass.getpass("邀请密钥：")
+
+    data = _post(
+        "/api/requests",
+        {
+            "invite_id": invite_id,
+            "invite_secret": invite_secret,
+            "application": application,
+        },
+    )
+    if not data.get("ok"):
+        error = data.get("error", {})
+        _fail(str(error.get("code", "error")), str(error.get("message", "")), False)
+    result = data["data"]
+    typer.echo("")
+    typer.echo("申请已提交。请妥善保存以下信息（回执密钥仅显示一次）：")
+    typer.echo(f"  申请编号：{result['request_id']}")
+    typer.echo(f"  回执密钥：{result['receipt_secret']}")
+    typer.echo("查询状态：udc-resource join --status")
+
+
+@me_app.command("keys")
+def me_keys(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="list / add / revoke"),
+    key_file: Path | None = typer.Option(None, "--key-file", help="公钥 .pub 文件。"),
+    key_id: str = typer.Option("", "--key-id"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """管理我的登录公钥（只提交 .pub 公钥）。"""
+    config = _load(ctx)
+    if action == "list":
+        data = _request(_make_client(config), "me", json_output)
+        if json_output:
+            return
+        for key in data.get("keys", []):
+            state = "有效" if key.get("status") == "active" else "已撤销"
+            typer.echo(f"[{state}] {key['key_id']}  {key['fingerprint']}")
+        return
+    if action == "add":
+        if key_file is None:
+            _fail("bad_request", "add 需要 --key-file（.pub 公钥文件）", json_output)
+        try:
+            public_key = key_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            _fail("bad_request", f"无法读取公钥文件：{exc}", json_output)
+        data = _request(
+            _make_client(config),
+            "me_keys_add",
+            json_output,
+            public_key=public_key,
+        )
+        if json_output:
+            return
+        typer.echo(f"已添加：{data['fingerprint']}")
+        typer.echo("新密钥需管理员同步到服务器认证后生效。")
+        return
+    if action == "revoke":
+        if not key_id:
+            _fail("bad_request", "revoke 需要 --key-id", json_output)
+        if not json_output:
+            typer.confirm(
+                "撤销后该密钥立即失效；确认这是你的设备且你有其他可用密钥？",
+                abort=True,
+            )
+        data = _request(
+            _make_client(config),
+            "me_keys_revoke",
+            json_output,
+            key_id=key_id,
+        )
+        if json_output:
+            return
+        typer.echo(f"已撤销：{data['key_id']}")
+        return
+    _fail("bad_request", f"未知操作 {action}", json_output)
 
 
 @app.command("menu")
