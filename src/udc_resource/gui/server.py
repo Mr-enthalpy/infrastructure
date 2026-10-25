@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -31,9 +32,16 @@ RUNNER_KEY: web.AppKey[Any] = web.AppKey("runner", Any)
 TOKEN_KEY: web.AppKey[str] = web.AppKey("token", str)
 STATIC_KEY: web.AppKey[Path] = web.AppKey("static_dir", Path)
 VSCODE_KEY: web.AppKey[list[Any]] = web.AppKey("vscode_processes", list)
+VSCODE_TEMP_KEY: web.AppKey[list[str]] = web.AppKey("vscode_temp_dirs", list)
+VSCODE_CONFIG_PATH_KEY: web.AppKey[str] = web.AppKey("vscode_config_path", str)
 ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 ALLOCATION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 JOB_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+# The tunnel must come up through SSH, the broker, and the container sshd;
+# anything slower than this is treated as a failure instead of a false
+# success.
+VSCODE_READY_TIMEOUT_SECONDS = 90
+VSCODE_READY_POLL_SECONDS = 0.25
 
 
 class SSHRunner:
@@ -146,6 +154,7 @@ def create_app(
     runner: Any | None = None,
     token: str | None = None,
     static_dir: Path = STATIC_DIR,
+    config_path: str | None = None,
 ) -> web.Application:
     app = web.Application(middlewares=[_security_middleware])
     app[CONFIG_KEY] = config
@@ -153,6 +162,8 @@ def create_app(
     app[TOKEN_KEY] = token or secrets.token_urlsafe(32)
     app[STATIC_KEY] = static_dir
     app[VSCODE_KEY] = []
+    app[VSCODE_TEMP_KEY] = []
+    app[VSCODE_CONFIG_PATH_KEY] = (config_path or "").strip()
     app.on_cleanup.append(_cleanup_vscode)
     app.router.add_get("/", _index)
     app.router.add_static("/static/", static_dir)
@@ -166,7 +177,9 @@ def create_app(
     app.router.add_post("/api/release", _api_release)
     app.router.add_get("/api/logs/{allocation_id}", _api_logs)
     app.router.add_get("/api/jobs/{allocation_id}", _api_jobs)
+    app.router.add_post("/api/jobs/{allocation_id}/start", _api_job_start)
     app.router.add_post("/api/jobs/{allocation_id}/stop", _api_job_stop)
+    app.router.add_get("/api/job-logs/{allocation_id}", _api_job_logs)
     app.router.add_post("/api/vscode/{allocation_id}", _api_vscode)
     app.router.add_get("/api/admin/users", _api_admin_users)
     app.router.add_get("/api/admin/resources", _api_admin_resources)
@@ -312,6 +325,46 @@ async def _api_jobs(request: web.Request) -> web.Response:
     return await _remote(request, ["job", "list", allocation_id])
 
 
+async def _api_job_start(request: web.Request) -> web.Response:
+    allocation_id = request.match_info["allocation_id"]
+    if not ALLOCATION_RE.fullmatch(allocation_id):
+        return _json(_error("bad_request", "invalid allocation id"), 400)
+    body = await _json_body(request)
+    name = body.get("name")
+    if not isinstance(name, str) or not JOB_RE.fullmatch(name):
+        return _json(_error("bad_request", "invalid job name"), 400)
+    command = body.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or len(command) > 64
+        or any(not isinstance(item, str) or not item or len(item) > 512 for item in command)
+    ):
+        return _json(_error("bad_request", "command must be a non-empty list of strings"), 400)
+    return await _remote(
+        request,
+        ["job", "start", allocation_id, "--name", name, "--", *command],
+    )
+
+
+async def _api_job_logs(request: web.Request) -> web.Response:
+    allocation_id = request.match_info["allocation_id"]
+    if not ALLOCATION_RE.fullmatch(allocation_id):
+        return _json(_error("bad_request", "invalid allocation id"), 400)
+    name = request.query.get("name", "")
+    if not JOB_RE.fullmatch(name):
+        return _json(_error("bad_request", "invalid job name"), 400)
+    try:
+        tail = int(request.query.get("tail", "200"))
+    except ValueError:
+        return _json(_error("bad_request", "tail must be an integer"), 400)
+    tail = max(1, min(10000, tail))
+    return await _remote(
+        request,
+        ["job", "logs", allocation_id, "--name", name, "--tail", str(tail)],
+    )
+
+
 async def _api_job_stop(request: web.Request) -> web.Response:
     allocation_id = request.match_info["allocation_id"]
     if not ALLOCATION_RE.fullmatch(allocation_id):
@@ -321,6 +374,25 @@ async def _api_job_stop(request: web.Request) -> web.Response:
     if not isinstance(name, str) or not JOB_RE.fullmatch(name):
         return _json(_error("bad_request", "invalid job name"), 400)
     return await _remote(request, ["job", "stop", allocation_id, "--name", name])
+
+
+def _read_readiness(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_stderr_tail(path: Path, limit: int = 500) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()[-limit:]
+    except OSError:
+        return ""
+
+
+def _cleanup_vscode_dir(path: str) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 async def _api_vscode(request: web.Request) -> web.Response:
@@ -333,43 +405,90 @@ async def _api_vscode(request: web.Request) -> web.Response:
     executable = shutil.which("udc-resource")
     base = [executable] if executable is not None else [sys.executable, "-m", "udc_resource.cli"]
     argv = [*base]
-    config_path = os.environ.get("UDC_RESOURCE_CONFIG", "").strip()
+    # Pass the config path explicitly: the GUI may have been started with a
+    # --config flag that the child would not otherwise see.
+    config_path = (
+        request.app[VSCODE_CONFIG_PATH_KEY]
+        or os.environ.get(
+            "UDC_RESOURCE_CONFIG",
+            "",
+        ).strip()
+    )
     if config_path:
         argv.extend(["--config", config_path])
     runner: SSHRunner = request.app[RUNNER_KEY]
     if not ALIAS_RE.fullmatch(runner.member_alias):
         return _json(_error("internal", "invalid SSH alias"), 500)
     argv.extend(["vscode", allocation_id, "--server", runner.member_alias, "--code"])
+
+    temp_dir = tempfile.mkdtemp(prefix="udc-vscode-")
+    request.app[VSCODE_TEMP_KEY].append(temp_dir)
+    readiness_file = Path(temp_dir) / "readiness.json"
+    stderr_file = Path(temp_dir) / "stderr.log"
+    argv.extend(["--readiness-file", str(readiness_file)])
     processes: list[Any] = request.app[VSCODE_KEY]
     processes[:] = [process for process in processes if process.poll() is None]
     try:
-        if os.name == "posix":
-            process = await asyncio.to_thread(
-                subprocess.Popen,
-                argv,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        else:
-            process = await asyncio.to_thread(
-                subprocess.Popen,
-                argv,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-            )
+        with stderr_file.open("wb") as stderr_handle:
+            if os.name == "posix":
+                process = await asyncio.to_thread(
+                    subprocess.Popen,
+                    argv,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                )
+            else:
+                process = await asyncio.to_thread(
+                    subprocess.Popen,
+                    argv,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_handle,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
     except OSError as exc:
         return _json(_error("internal", f"could not start VS Code: {exc}"), 500)
-    await asyncio.sleep(0.3)
-    if process.poll() is not None:
-        try:
-            await asyncio.to_thread(process.wait, 1)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return _json(_error("internal", "VS Code tunnel process exited immediately"), 500)
-    processes.append(process)
-    return _json({"ok": True, "data": {"pid": process.pid, "id": allocation_id}})
+
+    # Wait for the CLI to report real readiness (local tunnel bound, SSH
+    # config installed) instead of assuming success after a fixed delay.
+    loop = asyncio.get_running_loop()
+    timeout = max(60, config.gui.connect_timeout * 3)
+    deadline = loop.time() + min(timeout, VSCODE_READY_TIMEOUT_SECONDS)
+    while True:
+        if process.poll() is not None:
+            detail = _read_stderr_tail(stderr_file) or "no diagnostics were captured"
+            return _json(
+                _error("internal", f"VS Code tunnel process exited before ready: {detail}"),
+                500,
+            )
+        stage = _read_readiness(readiness_file)
+        stage_name = str(stage.get("stage", ""))
+        if stage_name == "error":
+            message = str(stage.get("message") or "VS Code tunnel failed")
+            await _stop_vscode_process(process)
+            return _json(_error("internal", message), 500)
+        if stage_name in {"listening", "ready"}:
+            processes.append(process)
+            data: dict[str, Any] = {
+                "pid": process.pid,
+                "id": allocation_id,
+                "stage": stage_name,
+            }
+            for key in ("port", "uri"):
+                if stage.get(key):
+                    data[key] = stage[key]
+            return _json({"ok": True, "data": data})
+        if loop.time() >= deadline:
+            detail = _read_stderr_tail(stderr_file) or "no diagnostics were captured"
+            await _stop_vscode_process(process)
+            return _json(
+                _error(
+                    "internal",
+                    f"VS Code tunnel did not report readiness within {int(timeout)}s: {detail}",
+                ),
+                500,
+            )
+        await asyncio.sleep(VSCODE_READY_POLL_SECONDS)
 
 
 async def _stop_vscode_process(process: Any) -> None:
@@ -395,6 +514,10 @@ async def _cleanup_vscode(app: web.Application) -> None:
     for process in list(processes):
         await _stop_vscode_process(process)
     processes.clear()
+    temp_dirs: list[str] = app[VSCODE_TEMP_KEY]
+    for temp_dir in [*temp_dirs]:
+        _cleanup_vscode_dir(temp_dir)
+    temp_dirs.clear()
 
 
 async def _api_admin_users(request: web.Request) -> web.Response:
@@ -574,6 +697,7 @@ def run_gui(
     admin_alias: str | None,
     port: int = 0,
     open_browser: bool = True,
+    config_path: str | None = None,
 ) -> None:
     token = secrets.token_urlsafe(32)
     app = create_app(
@@ -581,6 +705,7 @@ def run_gui(
         member_alias=member_alias,
         admin_alias=admin_alias,
         token=token,
+        config_path=config_path,
     )
 
     async def serve() -> None:

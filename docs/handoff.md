@@ -50,18 +50,39 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     `nosuid`。
   - Broker 在队列准入前重新检查存储闸门。
   - 支持 XFS 和 ext4 项目配额；不使用 UID 配额。
+  - Broker 在每次 allocation 物化前校验成员 workspace 的实际 project ID
+    （lsattr）、新文件继承（探针文件）和硬配额（xfs_quota report /
+    repquota 解析）；未生效时自动重新开通并复查，仍失败则分配失败。
+  - `create_user.sh` 在建号时执行完整的 workspace 开通事务（建目录 → 项目
+    ID → 硬配额 → 查询验证），可用 `--no-workspace` 跳过。
+  - Docker 存储目录整机容量闸门：`policy.min_free_docker_gb`（默认 20 GiB）
+    不足时阻止新分配，既有任务与释放/到期不受影响。
 - 队列：
-  - 顺序为 `priority DESC, created_at ASC, id`。
+  - 顺序为 `priority DESC, created_at ASC, rowid`（插入序），且队列空检查位于
+    `create_allocation` 的数据库事务内。
   - 严格队首阻塞；后续请求不得越过未过期队首。
   - `--no-queue` 表示不等待、不保留请求，但不得越过队列。
   - `queue_enabled = false` 仅阻止新排队请求，不允许直接申请绕过已有队列。
 - Docker 与管理容器：
   - development profile：成员 UID、容器内 passwordless sudo、可写 rootfs、
-    临时 HOME、持久 `/workspace`、`storage_opt` 可写层配额、PID 限制。
+    临时 HOME（默认可写层内）、持久 `/workspace`、`storage_opt` 可写层配额、
+    PID 限制。
+  - GPU 容器显式设置 `NVIDIA_VISIBLE_DEVICES=<分配的 UUID 列表>`，CPU-only
+    容器设置 `NVIDIA_VISIBLE_DEVICES=void`；CUDA 基础镜像继承的
+    `NVIDIA_VISIBLE_DEVICES=all` 不再与 DeviceRequests 取并集，
+    `docker inspect` 解析以 DeviceRequests 为权威。
   - 禁止 privileged、Docker socket、host PID/network namespace、host 系统挂载。
   - managed container 仅在 DB container ID、allocation 状态、owner 和 GPU UUID
     集合全部匹配时才豁免 unmanaged-GPU 检查。
 - 容器 SSH 与 VS Code：
+  - 容器身份初始化（/etc/passwd、/etc/group、HOME）在 allocation 创建时执行，
+    容器只有初始化成功后才转入 active；VS Code 准备流程只负责 SSH 密钥与
+    连接配置（幂等重跑身份脚本作为防御）。
+  - 默认 HOME 位于容器可写层内（受 storage_opt 配额约束、随容器销毁）；
+    `container_home_tmpfs_gb > 0` 时改为等容量 tmpfs。
+  - GUI VS Code 按钮通过 `--readiness-file` JSON 协议等待真实就绪
+    （listening/ready/error），并显式传递配置路径；不再假成功。
+  - GUI 提供 job 启动与 `/workspace/.udc-logs/` 持久日志查看。
   - 容器 sshd 使用 inetd 模式，由 Broker 通过 Docker exec 隧道启动。
   - Host SSH 保持 key-only、`ForceCommand` 限制和转发禁用。
   - 容器 sshd 仅允许 local TCP forwarding，用于 Remote-SSH；remote、Unix-socket、
@@ -120,8 +141,14 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 - udev 规则应用后，现有 `/dev/nvidia*` 属主/权限是否立即变化，以及是否影响正在
   运行的训练容器。
 - GPU 审计在 reboot 和 NVIDIA driver reload 后是否仍通过。
-- 容器可写层配额、tmpfs HOME、持久 `/workspace` 和 release/re-apply 行为。
+- 容器可写层配额、临时 HOME（默认在可写层内；`container_home_tmpfs_gb > 0` 时为
+  tmpfs）、持久 `/workspace` 和 release/re-apply 行为。
 - 文件传输的 TOCTOU、路径逃逸、symlink、配额和中断恢复测试。
+- 成员配额闭环的解析在真实 XFS/ext4 上的行为：`lsattr -p` 的 project ID、
+  继承探针文件、`xfs_quota report` 的块单位（代码按 512B/1K/4K/1M 容错）、
+  `repquota -P` 的输出格式。
+- GUI VS Code readiness 文件协议、job 启动/日志端点，以及 Docker 容量闸门
+  （`min_free_docker_gb`）在真实主机上的阈值行为。
 
 ## 6. 下一会话执行顺序
 

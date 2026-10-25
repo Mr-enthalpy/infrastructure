@@ -182,7 +182,9 @@ stop, restart, or alter training containers.
 
 - Write one marker under `/workspace` and one under `$HOME`.
 - Release and re-apply. The `/workspace` marker must survive; the `$HOME` marker
-  must be absent because HOME is a fresh tmpfs.
+  must be absent because HOME lives in the container writable layer (or in the
+  optional tmpfs when `container_home_tmpfs_gb > 0`) and is destroyed with the
+  container.
 - Confirm that the writable-layer quota rejects growth beyond
   `writable_layer_gb` and that the rejection does not affect `/workspace`.
 

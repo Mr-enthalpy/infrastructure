@@ -94,6 +94,8 @@ class DockerBackend(Protocol):
 
     def create_container(self, allocation: Allocation) -> ContainerRef: ...
 
+    def initialize_container_identity(self, container_id: str, allocation: Allocation) -> None: ...
+
     def remove_container(self, container_id: str) -> None: ...
 
     def storage_preflight(self) -> tuple[bool, str]: ...
@@ -396,19 +398,28 @@ class DockerDriver:
                 refs.append("all")
             elif isinstance(count, int) and count > 0:
                 refs.append("any")
-        for device in host_config.get("Devices") or []:
-            if not isinstance(device, dict):
-                continue
-            path = str(device.get("PathOnHost", ""))
-            match = re.search(r"/dev/nvidia(\d+)$", path)
-            if match:
-                refs.append(match.group(1))
-        for item in config.get("Env") or []:
-            text = str(item)
-            if not text.startswith("NVIDIA_VISIBLE_DEVICES="):
-                continue
-            value = text.split("=", 1)[1]
-            refs.extend(part.strip() for part in value.split(",") if part.strip())
+        if not refs:
+            for device in host_config.get("Devices") or []:
+                if not isinstance(device, dict):
+                    continue
+                path = str(device.get("PathOnHost", ""))
+                match = re.search(r"/dev/nvidia(\d+)$", path)
+                if match:
+                    refs.append(match.group(1))
+        if not refs:
+            # NVIDIA_VISIBLE_DEVICES is inherited from base images (CUDA
+            # images default to "all"), so it is only consulted when Docker
+            # reports no authoritative device assignment of its own. Otherwise
+            # a container granted one GPU via DeviceRequests plus an inherited
+            # image env would falsely appear to hold every GPU.
+            env_value = ""
+            for item in config.get("Env") or []:
+                text = str(item)
+                if text.startswith("NVIDIA_VISIBLE_DEVICES="):
+                    env_value = text.split("=", 1)[1]
+                    break
+            if env_value.strip().lower() not in {"", "void", "none"}:
+                refs.extend(part.strip() for part in env_value.split(",") if part.strip())
         return ContainerInfo(
             id=str(container.id),
             name=str(container.name),
@@ -503,8 +514,29 @@ class DockerDriver:
             "/run": "rw,nosuid,nodev,size=64m",
             "/var/tmp": "rw,nosuid,nodev,size=256m",
         }
-        if dev_profile:
-            tmpfs[home] = f"rw,nosuid,nodev,size=1g,uid={uid},gid={gid},mode=0700"
+        if dev_profile and self.config.policy.container_home_tmpfs_gb > 0:
+            # Opt-in tmpfs HOME. By default HOME lives in the container's
+            # quota-bounded writable layer (created by
+            # initialize_container_identity) so VS Code Server and tool caches
+            # are bounded by the same storage_opt limit and vanish with the
+            # container instead of consuming host memory.
+            tmpfs[home] = (
+                f"rw,nosuid,nodev,size={self.config.policy.container_home_tmpfs_gb}g,"
+                f"uid={uid},gid={gid},mode=0700"
+            )
+        # CUDA base images ship NVIDIA_VISIBLE_DEVICES=all. Without an explicit
+        # override the NVIDIA runtime injects every GPU into a container that
+        # was granted one, and CPU-only containers inherit image defaults.
+        if allocation.gpus:
+            nvidia_env = {
+                "NVIDIA_VISIBLE_DEVICES": ",".join(allocation.gpus),
+                "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+            }
+        else:
+            nvidia_env = {
+                "NVIDIA_VISIBLE_DEVICES": "void",
+                "NVIDIA_DRIVER_CAPABILITIES": "void",
+            }
         kwargs: dict[str, Any] = {
             "command": ["sleep", "infinity"],
             "detach": True,
@@ -522,9 +554,9 @@ class DockerDriver:
             },
             "working_dir": "/workspace",
             "environment": {
-                "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
                 "HOME": home,
                 "PYTHONDONTWRITEBYTECODE": "1",
+                **nvidia_env,
             },
             "cap_drop": ["ALL"],
             "read_only": False if dev_profile else self.config.policy.container_read_only,
@@ -559,23 +591,44 @@ class DockerDriver:
         return ContainerRef(id=str(container.id), name=str(container.name))
 
     def storage_preflight(self) -> tuple[bool, str]:
-        """Check that Docker writable-layer quotas are enforceable.
+        """Check Docker storage capacity and writable-layer quota enforcement.
 
         ``storage-opt size`` works only with the overlay2 driver on XFS mounted
-        with project quotas. Anything else must fail closed.
+        with project quotas. Anything else must fail closed. Independently of
+        the profile, the Docker root must keep ``policy.min_free_docker_gb``
+        free: per-container writable-layer quotas do not stop many containers
+        from together filling the disk that also holds OS and Docker metadata.
         """
 
         policy = self.config.policy
+        info: dict[str, Any] | None = None
+        if policy.min_free_docker_gb > 0 or (
+            policy.container_profile == "development" and policy.writable_layer_gb > 0
+        ):
+            try:
+                info = self.client.info()
+            except DockerException as exc:
+                return False, f"cannot inspect Docker storage: {exc}"
+        if policy.min_free_docker_gb > 0:
+            docker_root = str((info or {}).get("DockerRootDir", ""))
+            if not docker_root:
+                return False, "DockerRootDir is unknown; cannot verify free capacity"
+            try:
+                usage = shutil.disk_usage(docker_root)
+            except OSError as exc:
+                return False, f"cannot inspect Docker storage directory: {exc}"
+            free_gb = usage.free // 1024**3
+            if free_gb < policy.min_free_docker_gb:
+                return False, (
+                    f"Docker storage {docker_root} has only {free_gb} GiB free; "
+                    f"policy.min_free_docker_gb is {policy.min_free_docker_gb}"
+                )
         if policy.container_profile != "development" or policy.writable_layer_gb <= 0:
             return True, "writable-layer quota is not required"
         if os.name != "posix":
             return False, "Docker storage preflight is only supported on Linux"
-        try:
-            info = self.client.info()
-        except DockerException as exc:
-            return False, f"cannot inspect Docker storage: {exc}"
-        driver = str(info.get("Driver", ""))
-        docker_root = str(info.get("DockerRootDir", ""))
+        driver = str((info or {}).get("Driver", ""))
+        docker_root = str((info or {}).get("DockerRootDir", ""))
         if driver != "overlay2":
             return False, f"Docker storage driver is {driver or 'unknown'}, expected overlay2"
         findmnt = shutil.which("findmnt")
@@ -656,38 +709,28 @@ class DockerDriver:
         )
         return int(info.get("ExitCode", -1)), text, ""
 
-    def prepare_container_ssh(
-        self,
-        container_id: str,
-        uid: int,
-        gid: int,
-        username: str,
-        public_keys: list[str],
-        home: str,
-    ) -> None:
-        """Install a per-allocation SSH identity inside a dev container."""
+    @staticmethod
+    def _identity_script(uid: int, gid: int, username: str, home: str) -> str:
+        """Build the idempotent passwd/group/home bootstrap for a member UID.
 
-        if self.config.policy.container_profile != "development":
-            raise DockerError("VS Code tunnels require the development container profile")
-        if not public_keys:
-            raise DockerError("member has no SSH public keys to authorize")
-        if uid <= 0:
-            raise DockerError("VS Code tunnels require a non-root member UID")
+        Docker happily runs a numeric UID that has no /etc/passwd entry, but
+        sudo and login shells need a full identity record. This runs at
+        allocation creation (not only when VS Code is opened) so the very
+        first `sudo apt install` inside the container works.
+        """
+
         safe_name = re.sub(r"[^a-z0-9_-]", "-", username.lower()) or f"udc{uid}"
-        if ".." in PurePosixPath(home).parts or not home.startswith("/home/") or home == "/home/":
-            raise DockerError("invalid container home for SSH")
-        keys = "\n".join(key.strip() for key in public_keys if key.strip())
-        script = f"""
+        return f"""
 set -eu
 home={shlex.quote(home)}
 group_entry="udc-{safe_name}:x:{gid}:"
-# Serialize concurrent tunnel preparation when util-linux is available.
+# Serialize concurrent preparation when util-linux is available.
 if command -v flock >/dev/null 2>&1; then
     exec 9>/run/udc-ssh.lock
     flock 9
 fi
 # Base images commonly already use UID 1000 for an "ubuntu" account. Reuse the
-# entry for the member UID instead of failing SSH login, and drop a conflicting
+# entry for the member UID instead of failing login, and drop a conflicting
 # image account with the same name when it is a regular user account.
 awk -F: -v OFS=: -v uid="{uid}" -v gid="{gid}" -v name="{safe_name}" -v home="$home" '
     $1 == name && $3 != uid {{
@@ -718,11 +761,67 @@ awk -F: -v OFS=: -v uid="{uid}" -v gid="{gid}" -v name="{safe_name}" -v home="$h
 chmod 0644 /etc/passwd.udc
 mv /etc/passwd.udc /etc/passwd
 grep -q "^[^:]*:[^:]*:{gid}:" /etc/group || echo "$group_entry" >> /etc/group
+mkdir -p "$home"
+chown {uid}:{gid} "$home"
+chmod 700 "$home"
+"""
+
+    def initialize_container_identity(self, container_id: str, allocation: Allocation) -> None:
+        """Create the member identity inside a dev container after creation.
+
+        Called by the broker before an allocation can become active, so the
+        container is never usable without a passwd entry. No-op for the
+        restricted profile, which grants no sudo and keeps a read-only rootfs.
+        """
+
+        if self.config.policy.container_profile != "development":
+            return
+        container_user = self._container_user(allocation)
+        uid, gid = self._split_user(container_user)
+        if uid <= 0:
+            raise DockerError("development containers require a non-root member UID")
+        home = self._development_home(allocation)
+        code, output, _err = self._exec_capture(
+            container_id,
+            ["/bin/sh", "-c", self._identity_script(uid, gid, allocation.owner_name, home)],
+            user="0:0",
+        )
+        if code != 0:
+            raise DockerError(f"cannot initialize container identity: {output.strip()}")
+
+    def prepare_container_ssh(
+        self,
+        container_id: str,
+        uid: int,
+        gid: int,
+        username: str,
+        public_keys: list[str],
+        home: str,
+    ) -> None:
+        """Install a per-allocation SSH identity inside a dev container.
+
+        The passwd entry is only re-ensured here (idempotently); the
+        authoritative creation point is :meth:`initialize_container_identity`
+        at allocation creation.
+        """
+
+        if self.config.policy.container_profile != "development":
+            raise DockerError("VS Code tunnels require the development container profile")
+        if not public_keys:
+            raise DockerError("member has no SSH public keys to authorize")
+        if uid <= 0:
+            raise DockerError("VS Code tunnels require a non-root member UID")
+        if ".." in PurePosixPath(home).parts or not home.startswith("/home/") or home == "/home/":
+            raise DockerError("invalid container home for SSH")
+        keys = "\n".join(key.strip() for key in public_keys if key.strip())
+        script = f"""
+set -eu
+{self._identity_script(uid, gid, username, home)}
 mkdir -p "$home/.ssh"
-chmod 700 "$home" "$home/.ssh"
+chmod 700 "$home/.ssh"
 printf '%s\\n' {shlex.quote(keys)} > "$home/.ssh/authorized_keys"
 chmod 600 "$home/.ssh/authorized_keys"
-chown {uid}:{gid} "$home" "$home/.ssh" "$home/.ssh/authorized_keys"
+chown {uid}:{gid} "$home/.ssh" "$home/.ssh/authorized_keys"
 # /run is a fresh tmpfs at container start, so the image's /run/sshd is gone.
 mkdir -p /run/sshd
 chmod 0755 /run/sshd

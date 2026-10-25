@@ -153,6 +153,7 @@
       state.queue = queuePayload.ok ? (queuePayload.data.queue || []) : [];
       renderMyAllocations();
       renderMyQueue();
+      renderJobStartChoices();
       // Job inspection costs one SSH/Docker round trip per active allocation.
       // Keep it off the 5-second status poll.
       if (!state.jobsRefreshedAt || Date.now() - state.jobsRefreshedAt >= 30000) {
@@ -216,6 +217,21 @@
     });
   }
 
+  function renderJobStartChoices() {
+    const select = $("#job-start-allocation");
+    if (!select) return;
+    const allocations = (state.my?.allocations || []).filter(
+      (item) => item.status === "active",
+    );
+    const current = select.value;
+    select.innerHTML = allocations.map((allocation) => `
+      <option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))} · GPU ${esc((allocation.gpus || []).join(",") || "cpu")}</option>
+    `).join("");
+    if (allocations.some((allocation) => allocation.id === current)) {
+      select.value = current;
+    }
+  }
+
   function renderJobs() {
     const target = $("#my-jobs");
     const jobs = state.jobs || [];
@@ -232,6 +248,7 @@
         <div class="muted">${esc(job.log_bytes ?? 0)} bytes</div>
         <div class="row-actions">
           <button data-action="job-attach" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">attach</button>
+          <button data-action="job-logs" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">logs</button>
           <button data-action="job-stop" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">stop</button>
         </div>
       </div>
@@ -239,6 +256,7 @@
     target.querySelectorAll("button[data-action]").forEach((button) => {
       button.addEventListener("click", () => {
         if (button.dataset.action === "job-attach") openTerminal(button.dataset.id, button.dataset.job);
+        if (button.dataset.action === "job-logs") openJobLogs(button.dataset.id, button.dataset.job);
         if (button.dataset.action === "job-stop") stopJob(button.dataset.id, button.dataset.job);
       });
     });
@@ -503,11 +521,39 @@
     }
   }
 
+  async function startJob(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const errorTarget = $("#job-start-error");
+    errorTarget.textContent = "";
+    const data = new FormData(form);
+    const allocationId = String(data.get("allocation") || "");
+    const name = String(data.get("name") || "").trim();
+    const command = String(data.get("command") || "").trim().split(/\s+/).filter(Boolean);
+    if (!allocationId || !name || !command.length) {
+      errorTarget.textContent = "allocation、任务名和命令都不能为空";
+      return;
+    }
+    try {
+      const payload = await api(`/api/jobs/${encodeURIComponent(allocationId)}/start`, {
+        method: "POST",
+        body: { name, command },
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(`Job ${payload.data.name} started; log: ${payload.data.log}`, "ok");
+      form.reset();
+      await refreshJobs();
+    } catch (error) {
+      errorTarget.textContent = String(error.message || error);
+    }
+  }
+
   async function openVscode(id) {
     try {
       const payload = await api(`/api/vscode/${encodeURIComponent(id)}`, { method: "POST" });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash("VS Code tunnel started; check the VS Code window.", "ok");
+      const detail = payload.data?.uri ? `: ${payload.data.uri}` : "";
+      flash(`VS Code tunnel is listening${detail}; check the VS Code window.`, "ok");
     } catch (error) {
       flash(String(error.message || error), "error");
     }
@@ -518,9 +564,28 @@
     $("#terminal-modal").hidden = true;
     $("#logs-modal").hidden = false;
     $("#modal-backdrop").hidden = false;
+    $("#logs-modal-title").textContent = "Logs";
     $("#logs-content").textContent = "loading…";
     try {
       const payload = await api(`/api/logs/${encodeURIComponent(id)}?tail=300`);
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      $("#logs-content").textContent = payload.data.logs || "(empty)";
+    } catch (error) {
+      $("#logs-content").textContent = String(error.message || error);
+    }
+  }
+
+  async function openJobLogs(id, name) {
+    closeTerminal();
+    $("#terminal-modal").hidden = true;
+    $("#logs-modal").hidden = false;
+    $("#modal-backdrop").hidden = false;
+    $("#logs-modal-title").textContent = `Job logs · ${name}`;
+    $("#logs-content").textContent = "loading…";
+    try {
+      const payload = await api(
+        `/api/job-logs/${encodeURIComponent(id)}?name=${encodeURIComponent(name)}&tail=300`,
+      );
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
       $("#logs-content").textContent = payload.data.logs || "(empty)";
     } catch (error) {
@@ -764,6 +829,8 @@
         errorTarget.textContent = String(error.message || error);
       }
     });
+
+    $("#job-start-form").addEventListener("submit", startJob);
 
     $("#admin-release-form").addEventListener("submit", async (event) => {
       event.preventDefault();

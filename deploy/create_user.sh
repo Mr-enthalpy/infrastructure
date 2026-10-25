@@ -10,6 +10,8 @@ USERNAME=""
 SSH_KEY=""
 SSH_KEY_STRING=""
 WORKSPACE_ROOT=${UDC_WORKSPACE_ROOT:-/data1/udc-users}
+WORKSPACE_LIMIT_GB=${UDC_WORKSPACE_LIMIT_GB:-200}
+SKIP_WORKSPACE=0
 MEMBER_SHELL=/usr/local/libexec/udc-resource/member-shell
 PYTHON_BIN=${PYTHON_BIN:-}
 
@@ -22,6 +24,8 @@ Options:
   --ssh-key PATH          Install this public key into authorized_keys.
   --ssh-key-string TEXT   Install a literal public key into authorized_keys.
   --workspace-root PATH   Workspace parent (default: /data1/udc-users).
+  --limit-gb N            Per-member workspace hard quota in GiB (default: 200).
+  --no-workspace          Do not create a workspace or configure its quota.
   --dry-run               Print actions without changing the host.
   --yes                   Required for a real (non-dry-run) change.
   -h, --help              Show this help.
@@ -29,6 +33,11 @@ Options:
 Members are placed in udc-members and udc-cli and are subject to SSH
 ForceCommand. Administrators use udc-admins as their primary group and keep a
 normal shell; they must not be members of udc-members.
+
+Each account also receives a workspace directory with a filesystem project
+quota (project ID = UID, hard limit --limit-gb). The broker re-verifies and,
+if needed, reprovisions this quota before every allocation, but creating it
+here keeps member provisioning a single transaction.
 EOF
 }
 
@@ -66,6 +75,12 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -gt 0 ] || fail "--workspace-root requires a path"
             WORKSPACE_ROOT=$1
             ;;
+        --limit-gb)
+            shift
+            [ "$#" -gt 0 ] || fail "--limit-gb requires a value"
+            WORKSPACE_LIMIT_GB=$1
+            ;;
+        --no-workspace) SKIP_WORKSPACE=1 ;;
         -h|--help)
             usage
             exit 0
@@ -86,6 +101,7 @@ done
 [ -n "$USERNAME" ] || { usage; exit 2; }
 [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail "invalid Linux username: $USERNAME"
 [ "$USERNAME" != "root" ] || fail "refusing to modify root"
+[[ "$WORKSPACE_LIMIT_GB" =~ ^[1-9][0-9]*$ ]] || fail "limit-gb must be positive"
 
 if [ "$DRY_RUN" -eq 0 ]; then
     [ "$(id -u)" -eq 0 ] || fail "run as root, or use --dry-run"
@@ -265,6 +281,76 @@ if [ -n "$SSH_KEY" ] || [ -n "$SSH_KEY_STRING" ]; then
 fi
 
 run install -d -o root -g root -m 0755 "$WORKSPACE_ROOT"
+
+# ---------------------------------------------------------------------------
+# Workspace provisioning transaction: create the directory, assign the
+# project ID (convention: project ID = UID), set the hard quota, and verify
+# the result by querying the filesystem back.
+# ---------------------------------------------------------------------------
+provision_workspace() {
+    local ws_dir=$1 uid=$2 mount fstype
+    mount=$(findmnt -no TARGET -T "$ws_dir") || fail "cannot determine mount for $ws_dir"
+    fstype=$(findmnt -no FSTYPE -T "$ws_dir") || fail "cannot determine filesystem type"
+    local soft_gb=$((WORKSPACE_LIMIT_GB / 2))
+    [ "$soft_gb" -ge 1 ] || soft_gb=1
+    if [ "$fstype" = "xfs" ]; then
+        command -v xfs_quota >/dev/null 2>&1 || fail "xfs_quota not found"
+        xfs_quota -x -c "project -s -p $ws_dir $uid" "$mount" \
+            || fail "could not assign project ID $uid to $ws_dir"
+        xfs_quota -x -c "limit -p bsoft=${soft_gb}g bhard=${WORKSPACE_LIMIT_GB}g $uid" "$mount" \
+            || fail "could not set XFS project quota for $uid"
+    elif [ "$fstype" = "ext4" ] || [ "$fstype" = "ext3" ] || [ "$fstype" = "ext2" ]; then
+        command -v chattr >/dev/null 2>&1 || fail "chattr not found"
+        command -v setquota >/dev/null 2>&1 || fail "setquota not found"
+        chattr -R -p "$uid" "$ws_dir" || fail "could not assign project ID $uid to $ws_dir"
+        find "$ws_dir" -type d -exec chattr +P {} + \
+            || fail "could not enable project inheritance on $ws_dir"
+        local soft_kib=$((soft_gb * 1024 * 1024)) hard_kib=$((WORKSPACE_LIMIT_GB * 1024 * 1024))
+        setquota -P "$uid" "$soft_kib" "$hard_kib" 0 0 "$mount" \
+            || fail "could not set ext4 project quota for $uid"
+    else
+        fail "unsupported workspace filesystem $fstype; use XFS/ext4 project quotas"
+    fi
+}
+
+verify_workspace_quota() {
+    local ws_dir=$1 uid=$2 mount fstype hard projid
+    projid=$(lsattr -p -d "$ws_dir" 2>/dev/null | awk '{print $1}')
+    [ "$projid" = "$uid" ] || fail "project ID of $ws_dir is '$projid', expected $uid"
+    mount=$(findmnt -no TARGET -T "$ws_dir") || fail "cannot determine mount for $ws_dir"
+    fstype=$(findmnt -no FSTYPE -T "$ws_dir") || fail "cannot determine filesystem type"
+    if [ "$fstype" = "xfs" ]; then
+        # Accept the same block sizes xfs_quota may report (1K/2K/4K/1M).
+        hard=$(xfs_quota -x -c "report -p -b" "$mount" 2>/dev/null \
+            | awk -v u="$uid" '$1==u || $1=="#"u {print $4; exit}')
+        case "$hard" in
+            "$((WORKSPACE_LIMIT_GB * 1024 * 1024))"|\
+            "$((WORKSPACE_LIMIT_GB * 2048 * 1024))"|\
+            "$((WORKSPACE_LIMIT_GB * 256 * 1024))"|\
+            "$WORKSPACE_LIMIT_GB") ;;
+            *) fail "XFS hard limit for project $uid is '$hard', expected ${WORKSPACE_LIMIT_GB}g" ;;
+        esac
+    else
+        hard=$(repquota -P "$mount" 2>/dev/null \
+            | awk -v u="#$uid" '$1==u {c=0; for (i=3; i<=NF; i++) if ($i ~ /^[0-9]+$/) {c++; if (c==3) {print $i; exit}}}')
+        [ "$hard" = "$((WORKSPACE_LIMIT_GB * 1024 * 1024))" ] \
+            || fail "ext4 hard limit for project $uid is '$hard', expected ${WORKSPACE_LIMIT_GB}g"
+    fi
+    ok "workspace quota verified: $ws_dir (project $uid, hard ${WORKSPACE_LIMIT_GB}g)"
+}
+
+if [ "$SKIP_WORKSPACE" -eq 0 ]; then
+    WS_DIR="$WORKSPACE_ROOT/$USERNAME"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        note "would create workspace $WS_DIR (project ID = UID, hard ${WORKSPACE_LIMIT_GB}g) and verify it"
+    else
+        uid=$(id -u "$USERNAME") || fail "could not resolve UID for $USERNAME"
+        primary_gid=$(id -g "$USERNAME") || fail "could not resolve primary GID for $USERNAME"
+        run install -d -o "$uid" -g "$primary_gid" -m 0700 "$WS_DIR"
+        provision_workspace "$WS_DIR" "$uid"
+        verify_workspace_quota "$WS_DIR" "$uid"
+    fi
+fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
     ok "account ready: $USERNAME"

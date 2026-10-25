@@ -41,6 +41,7 @@ class FakeDocker:
         gpu_count: int = 8,
         fail_create: bool = False,
         fail_remove: bool = False,
+        fail_identity_init: bool = False,
     ) -> None:
         self.gpus = [
             GPU(
@@ -64,6 +65,8 @@ class FakeDocker:
         self.storage_ok = True
         self.storage_detail = "storage preflight passed"
         self.prepared_ssh: list[dict[str, object]] = []
+        self.initialized_identity: list[dict[str, object]] = []
+        self.fail_identity_init = fail_identity_init
         self.tunnels: list[str] = []
         self._next_id = 1
 
@@ -106,6 +109,18 @@ class FakeDocker:
             },
         )
         return ContainerRef(id=container_id, name=name)
+
+    def initialize_container_identity(self, container_id: str, allocation: Allocation) -> None:
+        if self.fail_identity_init:
+            raise RuntimeError("simulated identity initialization failure")
+        self.initialized_identity.append(
+            {
+                "container_id": container_id,
+                "allocation_id": allocation.id,
+                "owner_uid": allocation.owner_uid,
+                "owner_name": allocation.owner_name,
+            }
+        )
 
     def remove_container(self, container_id: str) -> None:
         if self.fail_remove:

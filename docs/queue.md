@@ -32,13 +32,17 @@ Broker 仅在 `active` 模式下调度队列，且必须同时满足以下条件
   数量均满足；
 - 请求的 GPU 索引存在于数据库 inventory 中。
 
-调度顺序为 `priority DESC, created_at ASC, id`。准入后立即创建容器并激活
+调度顺序为 `priority DESC, created_at ASC, rowid`（插入序）。随机 id 不参与
+排序：当 created_at 相同（时钟冻结或同一秒内提交）时，以随机 id 决胜会让后来的
+请求越过更早的请求。准入后立即创建容器并激活
 allocation；容器创建或 workspace 准备失败时，将 allocation 标记为 `failed` 并
 释放 claim。
 
 所有 `apply` 都必须尊重队列。存在未过期的 `queued` 请求时，必须先触发调度；若
 队首仍无法准入，直接申请必须进入队列，或在 `--no-queue` 下被拒绝，不得越过队列。
-只有队列为空且资源可用时，申请才可直接创建 allocation。
+只有队列为空且资源可用时，申请才可直接创建 allocation。队列空检查位于数据库
+事务内（`create_allocation` 的 `BEGIN IMMEDIATE`），并发提交的请求无法在应用层
+预检查和 allocation 插入之间绕过队列。
 
 `--no-queue` 仅表示“不等待、不保留请求”。它不会绕过已存在的排队请求，也不会在
 资源不足时创建 allocation。

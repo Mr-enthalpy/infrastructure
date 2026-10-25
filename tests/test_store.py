@@ -369,3 +369,14 @@ def test_per_user_gpu_limit_is_enforced(tmp_path):
             max_active_allocations_per_user=10,
         )
     connection.close()
+
+
+def test_create_allocation_cannot_bypass_pending_queue(tmp_path):
+    connection = _connection(tmp_path)
+    queue_id = _queue(connection, gpus=(3,), now=NOW)
+    with pytest.raises(GpuBusy, match="queued requests are pending"):
+        _create(connection, gpus=("GPU-3",))
+    store.cancel_queue_request(connection, queue_id, actor_uid=1000, reason="done", now=NOW)
+    allocation_id = _create(connection, gpus=("GPU-3",))
+    assert allocation_id
+    connection.close()

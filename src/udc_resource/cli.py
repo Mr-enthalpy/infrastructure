@@ -51,6 +51,24 @@ app.add_typer(queue_app, name="queue")
 ALLOCATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+def _write_readiness(path: Path | None, stage: str, **extra: Any) -> None:
+    """Publish VS Code startup progress for the GUI (best effort, atomic).
+
+    Stages: ``starting``, ``listening`` (local tunnel bound), ``ready`` (IDE
+    launch attempted), ``error`` (terminal failure with a message).
+    """
+
+    if path is None:
+        return
+    payload: dict[str, Any] = {"stage": stage, **extra}
+    try:
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        pass
+
+
 def _config_path(path: Path | None) -> Path:
     if path is not None:
         return path
@@ -436,6 +454,7 @@ async def _serve_vscode_tunnel(
     ssh_config: Path,
     identity: Path | None,
     launch_code: bool,
+    readiness_file: Path | None = None,
 ) -> None:
     ssh_command = shlex.join(["udc-resource", "tunnel", allocation_id])
     ssh_argv = [
@@ -544,9 +563,15 @@ async def _serve_vscode_tunnel(
     port = int(sockets[0].getsockname()[1])
     block = _managed_block(allocation_id, host, port, username, identity)
     created = _install_managed_block(ssh_config, allocation_id, block)
+    remote_uri = f"vscode-remote://ssh-remote+{host}/workspace"
+    _write_readiness(
+        readiness_file,
+        "listening",
+        port=port,
+        uri=remote_uri,
+    )
     typer.echo(f"local tunnel: 127.0.0.1:{port} -> {host} (allocation {allocation_id})")
     typer.echo(f"ssh config: {ssh_config}")
-    remote_uri = f"vscode-remote://ssh-remote+{host}/workspace"
     try:
         if launch_code:
             code = shutil.which("code")
@@ -567,6 +592,7 @@ async def _serve_vscode_tunnel(
                 )
         else:
             typer.echo(f"VS Code folder URI: {remote_uri}")
+        _write_readiness(readiness_file, "ready", uri=remote_uri)
         typer.echo("Press Ctrl-C to close the tunnel.")
         await stop.wait()
     finally:
@@ -1543,16 +1569,26 @@ def vscode_command(
         "--code/--no-code",
         help="Launch the VS Code CLI after the tunnel is ready.",
     ),
+    readiness_file: Path | None = typer.Option(
+        None,
+        "--readiness-file",
+        help="Write JSON startup progress here (used by the GUI).",
+    ),
 ) -> None:
     """Open a container through a Broker-mediated SSH tunnel in VS Code."""
 
+    def fail(error_code: str, message: str) -> NoReturn:
+        _write_readiness(readiness_file, "error", code=error_code, message=message)
+        _fail(error_code, message, False)
+
     config = _load(ctx)
     if not ALLOCATION_ID_RE.fullmatch(allocation_id):
-        _fail("bad_request", "invalid allocation id", False)
+        fail("bad_request", "invalid allocation id")
     if not config.policy.vscode_enabled:
-        _fail("forbidden", "VS Code support is disabled by policy", False)
+        fail("forbidden", "VS Code support is disabled by policy")
     alias = server or config.server.ssh_alias
     remote = shlex.join(["udc-resource", "status", allocation_id, "--json"])
+    _write_readiness(readiness_file, "starting")
     try:
         status = subprocess.run(
             [*_ssh_base(config), alias, remote],
@@ -1564,25 +1600,24 @@ def vscode_command(
             timeout=config.gui.connect_timeout + 15,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _fail("ssh_unavailable", f"cannot query allocation: {exc}", False)
+        fail("ssh_unavailable", f"cannot query allocation: {exc}")
     if status.returncode != 0:
-        _fail(
+        fail(
             "ssh_error",
             status.stderr.strip() or "could not inspect the allocation",
-            False,
         )
     try:
         envelope = json.loads(status.stdout)
         allocation = envelope["data"]["allocation"]
     except (json.JSONDecodeError, KeyError, TypeError):
-        _fail("protocol", "server returned an invalid allocation response", False)
+        fail("protocol", "server returned an invalid allocation response")
     if not isinstance(allocation, dict) or allocation.get("status") != "active":
-        _fail("conflict", "allocation is not active", False)
+        fail("conflict", "allocation is not active")
     username = str(allocation.get("owner") or "")
     if not username:
-        _fail("protocol", "allocation owner is missing", False)
+        fail("protocol", "allocation owner is missing")
     if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
-        _fail("protocol", "allocation owner name is not supported by the tunnel", False)
+        fail("protocol", "allocation owner name is not supported by the tunnel")
     configured_identity = config.policy.vscode_identity_file.strip()
     identity_path = identity
     if identity_path is None and configured_identity:
@@ -1590,7 +1625,7 @@ def vscode_command(
     if identity_path is None:
         identity_path = _default_identity()
     if identity_path is not None and not identity_path.is_file():
-        _fail("bad_request", f"SSH identity file not found: {identity_path}", False)
+        fail("bad_request", f"SSH identity file not found: {identity_path}")
     config_path = (
         ssh_config.expanduser() if ssh_config is not None else Path.home() / ".ssh" / "config"
     )
@@ -1607,14 +1642,15 @@ def vscode_command(
                 ssh_config=config_path,
                 identity=identity_path,
                 launch_code=code,
+                readiness_file=readiness_file,
             )
         )
     except KeyboardInterrupt:
         pass
     except OSError as exc:
-        _fail("internal", f"could not start the VS Code tunnel: {exc}", False)
+        fail("internal", f"could not start the VS Code tunnel: {exc}")
     except RuntimeError as exc:
-        _fail("internal", f"could not start the VS Code tunnel: {exc}", False)
+        fail("internal", f"could not start the VS Code tunnel: {exc}")
 
 
 @app.command("gui")
@@ -1648,6 +1684,7 @@ def gui_command(
         admin_alias=admin_server or config.gui.admin_ssh or None,
         port=port,
         open_browser=not no_browser,
+        config_path=str(Path(ctx.obj)),
     )
 
 

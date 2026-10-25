@@ -62,6 +62,8 @@ class PolicyConfig:
     container_sudo: bool = False
     writable_layer_gb: int = 0
     container_home: str = ""
+    container_home_tmpfs_gb: int = 0
+    min_free_docker_gb: int = 20
     userns_mode: str = ""
     legacy_audit_required: bool = True
     legacy_audit_script: str = "/usr/local/libexec/udc-resource/audit_legacy.sh"
@@ -221,6 +223,8 @@ def load_config(path: str | Path) -> LabConfig:
         container_sudo=bool(policy_raw.get("container_sudo", False)),
         writable_layer_gb=int(policy_raw.get("writable_layer_gb", 0)),
         container_home=str(policy_raw.get("container_home", "")),
+        container_home_tmpfs_gb=int(policy_raw.get("container_home_tmpfs_gb", 0)),
+        min_free_docker_gb=int(policy_raw.get("min_free_docker_gb", 20)),
         userns_mode=str(policy_raw.get("userns_mode", "")),
         legacy_audit_required=bool(policy_raw.get("legacy_audit_required", True)),
         legacy_audit_script=str(
@@ -304,6 +308,12 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("writable_layer_gb is only supported in the development profile")
     if policy.writable_layer_gb < 0:
         raise ValueError("policy.writable_layer_gb must not be negative")
+    if policy.container_home_tmpfs_gb < 0:
+        raise ValueError("policy.container_home_tmpfs_gb must not be negative")
+    if policy.container_home_tmpfs_gb > 64:
+        raise ValueError("policy.container_home_tmpfs_gb must not exceed 64")
+    if policy.min_free_docker_gb < 0:
+        raise ValueError("policy.min_free_docker_gb must not be negative")
     if policy.container_home:
         if not policy.container_home.startswith("/"):
             raise ValueError("policy.container_home must be an absolute path")

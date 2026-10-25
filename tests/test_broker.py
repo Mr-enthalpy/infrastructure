@@ -1291,3 +1291,139 @@ async def test_job_lifecycle(tmp_path, active_config):
     stopped = await _call(broker, "job_stop", {"id": allocation_id, "name": "train"}, ALICE)
     assert stopped["ok"] is True
     assert "train" not in fake.jobs[container_id]
+
+
+async def test_apply_verifies_and_self_heals_member_quota(tmp_path, active_config, monkeypatch):
+    from udc_resource.broker import server as broker_server
+    from udc_resource.workspace_quota import MemberQuotaResult
+
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            workspace_quota_required=True,
+            max_workspace_gb=200,
+        ),
+    )
+    broker, docker = _broker(
+        tmp_path,
+        config,
+        quota_check=lambda: QuotaCheckResult(True, "filesystem supports project quotas"),
+    )
+    calls = {"verify": 0, "provision": 0}
+
+    def fake_verify(workspace, uid, limit, **kwargs):
+        calls["verify"] += 1
+        if calls["verify"] == 1:
+            return MemberQuotaResult(False, "project ID is 0, expected 1000")
+        return MemberQuotaResult(True, "ok", project_id=uid, hard_limit_bytes=limit * 1024**3)
+
+    def fake_provision(workspace, uid, limit, **kwargs):
+        calls["provision"] += 1
+        assert uid == 1000
+        assert limit == 200
+        return MemberQuotaResult(True, "ok", project_id=uid, hard_limit_bytes=limit * 1024**3)
+
+    monkeypatch.setattr(broker_server, "verify_member_quota", fake_verify)
+    monkeypatch.setattr(broker_server, "provision_member_quota", fake_provision)
+    response = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert response["ok"] is True
+    # One verification, one provisioning (provisioning verifies internally).
+    assert calls == {"verify": 1, "provision": 1}
+    assert docker.created
+
+
+async def test_apply_blocks_when_member_quota_cannot_be_enforced(
+    tmp_path,
+    active_config,
+    monkeypatch,
+):
+    from udc_resource.broker import server as broker_server
+    from udc_resource.workspace_quota import MemberQuotaResult
+
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            workspace_quota_required=True,
+            max_workspace_gb=200,
+        ),
+    )
+    broker, docker = _broker(
+        tmp_path,
+        config,
+        quota_check=lambda: QuotaCheckResult(True, "filesystem supports project quotas"),
+    )
+    monkeypatch.setattr(
+        broker_server,
+        "verify_member_quota",
+        lambda *a, **k: MemberQuotaResult(False, "project ID is 0, expected 1000"),
+    )
+    monkeypatch.setattr(
+        broker_server,
+        "provision_member_quota",
+        lambda *a, **k: MemberQuotaResult(False, "xfs_quota is not installed"),
+    )
+    response = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert response["ok"] is False
+    assert "workspace quota could not be enforced" in response["error"]["message"]
+    assert docker.created == []
+    status = await _call(broker, "status", {}, ALICE)
+    assert status["data"]["allocations"][0]["status"] == "failed"
+
+
+async def test_allocation_is_gated_on_container_identity_initialization(
+    tmp_path,
+    active_config,
+):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+        ),
+    )
+    docker = FakeDocker()
+    broker, docker = _broker(tmp_path, config, docker=docker)
+    response = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert response["ok"] is True
+    assert len(docker.initialized_identity) == 1
+    assert docker.initialized_identity[0]["owner_uid"] == ALICE.uid
+    assert docker.initialized_identity[0]["allocation_id"] == response["data"]["id"]
+
+    second_dir = tmp_path / "phase2"
+    second_dir.mkdir()
+    second = FakeDocker(fail_identity_init=True)
+    broker, second = _broker(second_dir, config, docker=second)
+    failed = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert failed["ok"] is False
+    assert second.initialized_identity == []
+    assert second.removed, "container must be removed after identity failure"
+    status = await _call(broker, "status", {}, ALICE)
+    assert status["data"]["allocations"][0]["status"] == "failed"
+
+
+async def test_concurrent_applies_queue_behind_existing_request(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_process(GPUProcess(gpu_uuid="GPU-3", pid=4242, used_mib=1024, process_name="python"))
+    broker, fake = _broker(tmp_path, active_config, docker=fake)
+    first = await _call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert first["ok"] is True
+    assert first["data"]["status"] == "queued"
+    attempts = await asyncio.gather(
+        *[_call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, BOB) for _ in range(3)]
+    )
+    queued = [item for item in attempts if item["ok"] and item["data"].get("status") == "queued"]
+    assert len(queued) == 3, attempts
+    assert fake.created == []
+    # Head-of-line blocking: only the oldest queued request is admitted once
+    # the GPU frees up, and later requests keep their queue positions.
+    fake.processes.clear()
+    admitted = await broker._schedule_queue()
+    assert len(admitted) == 1
+    remaining = await _call(broker, "queue_list", {}, BOB)
+    assert len(remaining["data"]["queue"]) == 3

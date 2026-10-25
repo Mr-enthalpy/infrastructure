@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NoReturn
 
 from .. import store
 from ..config import LabConfig
@@ -51,7 +51,12 @@ from ..stream import (
     read_frame,
     write_frame,
 )
-from ..workspace_quota import QuotaCheckResult, check_workspace_quota
+from ..workspace_quota import (
+    QuotaCheckResult,
+    check_workspace_quota,
+    provision_member_quota,
+    verify_member_quota,
+)
 from . import workspace_io
 from .docker_driver import (
     ContainerInfo,
@@ -200,9 +205,6 @@ class Broker:
         return None
 
     def _run_storage_check(self) -> str | None:
-        if self.config.policy.container_profile != "development":
-            self._storage_failure = None
-            return None
         try:
             passed, detail = self.docker.storage_preflight()
         except Exception as exc:
@@ -1426,7 +1428,10 @@ class Broker:
                 "message": self._quota_failure or "",
             },
             "storage": {
-                "required": self.config.policy.container_profile == "development",
+                "required": (
+                    self.config.policy.container_profile == "development"
+                    or self.config.policy.min_free_docker_gb > 0
+                ),
                 "ok": self._storage_failure is None,
                 "message": self._storage_failure or "",
             },
@@ -1854,6 +1859,36 @@ class Broker:
         with self._connection() as connection:
             return store.get_queue_request(connection, queue_id, now=self._now())
 
+    def _verify_member_workspace_quota(self, workspace: str, owner_uid: int) -> None:
+        """Per-allocation gate: the member directory must really be bounded.
+
+        ``check_workspace_quota`` only proves the filesystem *supports* project
+        quotas. This verifies the member's own project ID, project inheritance,
+        and hard limit, provisioning them on first use so a workspace created
+        after ``configure_quotas.sh`` ran can never slip through unbounded.
+        """
+
+        if (
+            not self.config.policy.workspace_quota_required
+            or self.config.policy.max_workspace_gb <= 0
+        ):
+            return
+        if owner_uid <= 0:
+            logger.warning("skipping member workspace quota verification for UID %d", owner_uid)
+            return
+        limit_gb = self.config.policy.max_workspace_gb
+        result = verify_member_quota(workspace, owner_uid, limit_gb)
+        if result.passed:
+            return
+        logger.warning(
+            "member workspace %s is not quota-bounded (%s); reprovisioning",
+            workspace,
+            result.detail,
+        )
+        provisioned = provision_member_quota(workspace, owner_uid, limit_gb)
+        if not provisioned.passed:
+            raise Conflict(f"workspace quota could not be enforced: {provisioned.detail}")
+
     async def _materialize_allocation(self, allocation_id: str) -> dict[str, Any]:
         with self._connection() as connection:
             allocation_data = store.get_allocation(
@@ -1879,6 +1914,11 @@ class Broker:
                 owner_uid=owner_uid,
                 owner_gid=owner_gid,
             )
+            await asyncio.to_thread(
+                self._verify_member_workspace_quota,
+                str(allocation_data["workspace"]),
+                owner_uid,
+            )
         except Exception as exc:
             with self._connection() as connection:
                 store.fail_allocation(
@@ -1903,6 +1943,42 @@ class Broker:
                     now=self._now(),
                 )
             raise DockerError(f"container creation failed: {exc}") from exc
+
+        async def _fail_activated_container(step: str, exc: Exception) -> NoReturn:
+            logger.exception("%s failed for %s", step, allocation_id)
+            cleanup_failed = False
+            try:
+                await asyncio.to_thread(self.docker.remove_container, container.id)
+            except Exception:
+                cleanup_failed = True
+                logger.exception(
+                    "could not remove container %s after %s failure",
+                    container.id,
+                    step,
+                )
+            with self._connection() as connection:
+                store.fail_allocation(
+                    connection,
+                    allocation_id,
+                    reason=f"{step} failed: {exc}",
+                    now=self._now(),
+                )
+            if cleanup_failed:
+                raise InternalError(f"{step} failed and container cleanup failed") from exc
+            raise InternalError("allocation could not be activated") from exc
+
+        # The container only becomes usable once its member identity exists:
+        # without this gate, `sudo` inside the container fails with "you do
+        # not exist in the passwd database" on first use for base images that
+        # lack the member UID.
+        try:
+            await asyncio.to_thread(
+                self.docker.initialize_container_identity,
+                container.id,
+                allocation,
+            )
+        except Exception as exc:
+            await _fail_activated_container("container identity initialization", exc)
         try:
             with self._connection() as connection:
                 store.activate_allocation(
@@ -1914,28 +1990,7 @@ class Broker:
                 )
                 return store.get_allocation(connection, allocation_id, now=self._now())
         except Exception as exc:
-            logger.exception("allocation activation failed for %s", allocation_id)
-            cleanup_failed = False
-            try:
-                await asyncio.to_thread(self.docker.remove_container, container.id)
-            except Exception:
-                cleanup_failed = True
-                logger.exception(
-                    "could not remove container %s after activation failure",
-                    container.id,
-                )
-            with self._connection() as connection:
-                store.fail_allocation(
-                    connection,
-                    allocation_id,
-                    reason=f"activation failed: {exc}",
-                    now=self._now(),
-                )
-            if cleanup_failed:
-                raise InternalError(
-                    "allocation activation failed and container cleanup failed"
-                ) from exc
-            raise InternalError("allocation could not be activated") from exc
+            await _fail_activated_container("allocation activation", exc)
 
     async def _schedule_queue_safely(self, trigger: str) -> None:
         try:

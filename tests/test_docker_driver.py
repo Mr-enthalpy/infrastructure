@@ -191,6 +191,8 @@ def test_create_container_uses_expected_isolation(monkeypatch, active_config, tm
     assert kwargs["tmpfs"]["/tmp"].startswith("rw,nosuid,nodev")
     assert kwargs["environment"]["HOME"] == "/workspace"
     assert kwargs["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert kwargs["environment"]["NVIDIA_VISIBLE_DEVICES"] == "GPU-3,GPU-5"
+    assert kwargs["environment"]["NVIDIA_DRIVER_CAPABILITIES"] == "compute,utility"
     assert kwargs["user"]
     device_request = kwargs["device_requests"][0]
     assert device_request.device_ids == ["GPU-3", "GPU-5"]
@@ -206,6 +208,7 @@ def test_development_profile_creates_disposable_admin_container(active_config, t
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
+            min_free_docker_gb=0,
             container_home="",
         ),
     )
@@ -224,9 +227,47 @@ def test_development_profile_creates_disposable_admin_container(active_config, t
     assert kwargs["storage_opt"] == {"size": "20G"}
     assert kwargs["labels"]["udc.profile"] == "development"
     assert kwargs["environment"]["HOME"] == "/home/alice"
-    assert "/home/alice" in kwargs["tmpfs"]
-    assert "mode=0700" in kwargs["tmpfs"]["/home/alice"]
+    # Default HOME lives in the quota-bounded writable layer, not a tmpfs.
+    assert "/home/alice" not in kwargs["tmpfs"]
+    assert kwargs["environment"]["NVIDIA_VISIBLE_DEVICES"] == "GPU-3,GPU-5"
     assert kwargs["volumes"] == {allocation.workspace: {"bind": "/workspace", "mode": "rw"}}
+
+
+def test_development_profile_tmpfs_home_is_opt_in(active_config, tmp_path):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+            container_home="",
+            container_home_tmpfs_gb=2,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    driver.create_container(_allocation(tmp_path))
+    kwargs = fake_client.containers.run_kwargs
+    assert kwargs is not None
+    assert "size=2g" in kwargs["tmpfs"]["/home/alice"]
+    assert "mode=0700" in kwargs["tmpfs"]["/home/alice"]
+
+
+def test_cpu_only_container_disables_nvidia_injection(active_config, tmp_path):
+    driver = DockerDriver(active_config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    allocation = replace(_allocation(tmp_path), gpus=())
+    driver.create_container(allocation)
+    kwargs = fake_client.containers.run_kwargs
+    assert kwargs is not None
+    assert kwargs["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
+    assert kwargs["environment"]["NVIDIA_DRIVER_CAPABILITIES"] == "void"
+    assert "device_requests" not in kwargs
 
 
 def test_storage_preflight_rejects_non_overlay_driver(monkeypatch, active_config):
@@ -238,6 +279,7 @@ def test_storage_preflight_rejects_non_overlay_driver(monkeypatch, active_config
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
+            min_free_docker_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -259,6 +301,7 @@ def test_storage_preflight_accepts_overlay_on_xfs_prjquota(monkeypatch, active_c
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
+            min_free_docker_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -283,6 +326,30 @@ def test_storage_preflight_accepts_overlay_on_xfs_prjquota(monkeypatch, active_c
     assert "nosuid workspace" in detail
 
 
+def test_storage_preflight_blocks_low_docker_disk(active_config, tmp_path, monkeypatch):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            min_free_docker_gb=10,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": str(tmp_path)}
+    driver._client = fake_client
+    usage = SimpleNamespace(free=5 * 1024**3)
+    monkeypatch.setattr(docker_driver.shutil, "disk_usage", lambda path: usage)
+    passed, detail = driver.storage_preflight()
+    assert passed is False
+    assert "5 GiB free" in detail
+    assert str(tmp_path) in detail
+
+    usage.free = 64 * 1024**3
+    passed, detail = driver.storage_preflight()
+    assert passed is True
+
+
 def test_storage_preflight_requires_nosuid_workspace(monkeypatch, active_config):
     config = replace(
         active_config,
@@ -292,6 +359,7 @@ def test_storage_preflight_requires_nosuid_workspace(monkeypatch, active_config)
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
+            min_free_docker_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -325,6 +393,7 @@ def test_prepare_container_ssh_installs_keys_as_root(active_config):
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
+            min_free_docker_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -362,6 +431,7 @@ def test_prepare_container_ssh_rejects_root_uid(active_config):
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
+            min_free_docker_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -569,7 +639,7 @@ def test_logs_reads_container_output(active_config):
     assert driver.logs(container.id, 20) == "line one\nline two\n"
 
 
-def test_container_info_extracts_gpu_refs(active_config):
+def test_container_info_prefers_device_requests_over_image_env(active_config):
     driver = DockerDriver(active_config)
     container = FakeContainer()
     container.attrs["HostConfig"] = {
@@ -578,9 +648,38 @@ def test_container_info_extracts_gpu_refs(active_config):
         ],
         "Devices": [{"PathOnHost": "/dev/nvidia7", "PathInContainer": "/dev/nvidia7"}],
     }
+    # CUDA base images inherit NVIDIA_VISIBLE_DEVICES=all; the authoritative
+    # DeviceRequests must win instead of being unioned with the image env.
+    container.attrs["Config"]["Env"] = ["NVIDIA_VISIBLE_DEVICES=all"]
+    info = driver._container_info(container)
+    assert set(info.gpu_refs) == {"GPU-3"}
+
+
+def test_container_info_falls_back_to_devices_then_env(active_config):
+    driver = DockerDriver(active_config)
+    container = FakeContainer()
+    container.attrs["HostConfig"] = {
+        "Devices": [{"PathOnHost": "/dev/nvidia7", "PathInContainer": "/dev/nvidia7"}],
+    }
     container.attrs["Config"]["Env"] = ["NVIDIA_VISIBLE_DEVICES=5"]
     info = driver._container_info(container)
-    assert set(info.gpu_refs) == {"GPU-3", "7", "5"}
+    assert set(info.gpu_refs) == {"7"}
+
+    container.attrs["HostConfig"] = {}
+    info = driver._container_info(container)
+    assert set(info.gpu_refs) == {"5"}
+
+
+def test_container_info_ignores_void_env_without_devices(active_config):
+    driver = DockerDriver(active_config)
+    container = FakeContainer()
+    container.attrs["HostConfig"] = {}
+    container.attrs["Config"]["Env"] = [
+        "NVIDIA_VISIBLE_DEVICES=void",
+        "NVIDIA_DRIVER_CAPABILITIES=void",
+    ]
+    info = driver._container_info(container)
+    assert info.gpu_refs == ()
 
 
 def test_container_info_treats_count_minus_one_as_all(active_config):

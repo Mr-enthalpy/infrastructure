@@ -47,6 +47,14 @@ container_profile = "development"
 container_sudo = true
 writable_layer_gb = 40
 container_home = ""
+# 0 = HOME lives in the quota-bounded writable layer and vanishes with the
+# container. Set > 0 for a tmpfs HOME of that size in GiB (consumes container
+# memory; only prefer it if the writable-layer quota is not enough).
+container_home_tmpfs_gb = 0
+# Free space the Docker storage directory must keep before any new allocation
+# (protects the OS and Docker metadata from many quota-bounded containers
+# filling the disk together).
+min_free_docker_gb = 20
 userns_mode = ""
 legacy_audit_required = true
 legacy_audit_script = "/usr/local/libexec/udc-resource/audit_legacy.sh"

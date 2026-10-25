@@ -91,6 +91,14 @@ these tools is unavailable.
    member before active mode. Administrators use `--admin`, retain a normal
    shell, and must not be members of `udc-members`.
 
+   Each account also runs a workspace provisioning transaction: the member
+   directory is created, the project ID (= UID) and the hard quota
+   (`--limit-gb`, default 200) are assigned, and the result is verified by
+   querying the filesystem back. Use `--no-workspace` to skip it. The Broker
+   re-verifies — and if needed reprovisions — this quota before every
+   allocation, so a missing quota fails the allocation instead of leaving the
+   workspace unbounded.
+
 4. Install and validate the SSH policy. The installer installs the sshd drop-in,
    runs `sshd -t`, and reloads sshd. The member match block is key-only
    (`AuthenticationMethods publickey`), disables password and keyboard-interactive
@@ -119,9 +127,11 @@ these tools is unavailable.
    ```
 
    XFS and ext4 mounts must have project quotas enabled during a maintenance
-   window. The script does not remount `/data1`. Re-run it after adding members
-   and verify each member's project hard limit with `xfs_quota -x -c 'report -p
-   -b -h' <mount>` on XFS or `repquota -P <mount>` on ext4.
+   window. The script does not remount `/data1`. `create_user.sh` provisions
+   each new member's quota automatically; use this script to backfill or change
+   the limit for existing workspaces, then verify each member's project hard
+   limit with `xfs_quota -x -c 'report -p -b -h' <mount>` on XFS or
+   `repquota -P <mount>` on ext4.
 
 7. Start the broker in monitor-only mode and run the read-only security
    acceptance:

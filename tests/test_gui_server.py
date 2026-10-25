@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -60,6 +61,14 @@ class FakeRunner:
             data = {"queue_id": args[2], "status": "cancelled"}
         elif args[:2] == ["job", "list"]:
             data = {"jobs": [{"name": "train", "session": "udc-train", "log": "/tmp/x"}]}
+        elif args[:2] == ["job", "start"]:
+            data = {
+                "name": args[4],
+                "session": "udc-train",
+                "log": "/workspace/.udc-logs/train.log",
+            }
+        elif args[:2] == ["job", "logs"]:
+            data = {"id": args[2], "name": args[4], "logs": "epoch 1\n"}
         elif args[:2] == ["job", "stop"]:
             data = {"name": args[3], "stopped": True}
         elif args[:2] == ["admin", "users"]:
@@ -343,3 +352,185 @@ def test_ssh_runner_preserves_note_through_forcecommand(monitor_config, monkeypa
         note,
         "--json",
     ]
+
+
+async def test_job_start_and_persistent_log_endpoints(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        started = await client.post(
+            "/api/jobs/alloc-1/start",
+            headers=_headers(),
+            data=json.dumps({"name": "train", "command": ["python", "train.py", "-e", "10"]}),
+        )
+        assert started.status == 200
+        payload = await started.json()
+        assert payload["ok"] is True
+        assert payload["data"]["log"] == "/workspace/.udc-logs/train.log"
+        assert runner.calls[-1][1] == [
+            "job",
+            "start",
+            "alloc-1",
+            "--name",
+            "train",
+            "--",
+            "python",
+            "train.py",
+            "-e",
+            "10",
+        ]
+        bad = await client.post(
+            "/api/jobs/alloc-1/start",
+            headers=_headers(),
+            data=json.dumps({"name": "bad name!", "command": ["python"]}),
+        )
+        assert bad.status == 400
+        empty = await client.post(
+            "/api/jobs/alloc-1/start",
+            headers=_headers(),
+            data=json.dumps({"name": "train", "command": []}),
+        )
+        assert empty.status == 400
+        logs = await client.get("/api/job-logs/alloc-1?name=train&tail=50", headers=_headers())
+        assert logs.status == 200
+        assert (await logs.json())["data"]["logs"] == "epoch 1\n"
+    finally:
+        await client.close()
+
+
+class FakeVscodeProcess:
+    def __init__(self, argv, *, stage="listening", exit_code=None) -> None:
+        self.argv = argv
+        self.pid = 4242
+        self.returncode = exit_code
+        self.terminated = False
+        readiness_index = argv.index("--readiness-file")
+        readiness_path = Path(argv[readiness_index + 1])
+        if stage == "error":
+            payload = {"stage": "error", "message": "allocation is not active"}
+        else:
+            payload = {
+                "stage": stage,
+                "port": 39111,
+                "uri": "vscode-remote://ssh-remote+udc-alloc-1/workspace",
+            }
+        readiness_path.write_text(json.dumps(payload), encoding="utf-8")
+        FakeVscodeProcess.last = self
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        if self.returncode is None:
+            self.returncode = 0
+
+    def kill(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _fake_vscode_config(monitor_config):
+    from dataclasses import replace
+
+    return replace(
+        monitor_config,
+        policy=replace(monitor_config.policy, vscode_enabled=True),
+    )
+
+
+async def test_vscode_endpoint_waits_for_readiness(monitor_config, monkeypatch):
+    monkeypatch.setattr(
+        gui_server.subprocess,
+        "Popen",
+        lambda argv, **kwargs: FakeVscodeProcess(argv, stage="listening"),
+    )
+    runner = FakeRunner()
+    app = gui_server.create_app(
+        _fake_vscode_config(monitor_config),
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+        config_path="/etc/udc-resource/config.toml",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["ok"] is True
+        assert payload["data"]["stage"] == "listening"
+        assert payload["data"]["port"] == 39111
+        assert payload["data"]["pid"] == 4242
+        argv = FakeVscodeProcess.last.argv
+        assert "--config" in argv
+        assert argv[argv.index("--config") + 1] == "/etc/udc-resource/config.toml"
+        assert "--readiness-file" in argv
+    finally:
+        await client.close()
+
+
+async def test_vscode_endpoint_surfaces_readiness_error(monitor_config, monkeypatch):
+    monkeypatch.setattr(
+        gui_server.subprocess,
+        "Popen",
+        lambda argv, **kwargs: FakeVscodeProcess(argv, stage="error"),
+    )
+    runner = FakeRunner()
+    app = gui_server.create_app(
+        _fake_vscode_config(monitor_config),
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status == 500
+        payload = await response.json()
+        assert payload["ok"] is False
+        assert payload["error"]["message"] == "allocation is not active"
+        assert FakeVscodeProcess.last.terminated is True
+    finally:
+        await client.close()
+
+
+async def test_vscode_endpoint_reports_early_exit(monitor_config, monkeypatch):
+    monkeypatch.setattr(
+        gui_server.subprocess,
+        "Popen",
+        lambda argv, **kwargs: FakeVscodeProcess(argv, stage="starting", exit_code=3),
+    )
+    runner = FakeRunner()
+    app = gui_server.create_app(
+        _fake_vscode_config(monitor_config),
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status == 500
+        payload = await response.json()
+        assert "exited before ready" in payload["error"]["message"]
+    finally:
+        await client.close()
+
+
+async def test_vscode_endpoint_disabled_by_policy(monitor_config):
+    runner = FakeRunner()
+    app = gui_server.create_app(
+        monitor_config,
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status == 403
+    finally:
+        await client.close()

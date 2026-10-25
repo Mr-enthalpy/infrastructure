@@ -145,6 +145,19 @@ def test_member_ssh_policy_is_key_only_and_uses_root_owned_shell():
     assert "useradd --create-home --shell" in create_user
 
 
+def test_create_user_provisions_and_verifies_workspace_quota():
+    source = (ROOT / "deploy/create_user.sh").read_text(encoding="utf-8")
+    assert "--no-workspace" in source
+    assert "--limit-gb" in source
+    assert "provision_workspace" in source
+    assert "verify_workspace_quota" in source
+    # The provisioning transaction must query the filesystem back instead of
+    # trusting the apply commands' exit codes.
+    assert "lsattr -p -d" in source
+    assert "report -p -b" in source
+    assert "repquota -P" in source
+
+
 def test_audit_checks_effective_member_ssh_policy():
     source = (ROOT / "deploy/audit_legacy.sh").read_text(encoding="utf-8")
     assert "sshd -T -C" in source or '"-T" "-C"' in source or "-T -C" in source

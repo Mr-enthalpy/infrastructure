@@ -393,6 +393,11 @@ def create_allocation(
     allocation_id = uuid.uuid4().hex
     try:
         connection.execute("BEGIN IMMEDIATE")
+        # Fairness backstop: the queue-empty decision must be part of the same
+        # transaction that inserts the allocation. An application-layer check
+        # alone can race with a concurrent enqueue between check and insert.
+        if queue_request_count(connection, now=now or utcnow()):
+            raise GpuBusy("queued requests are pending; new requests must not bypass the queue")
         _check_capacity(
             connection,
             owner_uid=owner_uid,
@@ -434,7 +439,10 @@ def create_allocation(
 
 
 def _queue_row(connection: sqlite3.Connection, queue_id: str) -> sqlite3.Row:
-    row = connection.execute("SELECT * FROM queue_requests WHERE id = ?", (queue_id,)).fetchone()
+    row = connection.execute(
+        "SELECT rowid AS seq, * FROM queue_requests WHERE id = ?",
+        (queue_id,),
+    ).fetchone()
     if row is None:
         raise NotFound(f"queue request not found: {queue_id}")
     return row
@@ -453,7 +461,7 @@ def _queue_position(connection: sqlite3.Connection, row: sqlite3.Row) -> int | N
                   priority = ?
                   AND (
                       created_at < ?
-                      OR (created_at = ? AND id < ?)
+                      OR (created_at = ? AND rowid < ?)
                   )
               )
           )
@@ -463,7 +471,7 @@ def _queue_position(connection: sqlite3.Connection, row: sqlite3.Row) -> int | N
             int(row["priority"]),
             str(row["created_at"]),
             str(row["created_at"]),
-            str(row["id"]),
+            int(row["seq"]),
         ),
     ).fetchone()
     return int(position[0]) + 1 if position else 1
@@ -608,8 +616,14 @@ def list_queue_requests(
     if not include_finished:
         clauses.append("state = 'queued'")
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    # rowid is the insertion order tiebreaker. The random hex id must never
+    # decide ordering: with identical created_at (frozen clock, same-second
+    # commits) it would let a later request overtake an older one.
     rows = connection.execute(
-        f"SELECT * FROM queue_requests{where} ORDER BY priority DESC, created_at ASC, id",
+        f"""
+        SELECT rowid AS seq, * FROM queue_requests{where}
+        ORDER BY priority DESC, created_at ASC, rowid
+        """,
         params,
     ).fetchall()
     return [queue_to_dict(connection, row, now=now) for row in rows]
@@ -717,10 +731,12 @@ def admit_next_queued(
     current = now or utcnow()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        # rowid keeps strict insertion order when created_at ties (see
+        # list_queue_requests); the random id must never break the tie.
         rows = connection.execute(
-            "SELECT * FROM queue_requests "
+            "SELECT rowid AS seq, * FROM queue_requests "
             "WHERE state = 'queued' AND expires_at > ? "
-            "ORDER BY priority DESC, created_at ASC, id",
+            "ORDER BY priority DESC, created_at ASC, rowid",
             (current.isoformat(),),
         ).fetchall()
         for row in rows:

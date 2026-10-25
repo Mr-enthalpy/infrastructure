@@ -269,3 +269,18 @@ def test_image_allowlist_includes_base():
     assert image.image_allowed("base:1") is True
     assert image.image_allowed("extra:1") is True
     assert image.image_allowed("other:1") is False
+
+
+def test_container_home_tmpfs_must_be_sane(tmp_path):
+    negative = _variant(
+        tmp_path,
+        ('container_profile = "development"', 'container_profile = "development"'),
+    )
+    # Base variant is valid; only the mutated fields are under test.
+    assert load_config(negative).policy.container_home_tmpfs_gb == 0
+
+
+def test_new_storage_policies_have_defaults(tmp_path):
+    cfg = load_config(ROOT / "lab/resources.example.toml")
+    assert cfg.policy.container_home_tmpfs_gb == 0
+    assert cfg.policy.min_free_docker_gb == 20

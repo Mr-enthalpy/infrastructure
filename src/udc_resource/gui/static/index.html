@@ -93,6 +93,17 @@
         <h2>Jobs</h2>
         <button id="refresh-jobs" class="ghost">刷新</button>
       </div>
+      <div class="panel">
+        <h3>启动训练任务</h3>
+        <p class="muted">在 active allocation 中启动 detached 任务；日志持久写入 /workspace/.udc-logs/，随 allocation 保留。</p>
+        <form id="job-start-form" class="inline-form">
+          <select name="allocation" id="job-start-allocation" required></select>
+          <input name="name" placeholder="任务名（字母数字 . _ -）" maxlength="32" required>
+          <input name="command" placeholder="命令，例如 python train.py --epochs 10" required>
+          <button type="submit" class="primary">启动</button>
+        </form>
+        <span id="job-start-error" class="error-text"></span>
+      </div>
       <div id="my-jobs" class="allocation-list empty">No jobs.</div>
     </section>
 
@@ -150,7 +161,7 @@
   <div id="modal-backdrop" class="modal-backdrop" hidden>
     <div id="logs-modal" class="modal" hidden>
       <div class="modal-head">
-        <h2>Logs</h2>
+        <h2 id="logs-modal-title">Logs</h2>
         <button class="icon-button" data-close-modal>×</button>
       </div>
       <pre id="logs-content"></pre>
