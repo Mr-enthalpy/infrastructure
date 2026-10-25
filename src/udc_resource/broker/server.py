@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -42,7 +43,9 @@ from ..identity import (
 from ..legacy_audit import LegacyAuditResult, LegacyAuditRunner
 from ..members import load_members, public_member_data
 from ..membership import authorization as member_authz
+from ..membership import service as member_service
 from ..membership import store as member_store
+from ..membership.provisioning import ProvisioningClient, SpoolProvisioningClient
 from ..models import GPU, Allocation
 from ..stream import (
     FRAME_DATA,
@@ -107,6 +110,7 @@ class Broker:
         legacy_audit: Callable[[], LegacyAuditResult] | None = None,
         gpu_audit: Callable[[], GpuAuditResult] | None = None,
         quota_check: Callable[[], QuotaCheckResult] | None = None,
+        provisioning: ProvisioningClient | None = None,
         member_quota_check: Callable[[str, int, int], Any] | None = None,
         member_quota_provision: Callable[[str, int, int], Any] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -127,6 +131,9 @@ class Broker:
             config.policy.gpu_audit_script,
             timeout=config.policy.gpu_audit_timeout,
             expected_gpus=config.hardware.gpu_count,
+        )
+        self.provisioning = provisioning or SpoolProvisioningClient(
+            config.onboarding.provisioning_spool
         )
         self.quota_check = quota_check or (
             lambda: check_workspace_quota(
@@ -240,6 +247,296 @@ class Broker:
             membership_required=self.config.policy.membership_required,
             now=self._now(),
         )
+
+    def _provisioning_for_member(self, member_id: str) -> None:
+        """Cancel queues and tunnels for one member (§8.4 steps 2-3).
+
+        Called after the authoritative status/version changed so subsequent
+        operations are already refused; this reclaims in-flight work.
+        """
+        with self._connection() as connection:
+            member = member_store.get_member(connection, member_id)
+            uid = member["member"].get("linux_uid")
+            if uid is None:
+                return
+            queued = store.list_queue_requests(connection, owner_uid=int(uid), now=self._now())
+            for request in queued:
+                if request.get("status") == "queued":
+                    try:
+                        store.cancel_queue_request(
+                            connection,
+                            str(request["queue_id"]),
+                            actor_uid=0,
+                            reason="成员资格状态变更",
+                            now=self._now(),
+                        )
+                    except Exception:
+                        logger.exception("could not cancel queue request %s", request["queue_id"])
+        for allocation_id in list(self._tunnels):
+            self._cancel_tunnels(allocation_id)
+
+    def _open_db(self) -> sqlite3.Connection:
+        return connect(self.db_path)
+
+    def _request_id(self, args: dict[str, Any]) -> str:
+        request_id = args.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise BadRequest("request_id must be a non-empty string")
+        return request_id
+
+    async def _handle_membership_command(
+        self,
+        command: str,
+        identity: Any,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Admin membership management + member self-service keys (§7, §8)."""
+        admin_commands = {
+            "admin_requests_list",
+            "admin_requests_show",
+            "admin_requests_approve",
+            "admin_requests_reject",
+            "admin_members_list",
+            "admin_members_show",
+            "admin_members_suspend",
+            "admin_members_resume",
+            "admin_members_revoke",
+            "admin_operations_show",
+            "admin_operations_retry",
+        }
+        is_admin = command in admin_commands
+        if is_admin:
+            self._require_admin(identity)
+        else:
+            # Member self-service (me_keys_*): requires an active member.
+            if not self.config.policy.membership_required:
+                raise Forbidden("成员自助公钥管理未启用")
+            if identity.is_admin:
+                raise Forbidden("管理员公钥不走成员自助管理")
+        intake_db = self.config.onboarding.intake_db
+        provisioning = self.provisioning
+
+        if command == "admin_requests_list":
+            self._check_args(args, {"status"})
+            status = args.get("status")
+            if status is not None and not isinstance(status, str):
+                raise BadRequest("status must be a string")
+
+            def _list_requests() -> Any:
+                return member_service.list_requests(intake_db)
+
+            return await asyncio.to_thread(_list_requests)
+        if command == "admin_requests_show":
+            self._check_args(args, {"request_id"})
+            request_id = self._request_id(args)
+
+            def _show_request() -> Any:
+                decision = None
+                with self._connection() as connection:
+                    decision = member_store.get_application_decision(connection, request_id)
+                request = member_service.get_request(intake_db, request_id)
+                request["decision"] = decision
+                return request
+
+            return await asyncio.to_thread(_show_request)
+        if command == "admin_requests_approve":
+            self._check_args(
+                args,
+                {"request_id", "valid_until", "quota_gb", "review_note", "internal_note"},
+            )
+            request_id = self._request_id(args)
+            valid_until = args.get("valid_until", "") or ""
+            if not isinstance(valid_until, str):
+                raise BadRequest("valid_until must be a string")
+            quota_gb = args.get("quota_gb", 200)
+            if isinstance(quota_gb, bool) or not isinstance(quota_gb, int) or quota_gb <= 0:
+                raise BadRequest("quota_gb must be a positive integer")
+            review_note = args.get("review_note", "")
+            internal_note = args.get("internal_note", "")
+            if not isinstance(review_note, str) or not isinstance(internal_note, str):
+                raise BadRequest("notes must be strings")
+
+            def _approve() -> Any:
+                with self._connection() as connection:
+                    result = member_service.approve_request(
+                        connection,
+                        intake_db=intake_db,
+                        request_id=request_id,
+                        reviewer_uid=identity.uid,
+                        valid_until=valid_until,
+                        quota_gb=quota_gb,
+                        review_note=review_note,
+                        internal_note=internal_note,
+                        provisioning=provisioning,
+                        now=self._now(),
+                    )
+                    connection.commit()
+                    return result
+
+            return await asyncio.to_thread(_approve)
+        if command == "admin_requests_reject":
+            self._check_args(args, {"request_id", "review_note", "internal_note"})
+            request_id = self._request_id(args)
+            review_note = args.get("review_note", "")
+            internal_note = args.get("internal_note", "")
+            if not isinstance(review_note, str) or not review_note:
+                raise BadRequest("拒绝时必须给出申请人可见的原因")
+            if not isinstance(internal_note, str):
+                raise BadRequest("internal_note must be a string")
+
+            def _reject() -> Any:
+                with self._connection() as connection:
+                    result = member_service.reject_request(
+                        connection,
+                        intake_db=intake_db,
+                        request_id=request_id,
+                        reviewer_uid=identity.uid,
+                        review_note=review_note,
+                        internal_note=internal_note,
+                        now=self._now(),
+                    )
+                    connection.commit()
+                    return result
+
+            return await asyncio.to_thread(_reject)
+        if command == "admin_members_list":
+            self._check_args(args)
+            with self._connection() as connection:
+                return {"members": member_store.list_members(connection)}
+        if command == "admin_members_show":
+            self._check_args(args, {"member_id"})
+            member_id = args.get("member_id")
+            if not isinstance(member_id, str) or not member_id:
+                raise BadRequest("member_id must be a non-empty string")
+            with self._connection() as connection:
+                return member_store.get_member(connection, member_id)
+        if command in {
+            "admin_members_suspend",
+            "admin_members_resume",
+            "admin_members_revoke",
+        }:
+            self._check_args(args, {"member_id", "reason"})
+            member_id = args.get("member_id")
+            reason = args.get("reason", "")
+            if not isinstance(member_id, str) or not member_id:
+                raise BadRequest("member_id must be a non-empty string")
+            if not isinstance(reason, str) or not reason:
+                raise BadRequest("reason is required for member status changes")
+            target = {
+                "admin_members_suspend": "suspended",
+                "admin_members_resume": "active",
+                "admin_members_revoke": "revoked",
+            }[command]
+
+            def _transition() -> Any:
+                with self._connection() as connection:
+                    if target == "suspended":
+                        result = member_service.suspend_member(
+                            connection,
+                            member_id,
+                            actor_uid=identity.uid,
+                            reason=reason,
+                            provisioning=provisioning,
+                            on_member_change=self._provisioning_for_member,
+                            now=self._now(),
+                        )
+                    elif target == "active":
+                        result = member_service.resume_member(
+                            connection,
+                            member_id,
+                            actor_uid=identity.uid,
+                            reason=reason,
+                            provisioning=provisioning,
+                            now=self._now(),
+                        )
+                    else:
+                        result = member_service.revoke_member(
+                            connection,
+                            member_id,
+                            actor_uid=identity.uid,
+                            reason=reason,
+                            provisioning=provisioning,
+                            now=self._now(),
+                        )
+                    connection.commit()
+                    return result
+
+            return await asyncio.to_thread(_transition)
+        if command == "admin_operations_show":
+            self._check_args(args, {"operation_id"})
+            operation_id = args.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise BadRequest("operation_id must be a non-empty string")
+            with self._connection() as connection:
+                return member_store.get_operation(connection, operation_id)
+        if command == "admin_operations_retry":
+            self._check_args(args, {"operation_id"})
+            operation_id = args.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise BadRequest("operation_id must be a non-empty string")
+
+            def _retry() -> Any:
+                with self._connection() as connection:
+                    result = member_service.retry_operation(
+                        connection,
+                        operation_id,
+                        provisioning=provisioning,
+                        intake_db=intake_db,
+                        actor_uid=identity.uid,
+                        now=self._now(),
+                    )
+                    connection.commit()
+                    return result
+
+            return await asyncio.to_thread(_retry)
+        if command == "me_keys_add":
+            self._check_args(args, {"public_key"})
+            public_key = args.get("public_key")
+            if not isinstance(public_key, str) or not public_key.strip():
+                raise BadRequest("public_key must be a non-empty string")
+            from ..membership.models import parse_public_key
+
+            normalized, fingerprint = parse_public_key(public_key)
+
+            def _add_key() -> Any:
+                with self._connection() as connection:
+                    decision = member_store.check_access(connection, identity.uid, now=self._now())
+                    if not decision["allowed"]:
+                        raise Forbidden("成员状态不允许管理公钥")
+                    key_id = member_store.add_key(
+                        connection,
+                        str(decision["member_id"]),
+                        public_key=normalized,
+                        fingerprint=fingerprint,
+                        now=self._now(),
+                    )
+                    connection.commit()
+                    return {"key_id": key_id, "fingerprint": fingerprint}
+
+            return await asyncio.to_thread(_add_key)
+        if command == "me_keys_revoke":
+            self._check_args(args, {"key_id"})
+            key_id = args.get("key_id")
+            if not isinstance(key_id, str) or not key_id:
+                raise BadRequest("key_id must be a non-empty string")
+
+            def _revoke_key() -> Any:
+                with self._connection() as connection:
+                    decision = member_store.check_access(connection, identity.uid, now=self._now())
+                    if not decision["allowed"]:
+                        raise Forbidden("成员状态不允许管理公钥")
+                    member_store.revoke_key(
+                        connection,
+                        str(decision["member_id"]),
+                        key_id=key_id,
+                        actor_uid=identity.uid,
+                        now=self._now(),
+                    )
+                    connection.commit()
+                    return {"key_id": key_id, "revoked": True}
+
+            return await asyncio.to_thread(_revoke_key)
+        raise BadRequest(f"unknown membership command: {command}")
 
     def _writable_layer_reservation_bytes(self, *, include_next_slot: bool) -> int:
         """Worst-case writable-layer growth promised to live allocations.
@@ -1529,6 +1826,22 @@ class Broker:
                 summary = await asyncio.to_thread(self.reconcile_once)
                 self._cancel_inactive_tunnels()
                 return _ok(summary)
+            if command in {
+                "admin_requests_list",
+                "admin_requests_show",
+                "admin_requests_approve",
+                "admin_requests_reject",
+                "admin_members_list",
+                "admin_members_show",
+                "admin_members_suspend",
+                "admin_members_resume",
+                "admin_members_revoke",
+                "admin_operations_show",
+                "admin_operations_retry",
+                "me_keys_add",
+                "me_keys_revoke",
+            }:
+                return _ok(await self._handle_membership_command(command, identity, args))
             raise BadRequest(f"unknown command: {command}")
         except UdcError as exc:
             return _error(exc.code, exc.message)

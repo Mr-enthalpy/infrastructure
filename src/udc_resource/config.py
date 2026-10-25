@@ -132,6 +132,7 @@ class OnboardingConfig:
     support_contact: str = ""
     legacy_login_notice_enabled: bool = True
     intake_db: str = "/var/lib/udc-resource-intake/applications.db"
+    provisioning_spool: str = "/var/lib/udc-resource/provision"
     presets: tuple[tuple[str, int, float, int, int], ...] = ()
 
 
@@ -452,6 +453,9 @@ def load_config(path: str | Path) -> LabConfig:
         legacy_login_notice_enabled=bool(onboarding_raw.get("legacy_login_notice_enabled", True)),
         intake_db=str(
             onboarding_raw.get("intake_db", "/var/lib/udc-resource-intake/applications.db")
+        ),
+        provisioning_spool=str(
+            onboarding_raw.get("provisioning_spool", "/var/lib/udc-resource/provision")
         ),
     )
     raw_presets = onboarding_raw.get("presets", [])
