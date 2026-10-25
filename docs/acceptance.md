@@ -226,7 +226,41 @@ both paths separately, inside the same test allocation:
 Record `id -G`, `nvidia-smi -L`, and the torch output for both paths in the
 evidence. `VS Code can execute /bin/true` alone is not sufficient evidence.
 
-### 5.6 Closed gates
+### 5.6 Container-root impact on host device nodes
+
+The development container does not use a user namespace by default: container
+UID 0 maps to host UID 0, and the NVIDIA runtime bind-mounts the host device
+nodes. Whether container root (available to the member through sudo) can
+change the ownership or permissions of those host nodes — and thereby affect
+other members' access — cannot be proven by CI and must be verified on an
+approved test machine or an explicitly approved test GPU, during the approved
+maintenance window, with the host device state recorded before and after.
+
+Procedure (one allocated test GPU, one test member):
+
+1. On the host, record the full pre-state:
+   `stat -c '%n %t:%T %a %u:%g' /dev/nvidia* /dev/nvidia-caps/nvidia* > before.txt`.
+2. Inside the container, as the member via sudo, attempt (in this order, on
+   the allocated GPU's node only):
+   `sudo stat /dev/nvidia<allocated>`,
+   `sudo chmod 0666 /dev/nvidia<allocated>`,
+   `sudo chown 1000:1000 /dev/nvidia<allocated>`.
+3. On the host, repeat the `stat` capture into `after.txt` and diff. If the
+   host inode changed, the container root can mutate host device state.
+4. As a second (non-allocated) test member on the host, attempt to read the
+   device before and after the change and record the difference.
+5. Restore the original mode/owner on the host node immediately and verify
+   with `diff before.txt after-restored.txt`.
+
+Record the complete transcript. If container root can mutate host nodes, note
+it in the acceptance report together with the compensating controls that must
+then be treated as load-bearing: the continuous GPU-permission audit (device
+fingerprint changes block new allocations), the absence of host mounts and
+Docker socket in the container, and workspace `nosuid`. Evaluate a
+`userns-remap` configuration as a follow-up; do not enable it without the
+dedicated verification listed in the handoff.
+
+### 5.7 Closed gates
 
 - File transfer must remain disabled outside the controlled acceptance run until
   TOCTOU-safe handling and quota tests pass.

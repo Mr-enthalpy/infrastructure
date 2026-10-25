@@ -1197,9 +1197,24 @@ class Broker:
                     raise Conflict(
                         "allocation owner name is not supported by the container SSH profile"
                     )
-                keys = await asyncio.to_thread(self._member_public_keys, identity.username)
+                # Authorize the allocation owner plus the current connecter:
+                # an administrator opening a member's allocation must not
+                # revoke the member's key material, and vice versa.
+                connecter_keys = await asyncio.to_thread(
+                    self._member_public_keys,
+                    identity.username,
+                )
+                owner_keys = await asyncio.to_thread(
+                    self._member_public_keys,
+                    container_user,
+                )
+                keys: list[str] = []
+                for key in [*owner_keys, *connecter_keys]:
+                    key = key.strip()
+                    if key and key not in keys:
+                        keys.append(key)
                 if not keys:
-                    raise Conflict("no SSH public keys found for this member on the host")
+                    raise Conflict("no SSH public keys found for this allocation on the host")
                 home = self._container_home(container_user, owner_uid)
                 await asyncio.to_thread(
                     self.docker.prepare_container_ssh,
@@ -2026,6 +2041,18 @@ class Broker:
         with self._connection() as connection:
             if store.queue_request_count(connection, now=self._now()) == 0:
                 return []
+        # Admission must be as fresh as a direct apply: re-run the audit gates
+        # here instead of trusting results cached by an earlier check, so a
+        # host permission or quota change between periodic audits pauses
+        # automatic admission too.
+        gpu_failure = await asyncio.to_thread(self._run_gpu_audit)
+        if gpu_failure:
+            logger.warning("queue scheduling paused by GPU audit gate: %s", gpu_failure)
+            return []
+        quota_failure = await asyncio.to_thread(self._run_quota_check)
+        if quota_failure:
+            logger.warning("queue scheduling paused by workspace quota gate: %s", quota_failure)
+            return []
         # Re-check the nosuid/quota storage gate at admission time instead of
         # relying only on the value cached at startup or the last direct apply.
         storage_failure = await asyncio.to_thread(self._run_storage_check)

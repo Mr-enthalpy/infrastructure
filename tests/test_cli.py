@@ -562,3 +562,35 @@ def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
         )
     text = ssh_config_path.read_text(encoding="utf-8") if ssh_config_path.exists() else ""
     assert "udc-abc123" not in text
+
+
+def test_sweep_stale_managed_blocks(tmp_path):
+    import socket as socket_module
+
+    live = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    live.bind(("127.0.0.1", 0))
+    live.listen(1)
+    live_port = live.getsockname()[1]
+    try:
+        config = tmp_path / "config"
+        config.write_text(
+            "# BEGIN UDC VSCODE dead1\n"
+            "Host udc-dead1\n"
+            "  HostName 127.0.0.1\n"
+            "  Port 1\n"
+            "# END UDC VSCODE dead1\n"
+            "\n"
+            f"# BEGIN UDC VSCODE live1\n"
+            "Host udc-live1\n"
+            "  HostName 127.0.0.1\n"
+            f"  Port {live_port}\n"
+            "# END UDC VSCODE live1\n",
+            encoding="utf-8",
+        )
+        removed = cli._sweep_stale_managed_blocks(config)
+        assert removed == 1
+        text = config.read_text(encoding="utf-8")
+        assert "dead1" not in text
+        assert "udc-live1" in text
+    finally:
+        live.close()

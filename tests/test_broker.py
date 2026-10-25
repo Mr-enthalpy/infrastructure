@@ -1604,3 +1604,129 @@ async def test_job_logs_survive_release(tmp_path, active_config):
     logs = await _call(broker, "job_logs", {"id": allocation_id, "name": "train"}, ALICE)
     assert logs["ok"] is True
     assert logs["data"]["logs"] == "epoch 1\nepoch 2\n"
+
+
+class _EofReader:
+    async def read(self, size: int = -1) -> bytes:
+        return b""
+
+
+class _TunnelWriter:
+    def __init__(self) -> None:
+        self.messages: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.messages.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def is_closing(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def test_queue_admission_reruns_gpu_audit(tmp_path, active_config):
+    """Automatic admission must not trust audit results cached earlier."""
+    state = {"fail": False}
+
+    def audit():
+        if state["fail"]:
+            return GpuAuditResult(False, "device permissions drifted", fingerprint="fp")
+        return GpuAuditResult(True, "clean", fingerprint="fp")
+
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, gpu_audit_required=True),
+    )
+    broker, fake = _broker(tmp_path, config, gpu_audit=audit)
+    first = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert first["ok"] is True
+    second = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, BOB)
+    assert second["data"]["status"] == "queued"
+
+    state["fail"] = True
+    released = await _call(broker, "release", {"id": first["data"]["id"]}, ALICE)
+    assert released["ok"] is True
+    queue = await _call(broker, "queue_get", {"id": second["data"]["queue_id"]}, BOB)
+    assert queue["data"]["queue"]["status"] == "queued"
+    assert broker._gpu_audit_failure is not None
+
+    state["fail"] = False
+    admitted = await broker._schedule_queue()
+    assert len(admitted) == 1
+
+
+def _tunnel_config(active_config):
+    return replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            vscode_enabled=True,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+        ),
+    )
+
+
+async def test_tunnel_authorizes_owner_plus_connecter(tmp_path, active_config):
+    docker = FakeDocker()
+    broker, docker = _broker(tmp_path, _tunnel_config(active_config), docker=docker)
+    applied = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+
+    def keys_for(username: str) -> list[str]:
+        if username == ALICE.username:
+            return ["ssh-ed25519 AAAA-owner-key owner"]
+        return ["ssh-ed25519 AAAA-admin-key admin"]
+
+    broker._member_public_keys = keys_for
+
+    await broker._handle_tunnel(
+        {"cmd": "tunnel", "args": {"id": allocation_id}},
+        reader=_EofReader(),
+        writer=_TunnelWriter(),
+        uid=ADMIN.uid,
+        gid=ADMIN.gid,
+    )
+    assert len(docker.prepared_ssh) == 1
+    prepared = docker.prepared_ssh[0]
+    # An administrator opening the member's allocation must not revoke the
+    # owner's keys.
+    assert "ssh-ed25519 AAAA-owner-key owner" in prepared["public_keys"]
+    assert "ssh-ed25519 AAAA-admin-key admin" in prepared["public_keys"]
+    assert prepared["uid"] == ALICE.uid
+
+    await broker._handle_tunnel(
+        {"cmd": "tunnel", "args": {"id": allocation_id}},
+        reader=_EofReader(),
+        writer=_TunnelWriter(),
+        uid=ALICE.uid,
+        gid=ALICE.gid,
+    )
+    assert docker.prepared_ssh[1]["public_keys"] == ["ssh-ed25519 AAAA-owner-key owner"]
+
+
+async def test_tunnel_without_any_keys_is_rejected(tmp_path, active_config):
+    docker = FakeDocker()
+    broker, docker = _broker(tmp_path, _tunnel_config(active_config), docker=docker)
+    applied = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    broker._member_public_keys = lambda username: []
+    writer = _TunnelWriter()
+    await broker._handle_tunnel(
+        {"cmd": "tunnel", "args": {"id": applied["data"]["id"]}},
+        reader=_EofReader(),
+        writer=writer,
+        uid=ALICE.uid,
+        gid=ALICE.gid,
+    )
+    assert docker.prepared_ssh == []
+    assert b'"conflict"' in b"".join(writer.messages)

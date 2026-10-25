@@ -858,3 +858,36 @@ def test_identity_script_without_gpu_group(active_config, tmp_path, monkeypatch)
     driver.initialize_container_identity("container-1", _allocation(tmp_path))
     script = fake_client.api.exec_create_kwargs["cmd"][2]
     assert "udc-gpu" not in script
+
+
+def test_prepare_container_ssh_merges_instead_of_overwriting(active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    driver.prepare_container_ssh(
+        "container-1",
+        1000,
+        1000,
+        "alice",
+        ["ssh-ed25519 AAAA-new-key alice"],
+        "/home/alice",
+    )
+    script = fake_client.api.exec_create_kwargs["cmd"][2]
+    # Existing keys are concatenated with the new ones, deduplicated, and the
+    # file is capped instead of being overwritten per connection.
+    assert 'cat "$home/.ssh/authorized_keys"' in script
+    assert "awk '!seen[$0]++'" in script
+    assert "tail -n 40" in script
+    assert "authorized_keys.udc" in script
+    assert "ssh-ed25519 AAAA-new-key alice" in script

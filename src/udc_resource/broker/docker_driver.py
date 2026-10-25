@@ -875,9 +875,20 @@ set -eu
 {self._identity_script(uid, gid, username, home, gpu_gid=self._gpu_group_id())}
 mkdir -p "$home/.ssh"
 chmod 700 "$home/.ssh"
-printf '%s\\n' {shlex.quote(keys)} > "$home/.ssh/authorized_keys"
-chmod 600 "$home/.ssh/authorized_keys"
-chown {uid}:{gid} "$home/.ssh" "$home/.ssh/authorized_keys"
+# Merge with existing authorized keys instead of overwriting: a concurrent
+# connection (e.g. an administrator opening the member's allocation) must not
+# revoke keys that other authorized users installed earlier. Dedup, prefer the
+# newest additions, and cap the file so it cannot grow without bound.
+{{
+    if [ -f "$home/.ssh/authorized_keys" ]; then
+        cat "$home/.ssh/authorized_keys"
+    fi
+    printf '%s\\n' {shlex.quote(keys)}
+}} | awk '!seen[$0]++' | tail -n 40 > "$home/.ssh/authorized_keys.udc"
+chmod 600 "$home/.ssh/authorized_keys.udc"
+chown {uid}:{gid} "$home/.ssh/authorized_keys.udc"
+mv "$home/.ssh/authorized_keys.udc" "$home/.ssh/authorized_keys"
+chown {uid}:{gid} "$home/.ssh"
 # /run is a fresh tmpfs at container start, so the image's /run/sshd is gone.
 mkdir -p /run/sshd
 chmod 0755 /run/sshd

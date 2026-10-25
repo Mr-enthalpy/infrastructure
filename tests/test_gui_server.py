@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -439,6 +441,11 @@ class FakeVscodeProcess:
     def poll(self):
         return self.returncode
 
+    def send_signal(self, sig):
+        self.signalled = sig
+        if self.returncode is None:
+            self.returncode = 0
+
     def terminate(self):
         self.terminated = True
         if self.returncode is None:
@@ -517,7 +524,14 @@ async def test_vscode_endpoint_keeps_waiting_while_only_listening(
         assert response.status == 500
         payload = await response.json()
         assert "did not report readiness" in payload["error"]["message"]
-        assert FakeVscodeProcess.last.terminated is True
+        last = FakeVscodeProcess.last
+        assert last.poll() is not None
+        if os.name == "nt":
+            import signal
+
+            assert last.signalled == signal.CTRL_BREAK_EVENT
+        else:
+            assert last.terminated is True
     finally:
         await client.close()
 
@@ -542,7 +556,14 @@ async def test_vscode_endpoint_surfaces_readiness_error(monitor_config, monkeypa
         payload = await response.json()
         assert payload["ok"] is False
         assert payload["error"]["message"] == "allocation is not active"
-        assert FakeVscodeProcess.last.terminated is True
+        last = FakeVscodeProcess.last
+        assert last.poll() is not None
+        if os.name == "nt":
+            import signal
+
+            assert last.signalled == signal.CTRL_BREAK_EVENT
+        else:
+            assert last.terminated is True
     finally:
         await client.close()
 
@@ -584,3 +605,41 @@ async def test_vscode_endpoint_disabled_by_policy(monitor_config):
         assert response.status == 403
     finally:
         await client.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises the Windows CTRL_BREAK path")
+async def test_stop_vscode_process_lets_windows_child_clean_up(tmp_path):
+    """terminate() would hard-kill the CLI and leak the SSH config block; the
+    GUI must send CTRL_BREAK_EVENT so the child's cleanup handler runs."""
+    import subprocess
+    import sys
+
+    started = tmp_path / "started"
+    cleaned = tmp_path / "cleaned"
+    child_code = (
+        "import pathlib, signal, sys, time\n"
+        "started, cleaned = sys.argv[1], sys.argv[2]\n"
+        "pathlib.Path(started).write_text('ok')\n"
+        "def handler(signum, frame):\n"
+        "    pathlib.Path(cleaned).write_text('ok')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGBREAK, handler)\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(started), str(cleaned)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+    for _ in range(100):
+        if started.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert started.exists(), "child did not start"
+
+    await gui_server._stop_vscode_process(process)
+
+    assert process.poll() is not None
+    assert cleaned.exists(), "child cleanup handler did not run"

@@ -288,6 +288,44 @@ def _default_identity() -> Path | None:
     return None
 
 
+def _sweep_stale_managed_blocks(path: Path) -> int:
+    """Remove managed SSH blocks whose local tunnel port is no longer open.
+
+    After a hard kill (or a crashed GUI) a leftover block only ever points at
+    a dead local listener. Probing 127.0.0.1:<port> is cheap, fully local, and
+    never touches the remote network; a live tunnel keeps its block.
+    """
+
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    pattern = re.compile(r"(?ms)^# BEGIN UDC VSCODE (\S+)\n.*?^# END UDC VSCODE \1\n?")
+    removed = 0
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal removed
+        body = match.group(0)
+        port_match = re.search(r"(?m)^\s*Port (\d+)\s*$", body)
+        stale = True
+        if port_match:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.settimeout(0.25)
+            try:
+                stale = probe.connect_ex(("127.0.0.1", int(port_match.group(1)))) != 0
+            finally:
+                probe.close()
+        if stale:
+            removed += 1
+            return ""
+        return body
+
+    updated = pattern.sub(_replace, existing)
+    if removed and updated != existing:
+        _atomic_config_write(path, updated)
+    return removed
+
+
 def _managed_block(
     allocation_id: str,
     host: str,
@@ -551,6 +589,21 @@ async def _serve_vscode_tunnel(
             loop.add_signal_handler(signum, stop.set)
         except (NotImplementedError, RuntimeError):
             break
+    if os.name == "nt":
+        # asyncio loop signal handlers are unavailable on Windows. The GUI
+        # stops the tunnel with CTRL_BREAK_EVENT; without this handler the
+        # default disposition would hard-exit and skip the cleanup below.
+        sigbreak = getattr(signal, "SIGBREAK", None)
+        if sigbreak is not None:
+
+            def _on_sigbreak(signum: int, frame: Any) -> None:
+                del signum, frame
+                loop.call_soon_threadsafe(stop.set)
+
+            try:
+                signal.signal(sigbreak, _on_sigbreak)
+            except (OSError, ValueError):
+                pass
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         process = await asyncio.create_subprocess_exec(
@@ -1876,6 +1929,9 @@ def vscode_command(
     config_path = (
         ssh_config.expanduser() if ssh_config is not None else Path.home() / ".ssh" / "config"
     )
+    # Blocks from previous hard-killed tunnels would otherwise accumulate:
+    # drop the ones whose local listener is already gone.
+    _sweep_stale_managed_blocks(config_path)
     host = f"udc-{allocation_id}"
     try:
         asyncio.run(

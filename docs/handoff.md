@@ -84,6 +84,11 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     连接配置（幂等重跑身份脚本作为防御）。
   - 默认 HOME 位于容器可写层内（受 storage_opt 配额约束、随容器销毁）；
     `container_home_tmpfs_gb > 0` 时改为等容量 tmpfs。
+  - VS Code 授权密钥按 allocation 合并（owner ∪ 当前连接者），容器内在既有
+    authorized_keys 上合并去重并封顶 40 行，不再整文件覆盖。
+  - 队列自动准入前重新执行 GPU 审计与 workspace 配额闸门，与直接申请同等新鲜。
+  - GUI 在 Windows 上以 CTRL_BREAK_EVENT 优雅停止隧道子进程（CLI 安装
+    SIGBREAK 处理器完成清理），CLI 启动时清扫本地端口已关闭的失效 SSH 配置块。
   - 容器身份初始化同时建立与宿主 udc-gpu 同 GID 的容器内补充组并把成员加入
     （sshd 登录从容器 /etc/group 重建补充组，docker group_add 只覆盖 exec 路径）；
     验收要求两条登录路径分别检查 `id -G`、`nvidia-smi`、`torch.cuda`。
@@ -168,6 +173,10 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
   实机 clock/GPU 状态变化更复杂）。
 - VS Code 会话内的 GPU 设备访问：`id -G` 含 udc-gpu GID、`nvidia-smi -L`、
   `torch.cuda.is_available()`；与 docker-exec 路径分别验收（见 acceptance 5.5）。
+- 容器内 sudo（容器 root == 宿主 UID 0）能否 chmod/chown 宿主 /dev/nvidia*
+  节点并影响其他成员的访问：必须在批准的测试机/测试 GPU 上按 acceptance 5.6
+  的流程验证，保留前后 stat 记录；若可变更，把 GPU 连续审计、无 host 挂载、
+  workspace nosuid 作为承载性补偿控制记录，并评估 userns-remap。
 
 ## 6. 下一会话执行顺序
 

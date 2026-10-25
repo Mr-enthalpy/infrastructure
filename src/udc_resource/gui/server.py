@@ -11,6 +11,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -518,13 +519,25 @@ async def _stop_vscode_process(process: Any) -> None:
     try:
         if process.poll() is not None:
             return
-        process.terminate()
+        if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
+            # The CLI installs a SIGBREAK handler and cleans up its managed
+            # SSH config block, listener, and ssh children on the way out.
+            # TerminateProcess would skip all of that and leak the block.
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+            try:
+                await asyncio.to_thread(process.wait, 10)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            process.terminate()
+            try:
+                await asyncio.to_thread(process.wait, 5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
         try:
-            await asyncio.to_thread(process.wait, 5)
-            return
-        except subprocess.TimeoutExpired:
             process.kill()
-        try:
             await asyncio.to_thread(process.wait, 5)
         except (OSError, subprocess.TimeoutExpired):
             pass
