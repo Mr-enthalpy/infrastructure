@@ -765,12 +765,47 @@ def test_list_and_stop_jobs(active_config):
     assert api.calls[1][1]["cmd"] == ["tmux", "kill-session", "-t", "udc-train"]
 
 
+def _working_bash() -> str | None:
+    """Find a bash that actually runs.
+
+    On Windows runners PATH may resolve to the WSL launcher stub
+    (System32/bash.exe), which exits 1 without a distro. Fall back to the
+    Git Bash install locations.
+    """
+
+    candidates = []
+    found = shutil.which("bash")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+            "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+        ]
+    )
+    for candidate in candidates:
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "exit 0"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
 def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_path, monkeypatch):
     """SSH logins rebuild groups from the container /etc/group, so the member
     needs a supplementary group with the host udc-gpu GID inside the container
     as well — docker's group_add only covers the docker-exec path."""
-    if shutil.which("bash") is None:
-        pytest.skip("bash is required to syntax-check the identity script")
+    bash = _working_bash()
+    if bash is None:
+        pytest.skip("a working bash is required to syntax-check the identity script")
     config = replace(
         active_config,
         policy=replace(
@@ -796,7 +831,7 @@ def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_pat
     script_file = tmp_path / "identity.sh"
     script_file.write_text(script, encoding="utf-8", newline="\n")
     proc = subprocess.run(
-        ["bash", "-n", str(script_file)],
+        [bash, "-n", str(script_file)],
         capture_output=True,
         text=True,
         check=False,
