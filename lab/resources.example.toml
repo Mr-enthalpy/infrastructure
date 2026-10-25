@@ -35,6 +35,9 @@ reserve_cpus = 8
 reserve_memory_gb = 32
 max_gpus_per_user = 4
 max_active_allocations_per_user = 4
+# Gates only the Broker's restricted file put/get API (bounded by
+# max_upload_bytes). Container-internal SFTP over the VS Code tunnel is NOT
+# gated by this; workspace quotas are the actual disk protection.
 file_transfer_enabled = false
 max_upload_bytes = 21474836480
 min_free_gb = 50

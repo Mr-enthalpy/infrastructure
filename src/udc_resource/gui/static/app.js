@@ -339,17 +339,32 @@
 
   function renderApplyChoices(gpus) {
     const container = $("#gpu-choices");
-    const idle = gpus.filter((gpu) => gpu.state === "free");
-    if (!idle.length) {
-      container.innerHTML = '<span class="muted">没有空闲 GPU；留空将申请 CPU-only。</span>';
+    if (!gpus.length) {
+      container.innerHTML = '<span class="muted">GPU 清单不可用。</span>';
       return;
     }
-    container.innerHTML = idle.map((gpu) => `
-      <label class="gpu-choice">
-        <input type="checkbox" name="gpu" value="${gpu.index}" ${state.selectedGpus.has(gpu.index) ? "checked" : ""}>
-        GPU ${gpu.index}
-      </label>
-    `).join("");
+    // Busy GPUs are selectable on purpose: applying for one creates a queued
+    // request (never a bypass). Only "unknown" state is unselectable because
+    // the broker refuses to allocate GPUs it cannot verify.
+    const freeCount = gpus.filter((gpu) => gpu.state === "free").length;
+    const note = freeCount
+      ? ""
+      : '<span class="muted">所有 GPU 均被占用：选择 GPU 将创建排队请求（不会插队），留空则申请 CPU-only。</span>';
+    container.innerHTML = gpus.map((gpu) => {
+      const gpuState = String(gpu.state || "unknown");
+      const owner = gpuState === "allocated" && gpu.owner_display
+        ? ` · ${esc(gpu.owner_display)}`
+        : "";
+      const unselectable = gpuState === "unknown";
+      return `
+        <label class="gpu-choice">
+          <input type="checkbox" name="gpu" value="${gpu.index}"
+            ${unselectable ? "disabled" : ""}
+            ${state.selectedGpus.has(gpu.index) ? "checked" : ""}>
+          GPU ${gpu.index} <span class="muted">${esc(gpuState)}${owner}</span>
+        </label>
+      `;
+    }).join("") + note;
     container.querySelectorAll("input[name=gpu]").forEach((input) => {
       input.addEventListener("change", () => {
         const index = Number(input.value);

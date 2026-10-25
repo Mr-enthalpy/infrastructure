@@ -88,6 +88,12 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     Broker 启动恢复持久化 active、运行时 admin 切换三处强制同一规则；
     development profile 在 active 下必须启用 min_free_docker_gb 与
     docker_storage_budget_gb，且预算与 Docker 所在文件系统真实容量相容。
+  - GUI 申请页渲染全部 GPU（含状态与占有人）；占用 GPU 可选并生成排队请求，
+    仅 unknown 状态禁选。
+  - 托管 SSH 配置的读写以跨进程锁（fcntl/msvcrt）串行化；同一 allocation 的
+    旧隧道退出时，若块端口已被更新的存活隧道接管则不删除块。
+  - 工作站默认体验：本地 broker socket 不存在时，常规命令自动经配置的 SSH
+    alias 中继执行（`--local` 可强制本地）。
   - Broker 在 `list`/`status` 返回 `capabilities`，CLI 与 GUI 的 VS Code 入口
     以服务端能力为准，不再依赖成员本地（可能过期）的策略副本。
   - CLI code 启动器以非零状态退出时不写 ready；SSH 配置块移入独立的
@@ -312,6 +318,17 @@ xfs_quota -x -c 'report -p -b -h' /data1
 
 - 开发容器在没有 user namespace 时，容器 root 映射到宿主 root；当前安全性依赖
   Docker 隔离和 `nosuid` workspace。不得添加 host 挂载或 Docker socket。
+  acceptance 5.6（容器 root 对宿主设备节点的影响）是对成员开放的硬性前置：
+  审计只是检测/阻断后续分配的补偿手段，不能替代底层权限隔离。
+- Docker 存储条件是 fail-closed 的：amax 的 Docker Root Dir 若不是
+  overlay2 + XFS + prjquota，development profile 会被闸门直接拒绝而不是自动
+  退化——这需要容量规划与维护窗口整改，不得绕过。存储预检证明的是"配额可
+  执行 + 当前容量充足 + 预算与磁盘相容"，不能保证运行中的容器、既有镜像或
+  非 UDC 容器未来不耗尽磁盘；宿主机容量规划与实测仍是上线前提。
+- 生产启用清单（当前示例全部为关）：个人账号旧权限回收（audit_legacy 通过）、
+  文件系统条件满足、Docker GPU 隔离正常、容器内 sudo 不破坏宿主机（5.6）、
+  租期结束可靠清理容器与连接。全部有证据后按序打开
+  deployment_allowed → vscode_enabled → file_transfer_enabled。
 - `install_server.sh` 仅对非默认 `workspace_root` 或 `state_db` 发出警告；自定义
   路径必须手工更新 systemd `ReadWritePaths`。
 - 新增成员后需要重新运行 `configure_quotas.sh`；当前没有自动分配每个成员项目配额

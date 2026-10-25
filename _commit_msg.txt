@@ -1,0 +1,23 @@
+Make busy-GPU queueing, SSH config sharing, and workstation UX work
+
+Audit round six:
+
+- GUI apply form: render ALL GPUs with their state and occupant instead
+  of only free ones — selecting a busy GPU creates a queued request
+  (never a bypass), which is the normal lab situation; only "unknown"
+  state is unselectable because the broker refuses unverified GPUs.
+- VS Code SSH config: managed-file read-modify-write is serialized with
+  a cross-process lock (fcntl/msvcrt with bounded retry). Removing a
+  block now checks whether its port was taken over by a newer live
+  tunnel for the same allocation and leaves it alone, so closing the
+  first of two sessions can no longer break the second one's reconnects.
+- CLI: on a workstation without a local broker socket, plain
+  request/response commands (list/apply/queue/job/...) are relayed
+  through the configured SSH alias automatically; --local forces socket
+  mode and --remote stays explicit. Interactive commands are excluded.
+- Docs: file_transfer_enabled gates only the Broker's restricted
+  transfer API, not container-internal SFTP over the VS Code tunnel;
+  workspace quotas and the writable-layer budget are the actual disk
+  protection. Handoff records the fail-closed storage preconditions,
+  the residual capacity-planning responsibility, and the go-live
+  checklist.

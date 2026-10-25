@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -637,6 +638,177 @@ def test_managed_include_wins_over_host_wildcard(tmp_path, monkeypatch):
         assert values.get("user") == "alice"
         assert values.get("port") == "22222"
     finally:
-        cli._remove_managed_block(user_config, "abc123", added_include=True)
+        cli._remove_managed_block(user_config, "abc123", added_include=True, own_port=22222)
     text = user_config.read_text(encoding="utf-8")
     assert "udc-vscode-config" not in text
+
+
+def test_vscode_config_removal_respects_live_block(tmp_path):
+    """Reopening the same allocation overwrites the block with a new port;
+    the older process's exit must not delete a block another live tunnel
+    process owns."""
+    import socket as socket_module
+
+    live = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    live.bind(("127.0.0.1", 0))
+    live.listen(1)
+    live_port = live.getsockname()[1]
+    try:
+        config = tmp_path / "config"
+        block = cli._managed_block("abc123", "udc-abc123", live_port, "alice", None)
+        assert cli._install_managed_block(config, "abc123", block) is True
+
+        # A newer process overwrote the port and is still running: the older
+        # process (own_port is dead) must leave the block alone.
+        cli._remove_managed_block(config, "abc123", added_include=True, own_port=1)
+        managed = config.parent / "udc-vscode-config"
+        assert "udc-abc123" in managed.read_text(encoding="utf-8")
+        assert "udc-vscode-config" in config.read_text(encoding="utf-8")
+
+        # Once the port is dead the block is stale and gets removed along
+        # with the Include directive we added.
+        cli._remove_managed_block(config, "abc123", added_include=True, own_port=live_port)
+        assert not managed.exists() or "udc-abc123" not in managed.read_text(encoding="utf-8")
+        assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
+    finally:
+        live.close()
+
+
+def test_vscode_config_install_is_locked(tmp_path):
+    """Concurrent installers serialize on the lock file (no lost updates)."""
+    import threading
+
+    if os.name == "posix":
+        holder = threading.Thread(target=cli._managed_config_lock(tmp_path / "c").__enter__)
+        # Acquire the lock in another thread and confirm a second attempt
+        # with a tiny timeout fails instead of silently corrupting state.
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with cli._managed_config_lock(tmp_path / "c"):
+                started.set()
+                release.wait(5)
+
+        holder.start()
+        assert started.wait(5)
+        blocked = False
+        try:
+            with cli._managed_config_lock(tmp_path / "c", timeout=0.2):
+                pass
+        except OSError:
+            blocked = True
+        assert blocked
+        release.set()
+        holder.join(5)
+        # After release the lock is acquirable again.
+        with cli._managed_config_lock(tmp_path / "c", timeout=5):
+            pass
+    else:
+        # Windows: exercise acquire/release ordering only (msvcrt.locking on
+        # the same file descriptor set would deadlock within one process).
+        with cli._managed_config_lock(tmp_path / "c", timeout=5):
+            pass
+
+
+_BASE_CONFIG = cli.load_config(CONFIG)
+
+
+def _no_socket_config(tmp_path):
+    from dataclasses import replace
+
+    return replace(
+        _BASE_CONFIG,
+        server=replace(_BASE_CONFIG.server, broker_socket=str(tmp_path / "absent.sock")),
+    )
+
+
+def test_workstation_defaults_to_relay_without_socket(tmp_path, monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    recorded = {}
+
+    def fake_run(argv, **kwargs):
+        recorded["argv"] = list(argv)
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", lambda path: _no_socket_config(tmp_path))
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["udc-resource", "--config", str(CONFIG), "list"],
+    )
+    result = runner.invoke(cli.app, ["--config", str(CONFIG), "list"])
+    assert result.exit_code == 0
+    config = _no_socket_config(tmp_path)
+    assert recorded["argv"][-2] == config.server.ssh_alias
+    assert recorded["argv"][-1] == "udc-resource list"
+
+
+def test_local_flag_forces_socket_mode(tmp_path, monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", lambda path: _no_socket_config(tmp_path))
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["udc-resource", "--config", str(CONFIG), "--local", "list"],
+    )
+    # --local means the CLI must not relay: no ssh call happens (the local
+    # socket connection itself fails with the usual broker-unavailable error).
+    runner.invoke(cli.app, ["--config", str(CONFIG), "--local", "list"])
+    assert calls == []
+
+
+def test_no_relay_when_socket_exists(tmp_path, monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    config = _no_socket_config(tmp_path)
+    Path(config.server.broker_socket).write_bytes(b"")
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["udc-resource", "--config", str(CONFIG), "list"],
+    )
+    runner.invoke(cli.app, ["--config", str(CONFIG), "list"])
+    assert calls == []
+
+
+def test_attach_is_never_relayed(tmp_path, monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", lambda path: _no_socket_config(tmp_path))
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["udc-resource", "--config", str(CONFIG), "job", "attach", "alloc-1"],
+    )
+    runner.invoke(cli.app, ["--config", str(CONFIG), "job", "attach", "alloc-1"])
+    assert calls == []

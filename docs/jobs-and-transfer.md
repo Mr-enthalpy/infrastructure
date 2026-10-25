@@ -11,6 +11,17 @@ It must remain disabled until the TOCTOU handling, per-directory quota, and
 target-host acceptance checks have passed. Enabling it for an acceptance window
 does not authorize permanent production use.
 
+**Scope**: `file_transfer_enabled` gates only the Broker's restricted
+`file put`/`get` API (TOCTOU-safe, descriptor-relative, bounded by
+`max_upload_bytes`). It does NOT — and is not intended to — prevent data
+movement inside the container: the container sshd runs an `internal-sftp`
+subsystem for VS Code Remote-SSH, and once a VS Code tunnel exists the member
+can read and write `/workspace` through it without any Broker-side byte cap.
+That is by design (container-based development is unrestricted inside the
+allocation). The disk-protection responsibility therefore rests on the
+workspace project quota and the writable-layer budget, not on
+`file_transfer_enabled`.
+
 ## 2. Prerequisites
 
 - The allocation must be in `active` status.

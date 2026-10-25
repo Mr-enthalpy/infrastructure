@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NoReturn
@@ -317,6 +318,58 @@ def _include_directive(managed_file: Path) -> str:
     return f'Include "{managed_file.as_posix()}"'
 
 
+def _port_is_live(port: int) -> bool:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.25)
+    try:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        probe.close()
+
+
+@contextmanager
+def _managed_config_lock(ssh_config: Path, timeout: float = 15.0):
+    """Serialize managed-file read-modify-write across tunnel processes.
+
+    Multiple VS Code tunnels (and the stale sweep) edit the same include
+    file; without a cross-process lock their read-modify-write cycles can
+    lose updates.
+    """
+
+    lock_path = _managed_config_file(ssh_config).parent / (_MANAGED_CONFIG_NAME + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+        os.close(fd)
+
+
 def _sweep_stale_managed_blocks(path: Path) -> int:
     """Remove managed SSH blocks whose local tunnel port is no longer open.
 
@@ -336,14 +389,7 @@ def _sweep_stale_managed_blocks(path: Path) -> int:
         nonlocal removed
         body = match.group(0)
         port_match = re.search(r"(?m)^\s*Port (\d+)\s*$", body)
-        stale = True
-        if port_match:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            probe.settimeout(0.25)
-            try:
-                stale = probe.connect_ex(("127.0.0.1", int(port_match.group(1)))) != 0
-            finally:
-                probe.close()
+        stale = not (port_match and _port_is_live(int(port_match.group(1))))
         if stale:
             removed += 1
             return ""
@@ -472,29 +518,30 @@ def _install_managed_block(
     """
 
     managed_file = _managed_config_file(ssh_config)
-    managed_file.parent.mkdir(parents=True, exist_ok=True)
-    existed = managed_file.exists()
-    existing = managed_file.read_text(encoding="utf-8") if existed else ""
-    pattern = re.compile(
-        rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
-        rf"{re.escape(allocation_id)}\n?"
-    )
-    existing = pattern.sub("", existing)
-    updated = existing.rstrip()
-    if updated:
-        updated += "\n\n"
-    updated += block.rstrip() + "\n"
-    _atomic_config_write(managed_file, updated)
-    user_config = _config_target(ssh_config)
-    try:
-        user_text = user_config.read_text(encoding="utf-8")
-    except OSError:
-        user_text = ""
-    directive = _include_directive(managed_file)
-    if not re.search(rf"(?m)^\s*{re.escape(directive)}\s*$", user_text):
-        user_text = f"{directive}\n{user_text}" if user_text else f"{directive}\n"
-        _atomic_config_write(user_config, user_text)
-        return True
+    with _managed_config_lock(ssh_config):
+        managed_file.parent.mkdir(parents=True, exist_ok=True)
+        existed = managed_file.exists()
+        existing = managed_file.read_text(encoding="utf-8") if existed else ""
+        pattern = re.compile(
+            rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
+            rf"{re.escape(allocation_id)}\n?"
+        )
+        existing = pattern.sub("", existing)
+        updated = existing.rstrip()
+        if updated:
+            updated += "\n\n"
+        updated += block.rstrip() + "\n"
+        _atomic_config_write(managed_file, updated)
+        user_config = _config_target(ssh_config)
+        try:
+            user_text = user_config.read_text(encoding="utf-8")
+        except OSError:
+            user_text = ""
+        directive = _include_directive(managed_file)
+        if not re.search(rf"(?m)^\s*{re.escape(directive)}\s*$", user_text):
+            user_text = f"{directive}\n{user_text}" if user_text else f"{directive}\n"
+            _atomic_config_write(user_config, user_text)
+            return True
     return False
 
 
@@ -503,37 +550,55 @@ def _remove_managed_block(
     allocation_id: str,
     *,
     added_include: bool,
+    own_port: int,
 ) -> None:
+    """Drop this process's block — unless a newer tunnel for the SAME
+    allocation overwrote it with a still-live port, in which case that
+    process owns the block now and removing it would break its reconnects.
+    """
+
     managed_file = _managed_config_file(ssh_config)
-    try:
-        existing = managed_file.read_text(encoding="utf-8")
-    except OSError:
-        existing = ""
-    pattern = re.compile(
-        rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
-        rf"{re.escape(allocation_id)}\n?"
-    )
-    updated = pattern.sub("", existing)
-    try:
-        if not updated.strip():
-            # ssh tolerates a missing Include target; dropping the empty file
-            # keeps the user's config directory clean.
-            managed_file.unlink(missing_ok=True)
-        elif updated != existing:
-            _atomic_config_write(managed_file, updated)
-    except OSError:
-        pass
-    if not added_include:
-        return
-    user_config = _config_target(ssh_config)
-    try:
-        user_text = user_config.read_text(encoding="utf-8")
-    except OSError:
-        return
-    directive = _include_directive(managed_file)
-    cleaned = re.sub(rf"(?m)^\s*{re.escape(directive)}\n?", "", user_text)
-    if cleaned != user_text:
-        _atomic_config_write(user_config, cleaned)
+    with _managed_config_lock(ssh_config):
+        try:
+            existing = managed_file.read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+        pattern = re.compile(
+            rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
+            rf"{re.escape(allocation_id)}\n?"
+        )
+        match = pattern.search(existing)
+        if match is not None:
+            port_match = re.search(r"(?m)^\s*Port (\d+)\s*$", match.group(0))
+            if (
+                port_match
+                and int(port_match.group(1)) != own_port
+                and _port_is_live(int(port_match.group(1)))
+            ):
+                return
+        updated = pattern.sub("", existing)
+        try:
+            if not updated.strip():
+                # ssh tolerates a missing Include target; dropping the empty
+                # file keeps the user's config directory clean. Another
+                # allocation's blocks would keep the file non-empty, so its
+                # Include directive survives.
+                managed_file.unlink(missing_ok=True)
+            elif updated != existing:
+                _atomic_config_write(managed_file, updated)
+        except OSError:
+            pass
+        if not added_include:
+            return
+        user_config = _config_target(ssh_config)
+        try:
+            user_text = user_config.read_text(encoding="utf-8")
+        except OSError:
+            return
+        directive = _include_directive(managed_file)
+        cleaned = re.sub(rf"(?m)^\s*{re.escape(directive)}\n?", "", user_text)
+        if cleaned != user_text:
+            _atomic_config_write(user_config, cleaned)
 
 
 async def _wait_for_tunnel_ready(process: asyncio.subprocess.Process) -> tuple[bool, str]:
@@ -873,7 +938,12 @@ async def _serve_vscode_tunnel(
         server.close()
         for process in list(children):
             await _terminate_process(process)
-        _remove_managed_block(ssh_config, allocation_id, added_include=added_include)
+        _remove_managed_block(
+            ssh_config,
+            allocation_id,
+            added_include=added_include,
+            own_port=port,
+        )
 
 
 def _parse_gpu_indices(raw: str) -> list[int]:
@@ -903,11 +973,33 @@ def app_callback(
         "--remote",
         help="Run the command on the given SSH alias instead of the local broker socket.",
     ),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help="Force the local broker socket even when it is absent.",
+    ),
 ) -> None:
-    if remote is not None:
-        rest = _strip_local_options(sys.argv[1:], {"--config", "--remote"})
-        _dispatch_remote(remote, rest)
     ctx.obj = _config_path(config)
+    if remote is not None:
+        rest = _strip_local_options(sys.argv[1:], {"--config", "--remote", "--local"})
+        _dispatch_remote(remote, rest)
+        return
+    if local:
+        return
+    rest = _strip_local_options(sys.argv[1:], {"--config", "--remote", "--local"})
+    if not rest or rest[0] not in AUTO_RELAY_COMMANDS:
+        return
+    if rest[0] == "job" and len(rest) > 1 and rest[1] == "attach":
+        return
+    # Workstation default: without a local broker socket, talk to the
+    # configured server over SSH instead of failing on a missing socket.
+    try:
+        cfg = load_config(ctx.obj)
+    except (OSError, ValueError):
+        return
+    if Path(cfg.server.broker_socket).exists():
+        return
+    _dispatch_remote(cfg.server.ssh_alias, rest)
 
 
 def _strip_local_options(argv: list[str], names: set[str]) -> list[str]:
@@ -931,6 +1023,10 @@ def _strip_local_options(argv: list[str], names: set[str]) -> list[str]:
 # Commands that stream over the local broker socket or drive local apps cannot
 # be relayed as plain remote CLI invocations. `connect` is itself the SSH path.
 LOCAL_ONLY_COMMANDS = {"shell", "vscode", "gui", "tunnel", "file", "menu", "connect"}
+
+# Plain request/response commands run fine through the --remote relay; on a
+# workstation without a broker socket they are relayed automatically.
+AUTO_RELAY_COMMANDS = {"list", "status", "apply", "release", "logs", "queue", "admin", "job"}
 
 
 def _dispatch_remote(alias: str, rest: list[str]) -> NoReturn:
