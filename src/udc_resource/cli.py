@@ -406,11 +406,15 @@ def _atomic_config_write(path: Path, text: str) -> None:
             os.replace(temp_path, path)
             username = os.environ.get("USERNAME", "")
             if username:
+                # /grant:r only ADDS to the protected DACL that os.open
+                # created; the OWNER RIGHTS ACE must be removed explicitly.
                 subprocess.run(
                     [
                         "icacls",
                         str(path),
                         "/inheritance:r",
+                        "/remove:g",
+                        "*S-1-3-4",
                         "/grant:r",
                         f"{username}:F",
                         "/grant:r",

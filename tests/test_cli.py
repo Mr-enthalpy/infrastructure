@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -623,24 +622,6 @@ def test_managed_include_wins_over_host_wildcard(tmp_path, monkeypatch):
     added = cli._install_managed_block(user_config, "abc123", block)
     assert added is True
     try:
-        if os.name == "nt":
-            managed = cli._managed_config_file(user_config)
-            for target in (user_config, managed):
-                probe = subprocess_module.run(
-                    ["icacls", str(target)],
-                    capture_output=True,
-                    check=False,
-                )
-                owner = subprocess_module.run(
-                    ["icacls", str(target), "/findfileownerincluster", "*"],
-                    capture_output=True,
-                    check=False,
-                )
-                print(
-                    f"DIAG {target.name}: rc={probe.returncode} "
-                    f"acl={probe.stdout.decode('utf-8', errors='replace')!r} "
-                    f"owner={owner.stdout.decode('utf-8', errors='replace')!r}"
-                )
         result = subprocess_module.run(
             [ssh, "-G", "-F", str(user_config), "udc-abc123"],
             capture_output=True,
