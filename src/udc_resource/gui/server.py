@@ -196,6 +196,14 @@ def create_app(
     app.router.add_post("/api/admin/mode", _api_admin_mode)
     app.router.add_post("/api/admin/release", _api_admin_release)
     app.router.add_post("/api/admin/reconcile", _api_admin_reconcile)
+    app.router.add_get("/api/admin/membership/requests", _api_admin_requests)
+    app.router.add_post("/api/admin/membership/requests/approve", _api_admin_request_approve)
+    app.router.add_post("/api/admin/membership/requests/reject", _api_admin_request_reject)
+    app.router.add_get("/api/admin/membership/members", _api_admin_members)
+    app.router.add_post("/api/admin/membership/suspend", _api_admin_member_suspend)
+    app.router.add_post("/api/admin/membership/resume", _api_admin_member_resume)
+    app.router.add_post("/api/admin/membership/revoke", _api_admin_member_revoke)
+    app.router.add_post("/api/admin/membership/retry", _api_admin_operation_retry)
     app.router.add_get("/ws/shell/{allocation_id}", _ws_shell)
     return app
 
@@ -629,6 +637,87 @@ async def _api_admin_release(request: web.Request) -> web.Response:
 
 async def _api_admin_reconcile(request: web.Request) -> web.Response:
     return await _remote(request, ["admin", "reconcile"], admin=True)
+
+
+async def _api_admin_requests(request: web.Request) -> web.Response:
+    status = request.query.get("status", "")
+    args = ["admin", "requests", "list"]
+    if status:
+        args.extend(["--status", status])
+    return await _remote(request, args, admin=True)
+
+
+async def _api_admin_request_decide(request: web.Request, action: str) -> web.Response:
+    body = await _json_body(request)
+    request_id = body.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return _json(_error("bad_request", "request_id is required"), 400)
+    args = ["admin", "requests", action, "--request-id", request_id]
+    review_note = str(body.get("review_note", "") or "")
+    internal_note = str(body.get("internal_note", "") or "")
+    valid_until = str(body.get("valid_until", "") or "")
+    quota_gb = body.get("quota_gb")
+    if action == "approve":
+        if valid_until:
+            args.extend(["--valid-until", valid_until])
+        if isinstance(quota_gb, int) and quota_gb > 0:
+            args.extend(["--quota-gb", str(quota_gb)])
+    if review_note:
+        args.extend(["--review-note", review_note])
+    if internal_note:
+        args.extend(["--internal-note", internal_note])
+    return await _remote(request, args, admin=True)
+
+
+async def _api_admin_request_approve(request: web.Request) -> web.Response:
+    return await _api_admin_request_decide(request, "approve")
+
+
+async def _api_admin_request_reject(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    if not str(body.get("review_note", "") or "").strip():
+        return _json(_error("bad_request", "拒绝必须填写申请人可见的原因"), 400)
+    return await _api_admin_request_decide(request, "reject")
+
+
+async def _api_admin_members(request: web.Request) -> web.Response:
+    return await _remote(request, ["admin", "members", "list"], admin=True)
+
+
+async def _api_admin_member_transition(request: web.Request, action: str) -> web.Response:
+    body = await _json_body(request)
+    member_id = body.get("member_id")
+    reason = str(body.get("reason", "") or "")
+    if not isinstance(member_id, str) or not member_id:
+        return _json(_error("bad_request", "member_id is required"), 400)
+    if action != "resume" and not reason.strip():
+        return _json(_error("bad_request", "状态变更必须填写原因"), 400)
+    args = ["admin", "members", action, "--member-id", member_id, "--reason", reason]
+    return await _remote(request, args, admin=True)
+
+
+async def _api_admin_member_suspend(request: web.Request) -> web.Response:
+    return await _api_admin_member_transition(request, "suspend")
+
+
+async def _api_admin_member_resume(request: web.Request) -> web.Response:
+    return await _api_admin_member_transition(request, "resume")
+
+
+async def _api_admin_member_revoke(request: web.Request) -> web.Response:
+    return await _api_admin_member_transition(request, "revoke")
+
+
+async def _api_admin_operation_retry(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    operation_id = body.get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id:
+        return _json(_error("bad_request", "operation_id is required"), 400)
+    return await _remote(
+        request,
+        ["admin", "operations", "retry", "--operation-id", operation_id],
+        admin=True,
+    )
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:

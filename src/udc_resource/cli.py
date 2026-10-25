@@ -1494,6 +1494,36 @@ def start_command(
         typer.echo("进入终端：udc-resource connect " + allocation_id)
 
 
+@app.command("setup")
+def setup_command(
+    ctx: typer.Context,
+    host: str = typer.Option("", "--host", help="服务器地址（默认用配置的 ssh_alias）。"),
+    yes: bool = typer.Option(False, "--yes", help="跳过确认。"),
+) -> None:
+    """工作站配置向导：写入托管 SSH 片段并验证连接与成员状态。"""
+
+    from .onboarding import run_setup
+
+    config = _load(ctx)
+    target = host or config.server.ssh_alias
+    code = run_setup(config, host=target, yes=yes)
+    raise SystemExit(code)
+
+
+@app.command("doctor")
+def doctor_command(
+    ctx: typer.Context,
+    host: str = typer.Option("", "--host", help="服务器地址（默认用配置的 ssh_alias）。"),
+) -> None:
+    """只读诊断：本机环境、连接与成员状态。"""
+    from .onboarding import run_doctor
+
+    config = _load(ctx)
+    target = host or config.server.ssh_alias
+    code = run_doctor(config, host=target)
+    raise SystemExit(code)
+
+
 @app.command("join")
 def join_command(
     ctx: typer.Context,
@@ -1688,15 +1718,15 @@ def menu_command(ctx: typer.Context) -> None:
     client = _make_client(config)
     while True:
         typer.echo("")
-        typer.echo("UDC resource menu")
-        typer.echo("  1) list resources")
-        typer.echo("  2) my allocations")
-        typer.echo("  3) queue")
-        typer.echo("  4) apply")
-        typer.echo("  5) release")
-        typer.echo("  6) help / commands")
-        typer.echo("  0) exit")
-        choice = typer.prompt("choice", default="0").strip()
+        typer.echo("=== 实验室计算资源 ===")
+        typer.echo("  1) 查看资源")
+        typer.echo("  2) 我的工作环境")
+        typer.echo("  3) 等待队列")
+        typer.echo("  4) 创建工作环境")
+        typer.echo("  5) 结束工作环境并释放资源")
+        typer.echo("  6) 帮助 / 命令列表")
+        typer.echo("  0) 退出")
+        choice = typer.prompt("请选择", default="0").strip()
         if choice in {"0", "q", "quit", "exit"}:
             return
         if choice == "1":
@@ -1707,7 +1737,7 @@ def menu_command(ctx: typer.Context) -> None:
             data = _request(client, "status", False)
             allocations = data.get("allocations", [])
             if not allocations:
-                typer.echo("no allocations")
+                typer.echo("还没有工作环境；选择 4 创建。")
             for allocation in allocations:
                 typer.echo(
                     f"{allocation['id']}  {allocation['status']}  "
@@ -1723,7 +1753,7 @@ def menu_command(ctx: typer.Context) -> None:
             )
             requests = data.get("queue", [])
             if not requests:
-                typer.echo("no queued requests")
+                typer.echo("当前没有等待中的申请。")
             for request in requests:
                 typer.echo(
                     f"{request['queue_id']}  position={request.get('position')}  "
@@ -1755,8 +1785,8 @@ def menu_command(ctx: typer.Context) -> None:
             typer.echo(f"released: {data['id']}  status={data['status']}")
         elif choice == "6":
             typer.echo(
-                "Use udc-resource --help, or: list, status, apply, shell, logs, "
-                "job, queue, release."
+                "更多命令见 udc-resource --help；工作台：在你自己的电脑运行 "
+                "udc-resource gui。"
             )
         else:
             typer.echo("unknown choice")

@@ -1584,11 +1584,28 @@ class Broker:
                 # Authorize the allocation owner plus the current connecter:
                 # an administrator opening a member's allocation must not
                 # revoke the member's key material, and vice versa.
-                connecter_keys = await asyncio.to_thread(
-                    self._member_public_keys,
-                    identity.username,
+                # Authoritative key projection (goal §8.3): when the member
+                # record exists, its current active key set is authoritative —
+                # revoked historical keys are no longer projected. The host
+                # authorized_keys fallback covers pre-membership accounts.
+                with self._connection() as connection:
+                    owner_member_keys = (
+                        member_store.active_keys(connection, int(owner_uid))
+                        if self.config.policy.membership_required
+                        and int(owner_uid) > 0
+                        else []
+                    )
+                    connecter_member_keys = (
+                        member_store.active_keys(connection, identity.uid)
+                        if self.config.policy.membership_required
+                        and identity.uid != int(owner_uid)
+                        and not identity.is_admin
+                        else []
+                    )
+                connecter_keys = connecter_member_keys or (
+                    await asyncio.to_thread(self._member_public_keys, identity.username)
                 )
-                owner_keys = await asyncio.to_thread(
+                owner_keys = owner_member_keys or await asyncio.to_thread(
                     self._member_public_keys,
                     container_user,
                 )
