@@ -562,6 +562,11 @@ def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
         )
     text = ssh_config_path.read_text(encoding="utf-8") if ssh_config_path.exists() else ""
     assert "udc-abc123" not in text
+    # The block lives in the managed include file, which must be gone too,
+    # and the Include directive we added must be removed again.
+    managed = ssh_config_path.parent / "udc-vscode-config"
+    assert not managed.exists() or "udc-abc123" not in managed.read_text(encoding="utf-8")
+    assert "udc-vscode-config" not in text
 
 
 def test_sweep_stale_managed_blocks(tmp_path):
@@ -594,3 +599,44 @@ def test_sweep_stale_managed_blocks(tmp_path):
         assert "udc-live1" in text
     finally:
         live.close()
+
+
+def test_managed_include_wins_over_host_wildcard(tmp_path, monkeypatch):
+    """Our per-allocation block must beat an earlier `Host *` section."""
+    import shutil as shutil_module
+    import subprocess as subprocess_module
+
+    ssh = shutil_module.which("ssh")
+    if ssh is None:
+        pytest.skip("an ssh client is required")
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    # ssh resolves the relative Include against its own home directory; point
+    # HOME/USERPROFILE at the test home so both ssh builds agree with the
+    # standard ~/.ssh layout that _include_directive detects.
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    user_config = home / ".ssh" / "config"
+    user_config.write_text("Host *\n  User otheruser\n", encoding="utf-8")
+    block = cli._managed_block("abc123", "udc-abc123", 22222, "alice", None)
+    added = cli._install_managed_block(user_config, "abc123", block)
+    assert added is True
+    try:
+        result = subprocess_module.run(
+            [ssh, "-G", "-F", str(user_config), "udc-abc123"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        values = {}
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[0] not in values:
+                values[parts[0]] = parts[1]
+        assert values.get("user") == "alice"
+        assert values.get("port") == "22222"
+    finally:
+        cli._remove_managed_block(user_config, "abc123", added_include=True)
+    text = user_config.read_text(encoding="utf-8")
+    assert "udc-vscode-config" not in text

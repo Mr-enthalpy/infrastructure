@@ -210,6 +210,7 @@ def test_development_profile_creates_disposable_admin_container(active_config, t
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
             container_home="",
         ),
     )
@@ -244,6 +245,7 @@ def test_development_profile_tmpfs_home_is_opt_in(active_config, tmp_path):
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
             container_home="",
             container_home_tmpfs_gb=2,
         ),
@@ -281,6 +283,7 @@ def test_storage_preflight_rejects_non_overlay_driver(monkeypatch, active_config
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -303,6 +306,7 @@ def test_storage_preflight_accepts_overlay_on_xfs_prjquota(monkeypatch, active_c
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -339,7 +343,7 @@ def test_storage_preflight_blocks_low_docker_disk(active_config, tmp_path, monke
     fake_client = FakeClient()
     fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": str(tmp_path)}
     driver._client = fake_client
-    usage = SimpleNamespace(free=5 * 1024**3)
+    usage = SimpleNamespace(free=5 * 1024**3, total=1024 * 1024**3)
     monkeypatch.setattr(docker_driver.shutil, "disk_usage", lambda path: usage)
     passed, detail = driver.storage_preflight()
     assert passed is False
@@ -361,6 +365,7 @@ def test_storage_preflight_requires_nosuid_workspace(monkeypatch, active_config)
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -395,6 +400,7 @@ def test_prepare_container_ssh_installs_keys_as_root(active_config):
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -433,6 +439,7 @@ def test_prepare_container_ssh_rejects_root_uid(active_config):
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -815,6 +822,7 @@ def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_pat
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -849,6 +857,7 @@ def test_identity_script_without_gpu_group(active_config, tmp_path, monkeypatch)
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -870,6 +879,7 @@ def test_prepare_container_ssh_merges_instead_of_overwriting(active_config):
             container_sudo=True,
             writable_layer_gb=20,
             min_free_docker_gb=0,
+            docker_storage_budget_gb=0,
         ),
     )
     driver = DockerDriver(config)
@@ -891,3 +901,27 @@ def test_prepare_container_ssh_merges_instead_of_overwriting(active_config):
     assert "tail -n 40" in script
     assert "authorized_keys.udc" in script
     assert "ssh-ed25519 AAAA-new-key alice" in script
+
+
+def test_storage_preflight_rejects_budget_larger_than_disk(active_config, tmp_path, monkeypatch):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            min_free_docker_gb=10,
+            docker_storage_budget_gb=500,
+        ),
+    )
+    driver = DockerDriver(config)
+    fake_client = FakeClient()
+    fake_client.info_data = {"Driver": "overlay2", "DockerRootDir": str(tmp_path)}
+    driver._client = fake_client
+    usage = SimpleNamespace(free=64 * 1024**3, total=100 * 1024**3)
+    monkeypatch.setattr(docker_driver.shutil, "disk_usage", lambda path: usage)
+    passed, detail = driver.storage_preflight()
+    assert passed is False
+    assert "exceeds the 100 GiB filesystem" in detail
+
+    usage.total = 1024 * 1024**3
+    passed, detail = driver.storage_preflight()
+    assert passed is True

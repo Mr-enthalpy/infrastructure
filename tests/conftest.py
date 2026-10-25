@@ -27,12 +27,15 @@ def active_config(monitor_config: LabConfig, tmp_path: Path) -> LabConfig:
             deployment_allowed=True,
             file_transfer_enabled=True,
             min_free_gb=0,
-            max_workspace_gb=0,
-            workspace_quota_required=False,
-            # Most broker tests focus on lifecycle behavior. The dedicated
-            # audit-gate tests re-enable this and inject a runner.
-            legacy_audit_required=False,
-            gpu_audit_required=False,
+            # Active mode is validated against the same mandatory gates the
+            # broker enforces at startup and on runtime transitions, so the
+            # test fixture must satisfy them. _broker injects passing audit
+            # and quota runners by default; the dedicated gate tests override
+            # them with failing/counting runners.
+            max_workspace_gb=200,
+            workspace_quota_required=True,
+            legacy_audit_required=True,
+            gpu_audit_required=True,
             container_profile="restricted",
             container_read_only=True,
             container_sudo=False,

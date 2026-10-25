@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 from .. import store
-from ..config import LabConfig
+from ..config import LabConfig, validate_active_mode_policy
 from ..db import connect, init_db
 from ..errors import (
     BadRequest,
@@ -105,6 +105,8 @@ class Broker:
         legacy_audit: Callable[[], LegacyAuditResult] | None = None,
         gpu_audit: Callable[[], GpuAuditResult] | None = None,
         quota_check: Callable[[], QuotaCheckResult] | None = None,
+        member_quota_check: Callable[[str, int, int], Any] | None = None,
+        member_quota_provision: Callable[[str, int, int], Any] | None = None,
         clock: Callable[[], datetime] | None = None,
         expiry_interval: float = 30.0,
         reconcile_interval: float = 300.0,
@@ -130,6 +132,8 @@ class Broker:
                 config.policy.max_workspace_gb,
             )
         )
+        self.member_quota_check = member_quota_check or verify_member_quota
+        self.member_quota_provision = member_quota_provision or provision_member_quota
         self.clock = clock or store.utcnow
         self.expiry_interval = expiry_interval
         self.reconcile_interval = reconcile_interval
@@ -256,6 +260,16 @@ class Broker:
         if self._storage_failure:
             parts.append(f"Docker storage: {self._storage_failure}")
         return "; ".join(parts) if parts else None
+
+    def _capabilities(self) -> dict[str, bool]:
+        """Server-side feature flags; clients must defer to these instead of
+        their own (possibly stale) local configuration."""
+
+        return {
+            "vscode": self.config.policy.vscode_enabled,
+            "file_transfer": self.config.policy.file_transfer_enabled,
+            "development_profile": self.config.policy.container_profile == "development",
+        }
 
     def _live_resources(self) -> LiveResources:
         try:
@@ -427,6 +441,14 @@ class Broker:
             target = self._mode
             audit_failure = ""
             runtime_failure = ""
+            policy_failure = ""
+            if self._mode == "active":
+                try:
+                    validate_active_mode_policy(self.config.policy)
+                except ValueError as exc:
+                    # A persisted active mode must never outlive the policy
+                    # gates it was approved with.
+                    policy_failure = str(exc)
             if self._mode == "active" and self.config.policy.legacy_audit_required:
                 audit = self._legacy_audit_result()
                 if not audit.passed:
@@ -437,17 +459,18 @@ class Broker:
                 target = "maintenance"
             elif self._mode == "active" and not self.config.policy.deployment_allowed:
                 target = "maintenance" if (leases or queued) else "monitor"
-            elif self._mode == "active" and (audit_failure or runtime_failure):
+            elif self._mode == "active" and (policy_failure or audit_failure or runtime_failure):
                 target = "maintenance" if (leases or queued) else "monitor"
             if target != self._mode:
                 logger.warning(
                     "adjusting persisted mode %s -> %s "
-                    "(leases=%d queued=%d deployment_allowed=%s audit=%s runtime=%s)",
+                    "(leases=%d queued=%d deployment_allowed=%s policy=%s audit=%s runtime=%s)",
                     self._mode,
                     target,
                     leases,
                     queued,
                     self.config.policy.deployment_allowed,
+                    policy_failure or "passed",
                     audit_failure or "passed",
                     runtime_failure or "passed",
                 )
@@ -1468,6 +1491,7 @@ class Broker:
                 "ok": self._storage_failure is None,
                 "message": self._storage_failure or "",
             },
+            "capabilities": self._capabilities(),
         }
         self._add_member_identity(data)
         return data
@@ -1674,7 +1698,8 @@ class Broker:
                 return {
                     "allocations": store.list_allocations(
                         connection, owner_uid=identity.uid, now=self._now()
-                    )
+                    ),
+                    "capabilities": self._capabilities(),
                 }
             allocation = store.get_allocation(connection, allocation_id, now=self._now())
             if allocation["owner_uid"] != identity.uid and not identity.is_admin:
@@ -1682,6 +1707,7 @@ class Broker:
             return {
                 "allocation": allocation,
                 "events": store.list_allocation_events(connection, allocation_id),
+                "capabilities": self._capabilities(),
             }
 
     async def _apply(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
@@ -1911,7 +1937,7 @@ class Broker:
             logger.warning("skipping member workspace quota verification for UID %d", owner_uid)
             return
         limit_gb = self.config.policy.max_workspace_gb
-        result = verify_member_quota(workspace, owner_uid, limit_gb)
+        result = self.member_quota_check(workspace, owner_uid, limit_gb)
         if result.passed:
             return
         logger.warning(
@@ -1919,7 +1945,7 @@ class Broker:
             workspace,
             result.detail,
         )
-        provisioned = provision_member_quota(workspace, owner_uid, limit_gb)
+        provisioned = self.member_quota_provision(workspace, owner_uid, limit_gb)
         if not provisioned.passed:
             raise Conflict(f"workspace quota could not be enforced: {provisioned.detail}")
 
@@ -2407,8 +2433,11 @@ class Broker:
                 raise Conflict(
                     "cannot switch to monitor while managed containers exist; use maintenance mode"
                 )
-        if mode == "active" and not self.config.policy.deployment_allowed:
-            raise Forbidden("deployment_allowed=false; active mode is not approved")
+        if mode == "active":
+            try:
+                validate_active_mode_policy(self.config.policy)
+            except ValueError as exc:
+                raise Forbidden(f"active mode blocked by policy configuration: {exc}") from exc
         if mode == "active":
             audit = await asyncio.to_thread(self._legacy_audit_result)
             if not audit.passed:

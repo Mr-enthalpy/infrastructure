@@ -24,6 +24,17 @@ BOB = Identity(uid=1001, gid=1001, username="bob", role="member", is_admin=False
 ADMIN = Identity(uid=0, gid=0, username="root", role="admin", is_admin=True)
 
 
+def _passing_member_quota(workspace, uid, limit):
+    from udc_resource.workspace_quota import MemberQuotaResult
+
+    return MemberQuotaResult(
+        True,
+        "ok",
+        project_id=uid,
+        hard_limit_bytes=limit * 1024**3,
+    )
+
+
 def _broker(
     tmp_path,
     config,
@@ -32,6 +43,8 @@ def _broker(
     legacy_audit=None,
     gpu_audit=None,
     quota_check=None,
+    member_quota_check=None,
+    member_quota_provision=None,
     clock=None,
 ):
     fake_docker = docker or FakeDocker()
@@ -48,9 +61,12 @@ def _broker(
         socket_path=tmp_path / "broker.sock",
         docker=fake_docker,
         identity_resolver=resolver,
-        legacy_audit=legacy_audit,
-        gpu_audit=gpu_audit,
-        quota_check=quota_check,
+        legacy_audit=legacy_audit or (lambda: LegacyAuditResult(True, "clean")),
+        gpu_audit=gpu_audit or (lambda: GpuAuditResult(True, "clean", fingerprint="fp")),
+        quota_check=quota_check
+        or (lambda: QuotaCheckResult(True, "filesystem supports project quotas")),
+        member_quota_check=member_quota_check or _passing_member_quota,
+        member_quota_provision=member_quota_provision or _passing_member_quota,
         clock=clock or (lambda: FIXED),
     )
     broker.initialize()
@@ -1293,8 +1309,7 @@ async def test_job_lifecycle(tmp_path, active_config):
     assert "train" not in fake.jobs[container_id]
 
 
-async def test_apply_verifies_and_self_heals_member_quota(tmp_path, active_config, monkeypatch):
-    from udc_resource.broker import server as broker_server
+async def test_apply_verifies_and_self_heals_member_quota(tmp_path, active_config):
     from udc_resource.workspace_quota import MemberQuotaResult
 
     config = replace(
@@ -1304,11 +1319,6 @@ async def test_apply_verifies_and_self_heals_member_quota(tmp_path, active_confi
             workspace_quota_required=True,
             max_workspace_gb=200,
         ),
-    )
-    broker, docker = _broker(
-        tmp_path,
-        config,
-        quota_check=lambda: QuotaCheckResult(True, "filesystem supports project quotas"),
     )
     calls = {"verify": 0, "provision": 0}
 
@@ -1324,8 +1334,12 @@ async def test_apply_verifies_and_self_heals_member_quota(tmp_path, active_confi
         assert limit == 200
         return MemberQuotaResult(True, "ok", project_id=uid, hard_limit_bytes=limit * 1024**3)
 
-    monkeypatch.setattr(broker_server, "verify_member_quota", fake_verify)
-    monkeypatch.setattr(broker_server, "provision_member_quota", fake_provision)
+    broker, docker = _broker(
+        tmp_path,
+        config,
+        member_quota_check=fake_verify,
+        member_quota_provision=fake_provision,
+    )
     response = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
     assert response["ok"] is True
     # One verification, one provisioning (provisioning verifies internally).
@@ -1338,7 +1352,6 @@ async def test_apply_blocks_when_member_quota_cannot_be_enforced(
     active_config,
     monkeypatch,
 ):
-    from udc_resource.broker import server as broker_server
     from udc_resource.workspace_quota import MemberQuotaResult
 
     config = replace(
@@ -1352,17 +1365,14 @@ async def test_apply_blocks_when_member_quota_cannot_be_enforced(
     broker, docker = _broker(
         tmp_path,
         config,
-        quota_check=lambda: QuotaCheckResult(True, "filesystem supports project quotas"),
-    )
-    monkeypatch.setattr(
-        broker_server,
-        "verify_member_quota",
-        lambda *a, **k: MemberQuotaResult(False, "project ID is 0, expected 1000"),
-    )
-    monkeypatch.setattr(
-        broker_server,
-        "provision_member_quota",
-        lambda *a, **k: MemberQuotaResult(False, "xfs_quota is not installed"),
+        member_quota_check=lambda *a, **k: MemberQuotaResult(
+            False,
+            "project ID is 0, expected 1000",
+        ),
+        member_quota_provision=lambda *a, **k: MemberQuotaResult(
+            False,
+            "xfs_quota is not installed",
+        ),
     )
     response = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
     assert response["ok"] is False
@@ -1384,7 +1394,7 @@ async def test_allocation_is_gated_on_container_identity_initialization(
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
-            min_free_docker_gb=0,
+            min_free_docker_gb=1,
         ),
     )
     docker = FakeDocker()
@@ -1494,7 +1504,7 @@ async def test_writable_layer_budget_blocks_oversubscription(tmp_path, active_co
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
-            min_free_docker_gb=0,
+            min_free_docker_gb=1,
             docker_storage_budget_gb=20,
         ),
     )
@@ -1672,7 +1682,7 @@ def _tunnel_config(active_config):
             container_read_only=False,
             container_sudo=True,
             writable_layer_gb=20,
-            min_free_docker_gb=0,
+            min_free_docker_gb=1,
         ),
     )
 
@@ -1730,3 +1740,48 @@ async def test_tunnel_without_any_keys_is_rejected(tmp_path, active_config):
     )
     assert docker.prepared_ssh == []
     assert b'"conflict"' in b"".join(writer.messages)
+
+
+async def test_admin_mode_active_requires_mandatory_gates(tmp_path, monitor_config):
+    """A lax monitor-mode config must not be switchable into active mode."""
+    config = replace(
+        monitor_config,
+        policy=replace(
+            monitor_config.policy,
+            deployment_allowed=True,
+            legacy_audit_required=True,
+            gpu_audit_required=False,
+            workspace_quota_required=False,
+            max_workspace_gb=0,
+        ),
+    )
+    broker, _ = _broker(tmp_path, config)
+    response = await _call(broker, "admin_mode", {"mode": "active"}, ADMIN)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "forbidden"
+    # The message names the missing mandatory gate, not just approval.
+    assert "gpu_audit_required" in response["error"]["message"]
+
+
+async def test_restored_active_mode_requires_mandatory_gates(tmp_path, monitor_config):
+    """A persisted active mode must not survive a policy that lost its gates."""
+    from udc_resource import store
+    from udc_resource.db import init_db
+
+    config = replace(
+        monitor_config,
+        policy=replace(
+            monitor_config.policy,
+            deployment_allowed=True,
+            legacy_audit_required=False,
+            gpu_audit_required=False,
+            workspace_quota_required=False,
+            max_workspace_gb=0,
+        ),
+    )
+    connection = init_db(tmp_path / "state.db")
+    store.set_mode(connection, "active", actor_uid=0, now=FIXED)
+    connection.close()
+    broker, _ = _broker(tmp_path, config)
+    response = await _call(broker, "ping", {}, ALICE)
+    assert response["data"]["mode"] == "monitor"

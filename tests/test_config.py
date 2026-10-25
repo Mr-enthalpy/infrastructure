@@ -284,3 +284,36 @@ def test_new_storage_policies_have_defaults(tmp_path):
     cfg = load_config(ROOT / "lab/resources.example.toml")
     assert cfg.policy.container_home_tmpfs_gb == 0
     assert cfg.policy.min_free_docker_gb == 20
+
+
+def test_active_mode_requirements_cannot_be_disabled(tmp_path):
+    text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
+    text = text.replace('mode = "monitor"', 'mode = "active"')
+    text = text.replace("deployment_allowed = false", "deployment_allowed = true")
+    text = text.replace("gpu_audit_required = true", "gpu_audit_required = false")
+    path = tmp_path / "bad.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="gpu_audit_required"):
+        load_config(path)
+
+
+def test_monitor_mode_may_disable_gates_until_activation(tmp_path):
+    path = _variant(
+        tmp_path,
+        ("deployment_allowed = false", "deployment_allowed = true"),
+        ("gpu_audit_required = true", "gpu_audit_required = false"),
+    )
+    cfg = load_config(path)
+    assert cfg.policy.mode == "monitor"
+    assert cfg.policy.gpu_audit_required is False
+
+
+def test_active_development_profile_requires_storage_protection(tmp_path):
+    text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
+    text = text.replace('mode = "monitor"', 'mode = "active"')
+    text = text.replace("deployment_allowed = false", "deployment_allowed = true")
+    text = text.replace("docker_storage_budget_gb = 500", "docker_storage_budget_gb = 0")
+    path = tmp_path / "bad.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="docker_storage_budget_gb"):
+        load_config(path)

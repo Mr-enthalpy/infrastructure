@@ -602,14 +602,16 @@ class DockerDriver:
 
         policy = self.config.policy
         info: dict[str, Any] | None = None
-        if policy.min_free_docker_gb > 0 or (
-            policy.container_profile == "development" and policy.writable_layer_gb > 0
+        if (
+            policy.min_free_docker_gb > 0
+            or policy.docker_storage_budget_gb > 0
+            or (policy.container_profile == "development" and policy.writable_layer_gb > 0)
         ):
             try:
                 info = self.client.info()
             except DockerException as exc:
                 return False, f"cannot inspect Docker storage: {exc}"
-        if policy.min_free_docker_gb > 0:
+        if policy.min_free_docker_gb > 0 or policy.docker_storage_budget_gb > 0:
             docker_root = str((info or {}).get("DockerRootDir", ""))
             if not docker_root:
                 return False, "DockerRootDir is unknown; cannot verify free capacity"
@@ -617,12 +619,27 @@ class DockerDriver:
                 usage = shutil.disk_usage(docker_root)
             except OSError as exc:
                 return False, f"cannot inspect Docker storage directory: {exc}"
-            free_gb = usage.free // 1024**3
-            if free_gb < policy.min_free_docker_gb:
-                return False, (
-                    f"Docker storage {docker_root} has only {free_gb} GiB free; "
-                    f"policy.min_free_docker_gb is {policy.min_free_docker_gb}"
-                )
+            if policy.min_free_docker_gb > 0:
+                free_gb = usage.free // 1024**3
+                if free_gb < policy.min_free_docker_gb:
+                    return False, (
+                        f"Docker storage {docker_root} has only {free_gb} GiB free; "
+                        f"policy.min_free_docker_gb is {policy.min_free_docker_gb}"
+                    )
+            if policy.docker_storage_budget_gb > 0:
+                # The budget promises writable-layer space to containers; it
+                # must fit the real filesystem together with the reserve, or
+                # the aggregate protection is fiction.
+                required_bytes = (
+                    policy.docker_storage_budget_gb + policy.min_free_docker_gb
+                ) * 1024**3
+                total_gib = usage.total // 1024**3
+                if usage.total < required_bytes:
+                    return False, (
+                        f"Docker storage budget {policy.docker_storage_budget_gb} GiB plus "
+                        f"reserve {policy.min_free_docker_gb} GiB exceeds the {total_gib} GiB "
+                        f"filesystem at {docker_root}; lower docker_storage_budget_gb"
+                    )
         if policy.container_profile != "development" or policy.writable_layer_gb <= 0:
             return True, "writable-layer quota is not required"
         if os.name != "posix":

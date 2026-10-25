@@ -288,6 +288,34 @@ def _default_identity() -> Path | None:
     return None
 
 
+_MANAGED_CONFIG_NAME = "udc-vscode-config"
+
+
+def _managed_config_file(ssh_config: Path) -> Path:
+    """The fully-managed include file next to the user's SSH config.
+
+    The per-allocation blocks live in their own file which is included from
+    the TOP of the user config: OpenSSH applies first-match, so appending the
+    blocks behind an existing `Host *` section would let wildcard options
+    (User, IdentityFile, ...) silently override ours.
+    """
+
+    return _config_target(ssh_config).parent / _MANAGED_CONFIG_NAME
+
+
+def _include_directive(managed_file: Path) -> str:
+    """A relative Include resolves against the user's SSH directory on every
+    ssh build (MSYS ssh cannot follow absolute Windows paths inside config
+    files), so use it for the standard ~/.ssh location and fall back to an
+    absolute path only for custom --ssh-config files."""
+    try:
+        if managed_file.parent.resolve() == (Path.home() / ".ssh").resolve():
+            return f'Include "{_MANAGED_CONFIG_NAME}"'
+    except OSError:
+        pass
+    return f'Include "{managed_file.as_posix()}"'
+
+
 def _sweep_stale_managed_blocks(path: Path) -> int:
     """Remove managed SSH blocks whose local tunnel port is no longer open.
 
@@ -386,14 +414,20 @@ def _config_target(path: Path) -> Path:
 
 
 def _install_managed_block(
-    path: Path,
+    ssh_config: Path,
     allocation_id: str,
     block: str,
 ) -> bool:
-    path = _config_target(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existed = path.exists()
-    existing = path.read_text(encoding="utf-8") if existed else ""
+    """Write the allocation block into the managed include file.
+
+    Returns whether the Include directive was newly added to the user config,
+    so the removal path can take it back out again.
+    """
+
+    managed_file = _managed_config_file(ssh_config)
+    managed_file.parent.mkdir(parents=True, exist_ok=True)
+    existed = managed_file.exists()
+    existing = managed_file.read_text(encoding="utf-8") if existed else ""
     pattern = re.compile(
         rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
         rf"{re.escape(allocation_id)}\n?"
@@ -403,29 +437,56 @@ def _install_managed_block(
     if updated:
         updated += "\n\n"
     updated += block.rstrip() + "\n"
-    _atomic_config_write(path, updated)
-    return not existed
-
-
-def _remove_managed_block(path: Path, allocation_id: str, *, created: bool) -> None:
-    path = _config_target(path)
+    _atomic_config_write(managed_file, updated)
+    user_config = _config_target(ssh_config)
     try:
-        existing = path.read_text(encoding="utf-8")
+        user_text = user_config.read_text(encoding="utf-8")
     except OSError:
-        return
+        user_text = ""
+    directive = _include_directive(managed_file)
+    if not re.search(rf"(?m)^\s*{re.escape(directive)}\s*$", user_text):
+        user_text = f"{directive}\n{user_text}" if user_text else f"{directive}\n"
+        _atomic_config_write(user_config, user_text)
+        return True
+    return False
+
+
+def _remove_managed_block(
+    ssh_config: Path,
+    allocation_id: str,
+    *,
+    added_include: bool,
+) -> None:
+    managed_file = _managed_config_file(ssh_config)
+    try:
+        existing = managed_file.read_text(encoding="utf-8")
+    except OSError:
+        existing = ""
     pattern = re.compile(
         rf"(?ms)^# BEGIN UDC VSCODE {re.escape(allocation_id)}\n.*?^# END UDC VSCODE "
         rf"{re.escape(allocation_id)}\n?"
     )
     updated = pattern.sub("", existing)
     try:
-        if not updated.strip() and created:
-            path.unlink(missing_ok=True)
-            return
-        if updated != existing:
-            _atomic_config_write(path, updated)
+        if not updated.strip():
+            # ssh tolerates a missing Include target; dropping the empty file
+            # keeps the user's config directory clean.
+            managed_file.unlink(missing_ok=True)
+        elif updated != existing:
+            _atomic_config_write(managed_file, updated)
     except OSError:
         pass
+    if not added_include:
+        return
+    user_config = _config_target(ssh_config)
+    try:
+        user_text = user_config.read_text(encoding="utf-8")
+    except OSError:
+        return
+    directive = _include_directive(managed_file)
+    cleaned = re.sub(rf"(?m)^\s*{re.escape(directive)}\n?", "", user_text)
+    if cleaned != user_text:
+        _atomic_config_write(user_config, cleaned)
 
 
 async def _wait_for_tunnel_ready(process: asyncio.subprocess.Process) -> tuple[bool, str]:
@@ -690,10 +751,10 @@ async def _serve_vscode_tunnel(
         raise RuntimeError("could not bind the local VS Code tunnel")
     port = int(sockets[0].getsockname()[1])
     remote_uri = f"vscode-remote://ssh-remote+{host}/workspace"
-    created = False
+    added_include = False
     try:
         block = _managed_block(allocation_id, host, port, username, identity)
-        created = _install_managed_block(ssh_config, allocation_id, block)
+        added_include = _install_managed_block(ssh_config, allocation_id, block)
         _write_readiness(
             readiness_file,
             "listening",
@@ -734,12 +795,24 @@ async def _serve_vscode_tunnel(
                 command = [code, "--folder-uri", remote_uri]
                 if os.name == "nt" and Path(code).suffix.lower() in {".cmd", ".bat"}:
                     command = ["cmd", "/c", *command]
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     subprocess.run,
                     command,
                     check=False,
                 )
-                code_launched = True
+                if result.returncode != 0:
+                    # A failed launcher must not be reported as "ready".
+                    message = f"VS Code CLI exited with status {result.returncode}"
+                    _write_readiness(
+                        readiness_file,
+                        "tunnel_verified",
+                        port=port,
+                        uri=remote_uri,
+                        message=message,
+                    )
+                    typer.echo(message, err=True)
+                else:
+                    code_launched = True
         else:
             typer.echo(f"VS Code folder URI: {remote_uri}")
         if not launch_code or code_launched:
@@ -753,7 +826,7 @@ async def _serve_vscode_tunnel(
         server.close()
         for process in list(children):
             await _terminate_process(process)
-        _remove_managed_block(ssh_config, allocation_id, created=created)
+        _remove_managed_block(ssh_config, allocation_id, added_include=added_include)
 
 
 def _parse_gpu_indices(raw: str) -> list[int]:
@@ -1882,8 +1955,6 @@ def vscode_command(
     config = _load(ctx)
     if not ALLOCATION_ID_RE.fullmatch(allocation_id):
         fail("bad_request", "invalid allocation id")
-    if not config.policy.vscode_enabled:
-        fail("forbidden", "VS Code support is disabled by policy")
     alias = server or config.server.ssh_alias
     remote = shlex.join(["udc-resource", "status", allocation_id, "--json"])
     _write_readiness(readiness_file, "starting")
@@ -1909,6 +1980,13 @@ def vscode_command(
         allocation = envelope["data"]["allocation"]
     except (json.JSONDecodeError, KeyError, TypeError):
         fail("protocol", "server returned an invalid allocation response")
+    # Feature gating follows the SERVER, not the possibly stale local config.
+    capabilities = envelope["data"].get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("vscode") is False:
+        fail("forbidden", "VS Code support is disabled on the server")
+    if not isinstance(capabilities, dict) and not config.policy.vscode_enabled:
+        # Older server without a capabilities block: fall back to local policy.
+        fail("forbidden", "VS Code support is disabled by policy")
     if not isinstance(allocation, dict) or allocation.get("status") != "active":
         fail("conflict", "allocation is not active")
     username = str(allocation.get("owner") or "")
@@ -1931,7 +2009,7 @@ def vscode_command(
     )
     # Blocks from previous hard-killed tunnels would otherwise accumulate:
     # drop the ones whose local listener is already gone.
-    _sweep_stale_managed_blocks(config_path)
+    _sweep_stale_managed_blocks(_managed_config_file(config_path))
     host = f"udc-{allocation_id}"
     try:
         asyncio.run(

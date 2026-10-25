@@ -125,6 +125,36 @@ class LabConfig:
     gui: GUIConfig = field(default_factory=GUIConfig)
 
 
+def validate_active_mode_policy(policy: PolicyConfig) -> None:
+    """Mandatory, non-skippable preconditions for active mode.
+
+    Config loading, broker startup (when a persisted active mode is restored),
+    and runtime monitor->active transitions must all enforce the SAME rule, so
+    a laxer monitor-mode configuration cannot be switched into allocating
+    state without the designed safety gates.
+    """
+
+    if not policy.deployment_allowed:
+        raise ValueError("active mode requires deployment_allowed=true")
+    if not policy.legacy_audit_required:
+        raise ValueError("active mode requires legacy_audit_required=true")
+    if not policy.gpu_audit_required:
+        raise ValueError("active mode requires gpu_audit_required=true")
+    if not policy.workspace_quota_required:
+        raise ValueError("active mode requires workspace_quota_required=true")
+    if policy.max_workspace_gb <= 0:
+        raise ValueError("active mode requires max_workspace_gb > 0")
+    if policy.container_profile == "development":
+        if policy.min_free_docker_gb <= 0:
+            raise ValueError(
+                "active mode with the development profile requires min_free_docker_gb > 0"
+            )
+        if policy.docker_storage_budget_gb <= 0:
+            raise ValueError(
+                "active mode with the development profile requires docker_storage_budget_gb > 0"
+            )
+
+
 def _require(data: dict[str, Any], key: str, section: str) -> Any:
     if key not in data:
         raise ValueError(f"missing [{section}] {key}")
@@ -264,10 +294,10 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("max_hours must not exceed 36")
     if policy.mode not in {"monitor", "maintenance", "active"}:
         raise ValueError("policy.mode must be monitor, maintenance, or active")
-    if policy.mode == "active" and not policy.deployment_allowed:
-        raise ValueError("policy.mode=active requires deployment_allowed=true")
-    if policy.mode == "active" and not policy.legacy_audit_required:
-        raise ValueError("policy.mode=active requires legacy_audit_required=true")
+    if policy.mode == "active":
+        # The same rule the broker enforces at startup and on runtime mode
+        # transitions; see validate_active_mode_policy.
+        validate_active_mode_policy(policy)
     if policy.global_max_cpus <= 0 or policy.global_max_memory_gb <= 0:
         raise ValueError("global CPU and memory budgets must be positive")
     if policy.max_cpus_per_allocation <= 0 or policy.max_memory_gb_per_allocation <= 0:
@@ -351,10 +381,6 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("policy.gpu_audit_timeout must be positive")
     if policy.gpu_audit_interval <= 0:
         raise ValueError("policy.gpu_audit_interval must be positive")
-    if policy.mode == "active" and not policy.gpu_audit_required:
-        raise ValueError("policy.mode=active requires gpu_audit_required=true")
-    if policy.mode == "active" and not policy.workspace_quota_required:
-        raise ValueError("policy.mode=active requires workspace_quota_required=true")
     if policy.workspace_quota_required and policy.max_workspace_gb <= 0:
         raise ValueError("workspace_quota_required requires max_workspace_gb > 0")
     if policy.vscode_enabled and policy.container_profile != "development":

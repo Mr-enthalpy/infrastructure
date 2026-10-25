@@ -215,16 +215,37 @@ async def _index(request: web.Request) -> web.Response:
     )
 
 
+async def _server_capabilities(runner: SSHRunner) -> dict[str, Any]:
+    try:
+        payload = await runner.run(runner.member_alias, ["status"])
+    except Exception:
+        return {}
+    if not payload.get("ok"):
+        return {}
+    data = payload.get("data")
+    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    return capabilities if isinstance(capabilities, dict) else {}
+
+
 async def _api_config(request: web.Request) -> web.Response:
     runner = request.app[RUNNER_KEY]
+    config = request.app[CONFIG_KEY]
+    vscode_enabled = config.policy.vscode_enabled
+    capability_source = "local"
+    capabilities = await _server_capabilities(runner)
+    if "vscode" in capabilities:
+        # The server decides; the member's local config may be stale.
+        vscode_enabled = bool(capabilities["vscode"])
+        capability_source = "server"
     return _json(
         {
             "ok": True,
             "data": {
-                "server_name": request.app[CONFIG_KEY].server.name,
+                "server_name": config.server.name,
                 "member_alias": runner.member_alias,
                 "admin_enabled": bool(runner.admin_alias),
-                "vscode_enabled": request.app[CONFIG_KEY].policy.vscode_enabled,
+                "vscode_enabled": vscode_enabled,
+                "capability_source": capability_source,
             },
         }
     )
@@ -421,7 +442,11 @@ async def _api_vscode(request: web.Request) -> web.Response:
     if not ALLOCATION_RE.fullmatch(allocation_id):
         return _json(_error("bad_request", "invalid allocation id"), 400)
     config: LabConfig = request.app[CONFIG_KEY]
-    if not config.policy.vscode_enabled:
+    # Gate on the server's capability, not the possibly stale local config.
+    capabilities = await _server_capabilities(request.app[RUNNER_KEY])
+    if capabilities.get("vscode") is False:
+        return _json(_error("forbidden", "VS Code support is disabled on the server"), 403)
+    if "vscode" not in capabilities and not config.policy.vscode_enabled:
         return _json(_error("forbidden", "VS Code support is disabled by policy"), 403)
     executable = shutil.which("udc-resource")
     base = [executable] if executable is not None else [sys.executable, "-m", "udc_resource.cli"]

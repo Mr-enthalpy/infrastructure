@@ -84,6 +84,15 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     连接配置（幂等重跑身份脚本作为防御）。
   - 默认 HOME 位于容器可写层内（受 storage_opt 配额约束、随容器销毁）；
     `container_home_tmpfs_gb > 0` 时改为等容量 tmpfs。
+  - active 的必要安全条件抽取为 `validate_active_mode_policy`，配置加载、
+    Broker 启动恢复持久化 active、运行时 admin 切换三处强制同一规则；
+    development profile 在 active 下必须启用 min_free_docker_gb 与
+    docker_storage_budget_gb，且预算与 Docker 所在文件系统真实容量相容。
+  - Broker 在 `list`/`status` 返回 `capabilities`，CLI 与 GUI 的 VS Code 入口
+    以服务端能力为准，不再依赖成员本地（可能过期）的策略副本。
+  - CLI code 启动器以非零状态退出时不写 ready；SSH 配置块移入独立的
+    `~/.ssh/udc-vscode-config`，从用户配置顶部 Include 引入，避免既有
+    `Host *` 通配选项覆盖托管块。
   - VS Code 授权密钥按 allocation 合并（owner ∪ 当前连接者），容器内在既有
     authorized_keys 上合并去重并封顶 40 行，不再整文件覆盖。
   - 队列自动准入前重新执行 GPU 审计与 workspace 配额闸门，与直接申请同等新鲜。
@@ -175,8 +184,10 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
   `torch.cuda.is_available()`；与 docker-exec 路径分别验收（见 acceptance 5.5）。
 - 容器内 sudo（容器 root == 宿主 UID 0）能否 chmod/chown 宿主 /dev/nvidia*
   节点并影响其他成员的访问：必须在批准的测试机/测试 GPU 上按 acceptance 5.6
-  的流程验证，保留前后 stat 记录；若可变更，把 GPU 连续审计、无 host 挂载、
-  workspace nosuid 作为承载性补偿控制记录，并评估 userns-remap。
+  的流程验证，保留前后 stat 记录。这是对普通成员开放前的硬性前置条件：
+  周期性 GPU 审计只能检测漂移并阻止新分配，不能替代隔离——若证实容器 root 可
+  变更宿主设备节点，必须先落实更强的隔离或权限控制（并评估 userns-remap），
+  不得仅依赖审计告警。
 
 ## 6. 下一会话执行顺序
 

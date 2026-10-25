@@ -17,6 +17,8 @@ class FakeRunner:
     def __init__(self, admin_alias: str | None = None) -> None:
         self.member_alias = "member-alias"
         self.admin_alias = admin_alias
+        # None = the fake server reports no capabilities block (old server).
+        self.vscode_capability: bool | None = None
         self.calls: list[tuple[str, list[str]]] = []
 
     async def run(self, alias: str, args: list[str]) -> dict[str, Any]:
@@ -36,6 +38,11 @@ class FakeRunner:
             }
         elif args[:1] == ["status"]:
             data = {"allocations": []}
+            if self.vscode_capability is not None:
+                data["capabilities"] = {
+                    "vscode": self.vscode_capability,
+                    "file_transfer": False,
+                }
         elif args[:1] == ["apply"]:
             data = {
                 "id": "alloc-1",
@@ -246,13 +253,28 @@ async def test_jobs_endpoints(monitor_config):
         await client.close()
 
 
-async def test_config_exposes_vscode_policy(monitor_config):
+async def test_config_exposes_server_capability_over_local_policy(monitor_config):
+    runner = FakeRunner()
+    runner.vscode_capability = True
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.get("/api/config", headers=_headers())
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["data"]["vscode_enabled"] is True
+        assert payload["data"]["capability_source"] == "server"
+    finally:
+        await client.close()
+
+
+async def test_config_falls_back_to_local_policy_without_capabilities(monitor_config):
     runner = FakeRunner()
     client = await _client(_app(monitor_config, runner))
     try:
         response = await client.get("/api/config", headers=_headers())
         payload = await response.json()
         assert payload["data"]["vscode_enabled"] is False
+        assert payload["data"]["capability_source"] == "local"
     finally:
         await client.close()
 
@@ -591,6 +613,44 @@ async def test_vscode_endpoint_reports_early_exit(monitor_config, monkeypatch):
         await client.close()
 
 
+async def test_vscode_endpoint_defers_to_server_capability(monitor_config, monkeypatch):
+    # Server says enabled even though the local policy is stale: must proceed
+    # past the local-policy gate instead of returning 403.
+    runner = FakeRunner()
+    runner.vscode_capability = True
+    app = gui_server.create_app(
+        monitor_config,
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status != 403
+    finally:
+        await client.close()
+
+
+async def test_vscode_endpoint_disabled_on_server(monitor_config):
+    runner = FakeRunner()
+    runner.vscode_capability = False
+    app = gui_server.create_app(
+        monitor_config,
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status == 403
+        payload = await response.json()
+        assert "disabled on the server" in payload["error"]["message"]
+    finally:
+        await client.close()
+
+
 async def test_vscode_endpoint_disabled_by_policy(monitor_config):
     runner = FakeRunner()
     app = gui_server.create_app(
@@ -603,6 +663,8 @@ async def test_vscode_endpoint_disabled_by_policy(monitor_config):
     try:
         response = await client.post("/api/vscode/alloc-1", headers=_headers())
         assert response.status == 403
+        payload = await response.json()
+        assert "disabled by policy" in payload["error"]["message"]
     finally:
         await client.close()
 
