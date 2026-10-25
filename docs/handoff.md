@@ -1,5 +1,13 @@
 # 会话交接
 
+> **成员自助接入与管理闭环（本轮）**：权威成员状态/审批/开户/撤权已实现
+> （membership/ + enrollment/ + onboarding.py，迁移 3，`membership_required`
+> 默认 true）。管理员 CLI：invitations/requests/members/operations；GUI 新增
+> 成员管理面板；intake 服务与执行器模板在 deploy/。三份文档：
+> docs/guides/member-quickstart.md、docs/guides/admin-membership.md、
+> docs/reports/member-onboarding-and-ux.md（含差距表、测试结果与
+> D1=达成/D2=待执行/D3=未授权 结论）。
+
 ## 1. 基线信息
 
 - 代码基线：`d4cf3a8`（`Keep storage preflight tests off the global os module`）。

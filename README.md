@@ -289,3 +289,8 @@ py -3.13 -m venv .venv
 依赖更新后运行 `uv lock`。部署前必须运行
 `bash deploy/preflight.sh --config lab/resources.local.toml`（只读）。在训练结束并
 获得管理员明确批准前，不得执行任何会修改主机的 `deploy/` 脚本。
+
+
+## 成员自助接入（新增）
+
+新成员申请、配置与日常使用见 `docs/guides/member-quickstart.md`；管理员审批与管理见 `docs/guides/admin-membership.md`。实现报告见 `docs/reports/member-onboarding-and-ux.md`。
