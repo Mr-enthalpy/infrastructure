@@ -399,6 +399,19 @@ def _atomic_config_write(path: Path, text: str) -> None:
             os.chmod(temp_name, 0o600)
         except OSError:
             pass
+        if os.name == "nt":
+            # tempfile.mkstemp gives the temp file an OWNER RIGHTS ACL on
+            # Windows (CPython security hardening); Windows OpenSSH refuses
+            # config files carrying that ACE. Reset to inherited permissions.
+            try:
+                subprocess.run(
+                    ["icacls", str(temp_name), "/reset"],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         os.replace(temp_name, path)
     except Exception:
         try:

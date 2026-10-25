@@ -11,8 +11,28 @@ import pytest
 from tests.fakes import FakeDocker, FakeIdentityResolver
 from udc_resource.broker.server import Broker
 from udc_resource.client import BrokerClient
+from udc_resource.gpu_audit import GpuAuditResult
 from udc_resource.identity import Identity
+from udc_resource.legacy_audit import LegacyAuditResult
 from udc_resource.stream import FRAME_DATA, FRAME_EXIT, read_frame, write_frame
+from udc_resource.workspace_quota import MemberQuotaResult, QuotaCheckResult
+
+
+def _passing_member_quota(workspace: str, uid: int, limit: int) -> MemberQuotaResult:
+    return MemberQuotaResult(True, "ok", project_id=uid, hard_limit_bytes=limit * 1024**3)
+
+
+def _uds_broker_kwargs() -> dict:
+    """Active mode enforces the mandatory gates at startup; give the broker
+    passing audit and quota runners so the UDS tests focus on transport."""
+    return {
+        "legacy_audit": lambda: LegacyAuditResult(True, "clean"),
+        "gpu_audit": lambda: GpuAuditResult(True, "clean", fingerprint="fp"),
+        "quota_check": lambda: QuotaCheckResult(True, "ok"),
+        "member_quota_check": _passing_member_quota,
+        "member_quota_provision": _passing_member_quota,
+    }
+
 
 pytestmark = [
     pytest.mark.linux,
@@ -21,6 +41,30 @@ pytestmark = [
         reason="SO_PEERCRED and Unix sockets are required",
     ),
 ]
+
+
+def _uds_broker(tmp_path, config, socket_path, docker, identity_resolver):
+    """Active mode enforces the mandatory gates at startup; give the broker
+    passing audit and quota runners so the UDS tests focus on transport."""
+    from udc_resource.gpu_audit import GpuAuditResult
+    from udc_resource.legacy_audit import LegacyAuditResult
+    from udc_resource.workspace_quota import MemberQuotaResult, QuotaCheckResult
+
+    def passing_member_quota(workspace, uid, limit):
+        return MemberQuotaResult(True, "ok", project_id=uid, hard_limit_bytes=limit * 1024**3)
+
+    return Broker(
+        config,
+        db_path=tmp_path / "state.db",
+        socket_path=socket_path,
+        docker=docker,
+        identity_resolver=identity_resolver,
+        legacy_audit=lambda: LegacyAuditResult(True, "clean"),
+        gpu_audit=lambda: GpuAuditResult(True, "clean", fingerprint="fp"),
+        quota_check=lambda: QuotaCheckResult(True, "ok"),
+        member_quota_check=passing_member_quota,
+        member_quota_provision=passing_member_quota,
+    )
 
 
 async def test_uds_peer_identity_and_client(tmp_path, active_config):
@@ -40,6 +84,7 @@ async def test_uds_peer_identity_and_client(tmp_path, active_config):
         socket_path=socket_path,
         docker=FakeDocker(),
         identity_resolver=FakeIdentityResolver({uid: identity}),
+        **_uds_broker_kwargs(),
     )
     await broker.start()
     try:
@@ -142,6 +187,7 @@ async def test_uds_file_transfer_stays_in_workspace(tmp_path, active_config):
         socket_path=socket_path,
         docker=FakeDocker(),
         identity_resolver=FakeIdentityResolver({uid: identity}),
+        **_uds_broker_kwargs(),
     )
     await broker.start()
     try:
@@ -246,6 +292,7 @@ async def test_uds_upload_limit_aborts_without_partial_file(tmp_path, active_con
         socket_path=socket_path,
         docker=FakeDocker(),
         identity_resolver=FakeIdentityResolver({uid: identity}),
+        **_uds_broker_kwargs(),
     )
     await broker.start()
     try:
