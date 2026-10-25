@@ -2318,6 +2318,228 @@ def gui_command(
     )
 
 
+@admin_app.command("invitations")
+def admin_invitations(
+    ctx: typer.Context,
+    create: bool = typer.Option(False, "--create", help="生成一个新邀请。"),
+    validity_hours: int = typer.Option(168, "--validity-hours", min=1),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """生成或列出加入邀请（直接写入 intake 存储）。"""
+    config = _load(ctx)
+    from .enrollment import store as intake_store
+
+    connection = intake_store.connect(config.onboarding.intake_db)
+    try:
+        if create:
+            invitation = intake_store.create_invitation(
+                connection,
+                created_by="admin-cli",
+                validity_hours=validity_hours,
+            )
+            if json_output:
+                typer.echo(json.dumps({"ok": True, "data": invitation}))
+                return
+            typer.echo(f"邀请编号：{invitation['invite_id']}")
+            typer.echo(f"邀请密钥（仅显示一次，通过可信渠道发送）：{invitation['invite_secret']}")
+            typer.echo(f"有效期至：{invitation['expires_at']}")
+            return
+        rows = connection.execute(
+            "SELECT invite_id, created_by, created_at, expires_at, revoked, "
+            "used_by_request FROM invitations ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        if json_output:
+            typer.echo(
+                json.dumps({"ok": True, "data": {"invitations": [dict(row) for row in rows]}})
+            )
+            return
+        for row in rows:
+            state = "已撤销" if row["revoked"] else ("已使用" if row["used_by_request"] else "有效")
+            typer.echo(f"{row['invite_id']}  {state}  {row['created_at']}  by {row['created_by']}")
+    finally:
+        connection.close()
+
+
+@admin_app.command("requests")
+def admin_requests(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="list / show / approve / reject / import"),
+    request_id: str = typer.Option("", "--request-id"),
+    valid_until: str = typer.Option("", "--valid-until", help="成员资格有效期（ISO 时间）。"),
+    quota_gb: int = typer.Option(200, "--quota-gb", min=1),
+    review_note: str = typer.Option("", "--review-note", help="申请人可见说明。"),
+    internal_note: str = typer.Option("", "--internal-note", help="仅管理员可见备注。"),
+    file_path: Path | None = typer.Option(None, "--file", help="离线申请文件路径。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """审核加入申请：list / show / approve / reject / import。"""
+    config = _load(ctx)
+
+    if action == "list":
+        _request(_make_client(config), "admin_requests_list", json_output)
+        return
+    if action == "show":
+        if not request_id:
+            _fail("bad_request", "show 需要 --request-id", json_output)
+        _request(_make_client(config), "admin_requests_show", json_output, request_id=request_id)
+        return
+    if action == "approve":
+        if not request_id:
+            _fail("bad_request", "approve 需要 --request-id", json_output)
+        data = _request(
+            _make_client(config),
+            "admin_requests_approve",
+            json_output,
+            request_id=request_id,
+            valid_until=valid_until,
+            quota_gb=quota_gb,
+            review_note=review_note,
+            internal_note=internal_note,
+        )
+        if json_output:
+            return
+        typer.echo(f"申请 {data.get('request_id')} 已批准并提交开户。")
+        typer.echo(
+            f"开户操作：{data.get('operation_id')}  "
+            f"状态：{data.get('operation_status', data.get('status'))}"
+        )
+        return
+    if action == "reject":
+        if not request_id:
+            _fail("bad_request", "reject 需要 --request-id", json_output)
+        if not review_note:
+            _fail("bad_request", "拒绝必须提供 --review-note（申请人可见原因）", json_output)
+        data = _request(
+            _make_client(config),
+            "admin_requests_reject",
+            json_output,
+            request_id=request_id,
+            review_note=review_note,
+            internal_note=internal_note,
+        )
+        if json_output:
+            return
+        typer.echo(f"申请 {data.get('request_id')} 已拒绝；未创建任何账号或资源。")
+        return
+    if action == "import":
+        if file_path is None:
+            _fail("bad_request", "import 需要 --file", json_output)
+        from .enrollment import store as intake_store
+
+        connection = intake_store.connect(config.onboarding.intake_db)
+        try:
+            try:
+                raw = json.loads(file_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                _fail("bad_request", f"申请文件无效：{exc}", json_output)
+            try:
+                result = intake_store.submit_application(
+                    connection,
+                    invite_id=str(raw.get("invite_id", "")),
+                    invite_secret=str(raw.get("invite_secret", "")),
+                    application=raw.get("application", {}),
+                )
+            except ValueError as exc:
+                _fail("bad_request", str(exc), json_output)
+            if json_output:
+                typer.echo(json.dumps({"ok": True, "data": result}))
+                return
+            typer.echo(f"离线申请已导入：{result['request_id']}")
+            if result.get("receipt_secret"):
+                typer.echo(f"回执密钥（仅显示一次）：{result['receipt_secret']}")
+        finally:
+            connection.close()
+        return
+    _fail("bad_request", f"未知操作 {action}；可用：list/show/approve/reject/import", json_output)
+
+
+@admin_app.command("members")
+def admin_members(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="list / show / suspend / resume / revoke"),
+    member_id: str = typer.Option("", "--member-id"),
+    reason: str = typer.Option("", "--reason", help="状态变更原因（必填）。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """查看和管理已有成员。"""
+    config = _load(ctx)
+    if action == "list":
+        _request(_make_client(config), "admin_members_list", json_output)
+        return
+    if action == "show":
+        if not member_id:
+            _fail("bad_request", "show 需要 --member-id", json_output)
+        _request(
+            _make_client(config),
+            "admin_members_show",
+            json_output,
+            member_id=member_id,
+        )
+        return
+    if action in {"suspend", "resume", "revoke"}:
+        if not member_id:
+            _fail("bad_request", f"{action} 需要 --member-id", json_output)
+        if not reason:
+            _fail("bad_request", f"{action} 必须提供 --reason", json_output)
+        if action in {"suspend", "revoke"} and not json_output:
+            typer.confirm(
+                f"确认对成员 {member_id} 执行 {action}？原因：{reason}",
+                abort=True,
+            )
+        command = f"admin_members_{action}"
+        data = _request(
+            _make_client(config),
+            command,
+            json_output,
+            member_id=member_id,
+            reason=reason,
+        )
+        if json_output:
+            return
+        typer.echo(f"成员 {member_id}：{data.get('status')}")
+        if data.get("credential_revocation") == "pending_retry":
+            typer.echo("注意：凭据撤销待重试；访问已被状态阻断。")
+        return
+    _fail("bad_request", f"未知操作 {action}", json_output)
+
+
+@admin_app.command("operations")
+def admin_operations(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="show / retry"),
+    operation_id: str = typer.Option("", "--operation-id"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """查看与重试开户/撤权操作。"""
+    config = _load(ctx)
+    if action == "show":
+        if not operation_id:
+            _fail("bad_request", "show 需要 --operation-id", json_output)
+        _request(
+            _make_client(config),
+            "admin_operations_show",
+            json_output,
+            operation_id=operation_id,
+        )
+        return
+    if action == "retry":
+        if not operation_id:
+            _fail("bad_request", "retry 需要 --operation-id", json_output)
+        data = _request(
+            _make_client(config),
+            "admin_operations_retry",
+            json_output,
+            operation_id=operation_id,
+        )
+        if json_output:
+            return
+        typer.echo(f"操作 {operation_id}：{data.get('status')}")
+        if data.get("stages"):
+            typer.echo(f"阶段：{', '.join(data['stages'])}")
+        return
+    _fail("bad_request", f"未知操作 {action}", json_output)
+
+
 @admin_app.command("users")
 def admin_users(
     ctx: typer.Context,

@@ -75,6 +75,25 @@ def approve_request(
         request = intake_store.get_request(intake, request_id)
         if request is None:
             raise NotFound(f"request not found: {request_id}")
+        # Convergence first (§7.3): a retried/concurrent approval returns the
+        # original member and operation instead of conflicting on the intake
+        # projection, which the first approval already moved to approved.
+        decision_check = member_store.get_application_decision(connection, request_id)
+        if decision_check is not None and decision_check["status"] == "approved":
+            operation = (
+                member_store.get_operation(connection, str(decision_check["operation_id"] or ""))
+                if decision_check.get("operation_id")
+                else None
+            )
+            if operation is not None:
+                return {
+                    "request_id": request_id,
+                    "status": "approved",
+                    "member_id": operation.get("member_id"),
+                    "operation_id": operation["operation_id"],
+                    "operation_status": operation["status"],
+                }
+            raise Conflict("申请已批准但缺少开户操作记录；请联系管理员检查")
         if request["status"] not in ("pending_review", "needs_info"):
             raise Conflict(f"申请当前状态为 {request['status']}，已被其他管理员处理或不可批准")
         snapshot = json.loads(
@@ -107,27 +126,10 @@ def approve_request(
     }
     idempotency_key = f"approve:{request_id}:{version}"
 
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
-        decision = member_store.get_application_decision(connection, request_id)
-        if decision is not None and decision["status"] == "approved":
-            # Concurrent/retried approval: converge on the existing record.
-            connection.rollback()
-            member_id = str(decision.get("operation_id") or "")
-            operation = (
-                member_store.get_operation(connection, member_id)
-                if decision.get("operation_id")
-                else None
-            )
-            if operation is not None:
-                return {
-                    "request_id": request_id,
-                    "status": "approved",
-                    "member_id": operation.get("member_id"),
-                    "operation_id": operation["operation_id"],
-                    "operation_status": operation["status"],
-                }
-            raise Conflict("申请已批准但缺少开户操作记录；请联系管理员检查")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         member_id = member_store.create_member(
             connection,
             status="provisioning",
@@ -176,9 +178,11 @@ def approve_request(
             detail={"request_id": request_id, "operation_id": operation_id},
             now=now,
         )
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
 
     return _execute_provision_operation(
@@ -311,17 +315,20 @@ def _execute_provision_operation(
             "stage": str(exc),
             "member_id": member_id,
         }
+    # Re-provisioning re-entry (§6.1): provision_failed -> provisioning -> active.
+    row = connection.execute(
+        "SELECT status FROM members WHERE member_id = ?", (member_id,)
+    ).fetchone()
+    if row is not None and str(row["status"]) == "provision_failed":
+        member_store.transition_member(
+            connection,
+            member_id,
+            target="provisioning",
+            reason="provisioning retry",
+            actor_uid=None,
+            now=now,
+        )
     # Success: keys projection from the authoritative set, member activation.
-    member_keys = member_store.active_keys(connection, _uid_of_member(connection, member_id))
-    member_store.set_member_keys(
-        connection,
-        member_id,
-        [
-            {"public_key": key, "fingerprint": member_store.member_key_fingerprint(key)}
-            for key in member_keys
-        ],
-        now=now,
-    )
     member_store.update_operation(
         connection,
         operation_id,
@@ -330,8 +337,10 @@ def _execute_provision_operation(
         now=now,
     )
     connection.commit()
-    uid = _uid_of_member(connection, member_id)
     username = frozen["username"]
+    uid = result.get("uid")
+    if uid is None:
+        uid = _uid_of_member(connection, member_id)
     connection.execute("BEGIN IMMEDIATE")
     connection.execute(
         "UPDATE members SET linux_uid = ?, linux_username = ? WHERE member_id = ?",

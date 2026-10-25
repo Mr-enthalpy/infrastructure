@@ -151,6 +151,9 @@ def _action_provision_member(frozen: dict[str, Any], stages: list[str]) -> None:
     stages.append("central_keys_installed")
     if not _user_exists(username):
         raise StageError("verify_account", "account disappeared after provisioning")
+    import pwd
+
+    stages.append(f"uid:{pwd.getpwnam(username).pw_uid}")
     stages.append("verified")
 
 

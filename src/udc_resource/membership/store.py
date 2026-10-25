@@ -141,8 +141,10 @@ def create_member(
         raise Conflict(f"unknown member status: {status}")
     resolved = member_id or uuid.uuid4().hex
     timestamp = _now(now)
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             INSERT INTO members(
@@ -172,9 +174,11 @@ def create_member(
             detail={"member_id": resolved, "status": status},
             now=now,
         )
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
     return resolved
 
@@ -193,8 +197,10 @@ def transition_member(
     if target not in MEMBER_STATUSES:
         raise Conflict(f"unknown member status: {target}")
     timestamp = _now(now)
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM members WHERE member_id = ?", (member_id,)
         ).fetchone()
@@ -230,9 +236,11 @@ def transition_member(
             },
             now=now,
         )
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
     return {
         "member_id": member_id,
@@ -341,8 +349,10 @@ def add_key(
 ) -> str:
     key_id = uuid.uuid4().hex
     timestamp = _now(now)
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
             "SELECT member_id FROM member_keys WHERE fingerprint = ? AND status = 'active'",
             (fingerprint,),
@@ -365,9 +375,11 @@ def add_key(
             detail={"member_id": member_id, "fingerprint": fingerprint},
             now=now,
         )
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
     return key_id
 
@@ -381,8 +393,10 @@ def revoke_key(
     now: datetime | None = None,
 ) -> None:
     timestamp = _now(now)
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM member_keys WHERE key_id = ? AND member_id = ?",
             (key_id, member_id),
@@ -412,9 +426,11 @@ def revoke_key(
             detail={"member_id": member_id, "fingerprint": str(row["fingerprint"])},
             now=now,
         )
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
 
 
@@ -427,8 +443,10 @@ def set_member_keys(
 ) -> None:
     """Replace the active key set (provisioning projection, §8.3)."""
     timestamp = _now(now)
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             "UPDATE member_keys SET status = 'revoked', revoked_at = ? "
             "WHERE member_id = ? AND status = 'active'",
@@ -457,9 +475,11 @@ def set_member_keys(
                 (uuid.uuid4().hex, member_id, key["public_key"], key["fingerprint"], timestamp),
             )
         bump_access_version(connection, member_id)
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
 
 
@@ -492,8 +512,10 @@ def create_operation(
             return str(existing["operation_id"]), False
     operation_id = uuid.uuid4().hex
     timestamp = _now(now)
+    own = not connection.in_transaction
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        if own:
+            connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             INSERT INTO member_operations(
@@ -523,9 +545,11 @@ def create_operation(
             },
             now=now,
         )
-        connection.commit()
+        if own:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if own:
+            connection.rollback()
         raise
     return operation_id, True
 
