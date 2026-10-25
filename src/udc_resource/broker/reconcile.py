@@ -209,11 +209,38 @@ def reconcile(
                 active_container.id,
             )
             continue
-        if active_container.status != "running":
+        if active_container.status in {"running", "restarting", "paused"}:
+            # Same liveness set as the GPU holder logic: a restarting or
+            # paused container is a live allocation, not garbage to collect.
+            pass
+        else:
+            removed_ok = True
             try:
                 docker.remove_container(active_container.id)
             except Exception:
+                removed_ok = False
                 logger.exception("could not remove stopped container %s", active_container.id)
+            if not removed_ok:
+                # The orphan container may still exist: keep the GPU claims
+                # and reservations (non-terminal) and let the next reconcile
+                # pass retry, exactly like activation double failures.
+                try:
+                    store.mark_cleanup_pending(
+                        connection,
+                        allocation_id,
+                        reason=(
+                            f"container is not running ({active_container.status}) "
+                            "and cleanup failed"
+                        ),
+                        now=current,
+                    )
+                    summary["cleanup_failed"] += 1
+                except Exception:
+                    logger.exception(
+                        "could not mark cleanup pending for %s",
+                        allocation_id,
+                    )
+                continue
             try:
                 store.fail_allocation(
                     connection,

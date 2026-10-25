@@ -107,9 +107,11 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
   - development profile 的 capabilities 在 cap_drop=ALL 之上精确补回十项，
     含 sshd 预认证权限分离所需的 SYS_CHROOT；不得以 SYS_ADMIN/--privileged
     替代。
-  - 容器创建后立即记录 container_id；身份初始化或激活失败且容器清理也失败时，
-    allocation 进入非终态 cleanup_pending：GPU claim 与 CPU/内存/存储预算保持
-    占用，reconcile 周期重试清理并在确认容器消失后 finalize 为 failed。
+    - 容器创建后立即记录 container_id；身份初始化/激活失败且容器清理也失败、
+    以及 reconcile 发现 active 容器已停止但删除失败时，allocation 进入非终态
+    cleanup_pending：GPU claim 与 CPU/内存/存储预算保持占用，reconcile 周期
+    重试清理并在确认容器消失后 finalize。restarting/paused 是存活状态，
+    不会被当作垃圾回收。
   - 托管 SSH 配置的 Include 指令只在托管文件中不再有任何 allocation 块时才
     移除（跨 allocation 安全）；同一 allocation 的新旧隧道由端口存活判定接管。
   - VS Code 探测改为可追踪的异步子进程，超时显式 kill 并回收。

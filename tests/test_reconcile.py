@@ -1,6 +1,8 @@
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from tests.fakes import FakeDocker
 from udc_resource import store
 from udc_resource.broker.docker_driver import ContainerInfo
@@ -300,4 +302,86 @@ def test_active_expired_identity_mismatch_is_not_removed(tmp_path):
     assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 1
     assert "container-1" in fake.containers
     assert fake.removed == []
+    connection.close()
+
+
+def test_restarting_active_container_is_kept(tmp_path):
+    """A restarting or paused container is live: never garbage-collected."""
+    connection = _connection(tmp_path)
+    old = NOW - timedelta(hours=1)
+    allocation_id = _allocation(connection, created_at=old, expires_at=NOW + timedelta(hours=1))
+    store.activate_allocation(
+        connection,
+        allocation_id,
+        container_id="container-1",
+        container_name="udc-alice-test",
+        now=old,
+    )
+    fake = FakeDocker()
+    fake.add_container(_container(allocation_id, status="restarting"))
+    summary = reconcile(connection, fake, now=NOW)
+    assert summary["kept"] == 1
+    assert fake.removed == []
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == "active"
+    connection.close()
+
+
+def test_stopped_container_removal_failure_keeps_claims(tmp_path):
+    """Removal failure must not release the GPU claim: the orphan may still
+    hold the device. cleanup_pending defers finalization to the next pass."""
+    connection = _connection(tmp_path)
+    old = NOW - timedelta(hours=1)
+    allocation_id = _allocation(connection, created_at=old, expires_at=NOW + timedelta(hours=1))
+    store.activate_allocation(
+        connection,
+        allocation_id,
+        container_id="container-1",
+        container_name="udc-alice-test",
+        now=old,
+    )
+    fake = FakeDocker(fail_remove=True)
+    fake.add_container(_container(allocation_id, status="exited"))
+    summary = reconcile(connection, fake, now=NOW)
+    assert summary["cleanup_failed"] == 1
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == ("cleanup_pending")
+    # The claim still blocks the GPU.
+    with pytest.raises(Exception, match="GPU"):
+        store.create_allocation(
+            connection,
+            owner_uid=1001,
+            owner_name="bob",
+            gpu_uuids=("GPU-0",),
+            cpus=8.0,
+            memory_gb=32,
+            image="udc-base:2026.10",
+            workspace="/data1/udc-users/bob",
+            note="",
+            starts_at=NOW,
+            expires_at=NOW + timedelta(hours=1),
+            max_cpus=32.0,
+            max_memory_gb=128,
+            now=NOW,
+        )
+    connection.close()
+
+
+def test_cleanup_pending_is_finalized_once_removal_succeeds(tmp_path):
+    connection = _connection(tmp_path)
+    old = NOW - timedelta(hours=1)
+    allocation_id = _allocation(connection, created_at=old, expires_at=NOW + timedelta(hours=1))
+    store.activate_allocation(
+        connection,
+        allocation_id,
+        container_id="container-1",
+        container_name="udc-alice-test",
+        now=old,
+    )
+    fake = FakeDocker(fail_remove=True)
+    fake.add_container(_container(allocation_id, status="exited"))
+    reconcile(connection, fake, now=NOW)
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == ("cleanup_pending")
+    fake.fail_remove = False
+    summary = reconcile(connection, fake, now=NOW)
+    assert summary["cleanup_retried"] == 1
+    assert store.get_allocation(connection, allocation_id, now=NOW)["status"] == "failed"
     connection.close()
