@@ -47,16 +47,12 @@ def _member_from_row(row: sqlite3.Row) -> MemberRecord:
 
 
 def get_member_by_uid(connection: sqlite3.Connection, uid: int) -> MemberRecord | None:
-    row = connection.execute(
-        "SELECT * FROM members WHERE linux_uid = ?", (uid,)
-    ).fetchone()
+    row = connection.execute("SELECT * FROM members WHERE linux_uid = ?", (uid,)).fetchone()
     return _member_from_row(row) if row is not None else None
 
 
 def get_member(connection: sqlite3.Connection, member_id: str) -> dict[str, Any]:
-    row = connection.execute(
-        "SELECT * FROM members WHERE member_id = ?", (member_id,)
-    ).fetchone()
+    row = connection.execute("SELECT * FROM members WHERE member_id = ?", (member_id,)).fetchone()
     if row is None:
         raise NotFound(f"member not found: {member_id}")
     member = _member_from_row(row)
@@ -107,9 +103,7 @@ def get_member(connection: sqlite3.Connection, member_id: str) -> dict[str, Any]
 
 
 def list_members(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        "SELECT * FROM members ORDER BY created_at ASC, member_id"
-    ).fetchall()
+    rows = connection.execute("SELECT * FROM members ORDER BY created_at ASC, member_id").fetchall()
     result = []
     for row in rows:
         member = _member_from_row(row)
@@ -208,9 +202,7 @@ def transition_member(
             raise NotFound(f"member not found: {member_id}")
         current_status = str(row["status"])
         if target not in ALLOWED_MEMBER_TRANSITIONS.get(current_status, ()):
-            raise Conflict(
-                f"member {member_id} cannot transition {current_status} -> {target}"
-            )
+            raise Conflict(f"member {member_id} cannot transition {current_status} -> {target}")
         connection.execute(
             """
             UPDATE members
@@ -406,8 +398,7 @@ def revoke_key(
         ).fetchone()[0]
         if int(active_left) == 0:
             raise Conflict(
-                "这是最后一个有效公钥；移除后你将无法登录。请先添加新密钥，"
-                "或联系管理员走恢复流程"
+                "这是最后一个有效公钥；移除后你将无法登录。请先添加新密钥，或联系管理员走恢复流程"
             )
         connection.execute(
             "UPDATE member_keys SET status = 'revoked', revoked_at = ? WHERE key_id = ?",
@@ -451,12 +442,9 @@ def set_member_keys(
             ).fetchone()
             if existing is not None:
                 if str(existing["member_id"]) != member_id:
-                    raise Conflict(
-                        "该公钥已登记给其他成员；如需转移请联系管理员"
-                    )
+                    raise Conflict("该公钥已登记给其他成员；如需转移请联系管理员")
                 connection.execute(
-                    "UPDATE member_keys SET status = 'active', revoked_at = '' "
-                    "WHERE key_id = ?",
+                    "UPDATE member_keys SET status = 'active', revoked_at = '' WHERE key_id = ?",
                     (str(existing["key_id"]),),
                 )
                 continue
@@ -598,8 +586,7 @@ def list_operations(
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     rows = connection.execute(
-        "SELECT * FROM member_operations ORDER BY created_at DESC, operation_id "
-        "LIMIT ?",
+        "SELECT * FROM member_operations ORDER BY created_at DESC, operation_id LIMIT ?",
         (limit,),
     ).fetchall()
     return [

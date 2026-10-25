@@ -349,14 +349,16 @@ def _insert_allocation(
     expires_at: datetime,
     now: datetime | None,
     action: str = "allocation_pending",
+    idempotency_key: str = "",
 ) -> None:
     timestamp = (now or utcnow()).isoformat()
     connection.execute(
         """
         INSERT INTO allocations(
             id, owner_uid, owner_name, status, image, cpus, memory_gb,
-            workspace, note, created_at, starts_at, expires_at
-        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            workspace, note, gpus, created_at, starts_at, expires_at,
+            idempotency_key
+        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)
         """,
         (
             allocation_id,
@@ -370,6 +372,7 @@ def _insert_allocation(
             timestamp,
             starts_at.isoformat(),
             expires_at.isoformat(),
+            idempotency_key,
         ),
     )
     connection.executemany(
@@ -411,8 +414,28 @@ def create_allocation(
     max_active_allocations_per_user: int = 4,
     writable_layer_gb: int = 0,
     docker_storage_budget_gb: int = 0,
+    idempotency_key: str = "",
+    membership_valid_until: str = "",
     now: datetime | None = None,
 ) -> str:
+    # Membership validity bounds the allocation (§6.3): a new environment can
+    # never outlive the member's access.
+    if membership_valid_until:
+        try:
+            member_deadline = datetime.fromisoformat(membership_valid_until)
+            if member_deadline.tzinfo is None:
+                member_deadline = member_deadline.replace(tzinfo=UTC)
+            if expires_at > member_deadline:
+                expires_at = member_deadline
+        except ValueError:
+            pass
+    if idempotency_key:
+        existing = connection.execute(
+            "SELECT id FROM allocations WHERE owner_uid = ? AND idempotency_key = ?",
+            (owner_uid, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
     allocation_id = uuid.uuid4().hex
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -451,11 +474,19 @@ def create_allocation(
             note=note,
             starts_at=starts_at,
             expires_at=expires_at,
+            idempotency_key=idempotency_key,
             now=now,
         )
         connection.commit()
     except sqlite3.IntegrityError as exc:
         connection.rollback()
+        if idempotency_key:
+            existing = connection.execute(
+                "SELECT id FROM allocations WHERE owner_uid = ? AND idempotency_key = ?",
+                (owner_uid, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["id"])
         raise GpuBusy("GPU is already allocated") from exc
     except Exception:
         connection.rollback()
@@ -755,6 +786,7 @@ def admit_next_queued(
     docker_storage_budget_gb: int = 0,
     backfill_enabled: bool = True,
     backfill_reserve_minutes: int = 30,
+    membership_required: bool = False,
     now: datetime | None = None,
 ) -> str | None:
     """Admit the first runnable queued request in FIFO order.
@@ -819,6 +851,31 @@ def admit_next_queued(
                     now=current,
                 )
                 continue
+            if membership_required:
+                member = connection.execute(
+                    "SELECT status, valid_until FROM members WHERE linux_uid = ?",
+                    (int(row["owner_uid"]),),
+                ).fetchone()
+                blocked_member = True
+                if member is not None and str(member["status"]) == "active":
+                    blocked_member = False
+                    valid_until = str(member["valid_until"])
+                    if valid_until:
+                        if current.isoformat() >= valid_until:
+                            blocked_member = True
+                if blocked_member:
+                    connection.execute(
+                        "UPDATE queue_requests SET state = 'failed', reason = ? WHERE id = ?",
+                        ("成员资格状态不允许准入；请联系管理员", queue_id),
+                    )
+                    record_event(
+                        connection,
+                        actor_uid=int(row["owner_uid"]),
+                        action="queue_failed",
+                        detail={"queue_id": queue_id, "reason": "member not active"},
+                        now=current,
+                    )
+                    continue
             if oldest_blocked is not None:
                 # Some earlier request cannot run yet. Backfill rules apply to
                 # every later request — including CPU-only ones, whose blocked

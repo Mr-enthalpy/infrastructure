@@ -83,6 +83,10 @@ class PolicyConfig:
     vscode_enabled: bool = False
     vscode_max_tunnels: int = 8
     vscode_identity_file: str = ""
+    # Authoritative membership gating (goal §6): when true, normal resource
+    # operations require an active member record. Admin identities keep the
+    # trusted admin-group path and are exempt.
+    membership_required: bool = True
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,23 @@ class GUIConfig:
 
 
 @dataclass(frozen=True)
+class OnboardingConfig:
+    """Member-facing onboarding information (goal §4.2). Public data only.
+
+    The URLs are published by the lab through its own channels; unset values
+    mean the deployment preflight warns that the entry points are missing.
+    """
+
+    guide_url: str = ""
+    apply_url: str = ""
+    support_label: str = "实验室计算资源管理员"
+    support_contact: str = ""
+    legacy_login_notice_enabled: bool = True
+    intake_db: str = "/var/lib/udc-resource-intake/applications.db"
+    presets: tuple[tuple[str, int, float, int, int], ...] = ()
+
+
+@dataclass(frozen=True)
 class LabConfig:
     server: ServerConfig
     hardware: HardwareConfig
@@ -123,6 +144,7 @@ class LabConfig:
     image: ImageConfig = field(default_factory=ImageConfig)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     gui: GUIConfig = field(default_factory=GUIConfig)
+    onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
 
 
 def validate_active_mode_policy(policy: PolicyConfig) -> None:
@@ -179,6 +201,7 @@ def load_config(path: str | Path) -> LabConfig:
     image_raw = data.get("image", {})
     deployment_raw = data.get("deployment", {})
     gui_raw = data.get("gui", {})
+    onboarding_raw = data.get("onboarding", {})
 
     server = ServerConfig(
         name=str(_require(server_raw, "name", "server")),
@@ -230,6 +253,7 @@ def load_config(path: str | Path) -> LabConfig:
         policy_raw.get("global_max_memory_gb", hardware.ram_gib - reserve_memory_gb)
     )
     policy = PolicyConfig(
+        membership_required=bool(policy_raw.get("membership_required", True)),
         default_hours=int(policy_raw.get("default_hours", 12)),
         max_hours=int(policy_raw.get("max_hours", 36)),
         mode=str(policy_raw.get("mode", "monitor")),
@@ -420,6 +444,33 @@ def load_config(path: str | Path) -> LabConfig:
     )
     if gui.connect_timeout <= 0:
         raise ValueError("gui.connect_timeout must be positive")
+    onboarding = OnboardingConfig(
+        guide_url=str(onboarding_raw.get("guide_url", "")),
+        apply_url=str(onboarding_raw.get("apply_url", "")),
+        support_label=str(onboarding_raw.get("support_label", "实验室计算资源管理员")),
+        support_contact=str(onboarding_raw.get("support_contact", "")),
+        legacy_login_notice_enabled=bool(onboarding_raw.get("legacy_login_notice_enabled", True)),
+        intake_db=str(
+            onboarding_raw.get("intake_db", "/var/lib/udc-resource-intake/applications.db")
+        ),
+    )
+    raw_presets = onboarding_raw.get("presets", [])
+    if not isinstance(raw_presets, list):
+        raise ValueError("onboarding.presets must be a list of tables")
+    presets: list[tuple[str, int, float, int, int]] = []
+    for preset in raw_presets:
+        if not isinstance(preset, dict):
+            raise ValueError("onboarding.presets entries must be tables")
+        name = str(preset.get("name", ""))
+        gpus = int(preset.get("gpus", 0))
+        cpus = float(preset.get("cpus", 0))
+        memory_gb = int(preset.get("memory_gb", 0))
+        hours = int(preset.get("hours", 0))
+        if not name or gpus < 0 or cpus <= 0 or memory_gb <= 0 or hours <= 0:
+            raise ValueError(
+                "onboarding.presets entries need name, gpus >= 0, cpus, memory_gb, hours"
+            )
+        presets.append((name, gpus, cpus, memory_gb, hours))
     return LabConfig(
         server=server,
         hardware=hardware,
@@ -428,4 +479,13 @@ def load_config(path: str | Path) -> LabConfig:
         image=image,
         deployment=deployment,
         gui=gui,
+        onboarding=OnboardingConfig(
+            guide_url=onboarding.guide_url,
+            apply_url=onboarding.apply_url,
+            support_label=onboarding.support_label,
+            support_contact=onboarding.support_contact,
+            legacy_login_notice_enabled=onboarding.legacy_login_notice_enabled,
+            intake_db=onboarding.intake_db,
+            presets=tuple(presets),
+        ),
     )

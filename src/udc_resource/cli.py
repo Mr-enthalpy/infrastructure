@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -1397,6 +1398,98 @@ def apply_command(
     typer.echo(f"gpus: {data['gpus']}")
     typer.echo(f"expires: {data['expires_at']}")
     typer.echo(f"workspace: {data['workspace']}")
+
+
+@app.command("me")
+def me_command(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """查看我的成员状态与公钥。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "me", json_output)
+    if json_output:
+        return
+    membership = data.get("membership", {})
+    status = membership.get("status", "?")
+    typer.echo(f"账号：{data.get('username')}（UID {data.get('uid')}）")
+    if status == "admin":
+        typer.echo("成员状态：管理员（不受成员资格限制）")
+        return
+    typer.echo(f"成员状态：{status}")
+    if membership.get("valid_until"):
+        typer.echo(f"资格有效期至：{membership['valid_until']}")
+    if status != "active":
+        typer.echo("下一步：联系管理员；或使用 udc-resource join 提交加入申请。")
+        return
+    keys = data.get("keys", [])
+    if keys:
+        typer.echo("公钥：")
+        for key in keys:
+            state = "有效" if key.get("status") == "active" else "已撤销"
+            typer.echo(f"  [{state}] {key['fingerprint']}")
+    else:
+        typer.echo("公钥：无（请联系管理员安装登录公钥）")
+
+
+@app.command("start")
+def start_command(
+    ctx: typer.Context,
+    gpu_count: int = typer.Option(
+        1,
+        "--gpu-count",
+        min=0,
+        help="申请 GPU 张数（服务端自动选卡）。",
+    ),
+    preset: str = typer.Option("", "--preset", help="使用服务端配置的预设名称。"),
+    hours: int | None = typer.Option(None, "--hours", min=1, help="时长（小时）。"),
+    open_with: str = typer.Option("", "--open", help="创建成功后打开方式：vscode / terminal。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """快捷创建工作环境：按张数申请 GPU，服务端自动选卡。"""
+    config = _load(ctx)
+    gpus_option = ""
+    cpus: float | None = None
+    memory: int | None = None
+    resolved_hours = hours
+    if preset:
+        preset_table = {entry[0]: entry[1:] for entry in config.onboarding.presets}
+        if preset not in preset_table:
+            available = ", ".join(preset_table) or "（未配置）"
+            _fail("bad_request", f"未知预设 {preset}；可用预设：{available}", json_output)
+        preset_gpus, preset_cpus, preset_memory, preset_hours = preset_table[preset]
+        gpus_option = str(preset_gpus) if preset_gpus else ""
+        cpus = preset_cpus
+        memory = preset_memory
+        resolved_hours = hours if hours is not None else preset_hours
+    resolved_hours = resolved_hours if resolved_hours is not None else config.policy.default_hours
+
+    # Same broker path as `apply` — presets only fill defaults; the broker's
+    # own validation and budget checks always decide.
+    request_args: dict[str, Any] = {
+        "cpus": cpus if cpus is not None else 8.0,
+        "memory_gb": memory if memory is not None else 32,
+        "hours": resolved_hours,
+        "queue": True,
+        "idempotency_key": uuid.uuid4().hex,
+    }
+    if gpu_count:
+        request_args["gpu_count"] = gpu_count
+    if gpus_option:
+        request_args["gpus"] = _parse_gpu_indices(gpus_option)
+    data = _request(_make_client(config), "apply", json_output, **request_args)
+    if json_output:
+        return
+    if "queue_id" in data:
+        _print_queue(data)
+        return
+    _print_allocation(data)
+    allocation_id = str(data.get("id", ""))
+    if open_with == "vscode":
+        typer.echo("在 VS Code 中打开：udc-resource vscode " + allocation_id)
+        typer.echo("或在你自己的电脑运行 udc-resource gui。")
+    elif open_with == "terminal":
+        typer.echo("进入终端：udc-resource connect " + allocation_id)
 
 
 @app.command("menu")

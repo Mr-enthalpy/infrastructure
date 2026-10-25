@@ -36,6 +36,10 @@ def active_config(monitor_config: LabConfig, tmp_path: Path) -> LabConfig:
             workspace_quota_required=True,
             legacy_audit_required=True,
             gpu_audit_required=True,
+            # Membership gating is exercised by the dedicated membership
+            # tests (tests/test_membership.py); lifecycle tests provision no
+            # member records, so the gate stays off here like the audits.
+            membership_required=False,
             container_profile="restricted",
             container_read_only=True,
             container_sudo=False,

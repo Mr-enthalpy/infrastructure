@@ -1,6 +1,7 @@
 import pytest
 
 from udc_resource import login_wrapper
+from udc_resource import login_wrapper as wrapper
 from udc_resource.login_wrapper import parse_command
 
 
@@ -99,3 +100,69 @@ def test_cli_path_raises_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(login_wrapper.shutil, "which", lambda name: None)
     with pytest.raises(FileNotFoundError):
         login_wrapper.cli_path()
+
+
+def test_classifies_host_commands():
+    assert wrapper.classify("bash")[0] == "shell"
+    assert wrapper.classify("docker ps")[0] == "docker"
+    assert wrapper.classify("nvidia-smi")[0] == "gpu_tool"
+    assert wrapper.classify("scp file somewhere")[0] == "file_transfer"
+    assert wrapper.classify("code .")[0] == "vscode"
+    assert wrapper.classify("rm -rf /")[0] == "other"
+    assert wrapper.classify("udc-resource list --json")[0] == "udc"
+    assert wrapper.classify("udc-resource bash")[0] == "unknown_subcommand"
+    assert wrapper.classify("")[0] == "menu"
+
+
+def test_denial_names_only_the_program():
+    text = wrapper.render_denial(
+        "shell",
+        "bash",
+        {
+            "guide_url": "https://lab.example.invalid/compute",
+            "apply_url": "",
+            "support_label": "管理员",
+            "support_contact": "admin@lab",
+            "legacy": True,
+        },
+    )
+    assert "bash" in text
+    assert "使用指南：https://lab.example.invalid/compute" in text
+    assert "管理员：admin@lab" in text
+    # Never echoes arguments (could carry secrets).
+    assert "somewhere" not in wrapper.render_denial(
+        "other",
+        "scp",
+        {
+            "guide_url": "",
+            "apply_url": "",
+            "support_label": "x",
+            "support_contact": "",
+            "legacy": True,
+        },
+    )
+
+
+def test_denial_without_urls_is_honest():
+    text = wrapper.render_denial(
+        "docker",
+        "docker",
+        {
+            "guide_url": "",
+            "apply_url": "",
+            "support_label": "计算资源管理员",
+            "support_contact": "",
+            "legacy": True,
+        },
+    )
+    assert "请向计算资源管理员索取" in text
+
+
+def test_safe_command_head_strips_control_characters():
+    assert wrapper._safe_command_head("bash\x1b[31m; rm") == "bash"
+    assert wrapper._safe_command_head("nvidia-smi --query=secret") == "nvidia-smi"
+
+
+def test_noninteractive_usage_is_short():
+    assert "机器协议" in wrapper.NON_INTERACTIVE_USAGE
+    assert "菜单" in wrapper.NON_INTERACTIVE_USAGE

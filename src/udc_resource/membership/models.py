@@ -95,12 +95,7 @@ def parse_public_key(raw: str) -> tuple[str, str]:
     if len(text) > 4000:
         raise ValueError("公钥过长，请确认提交的是 .pub 公钥文件内容")
     if "PRIVATE KEY" in text or any(marker in text for marker in PRIVATE_KEY_MARKERS):
-        raise ValueError(
-            "检测到疑似私钥。私钥绝不能提交：请重新生成密钥对并撤销可能泄露的凭据"
-        )
-    first_token = text.split()[0] if text.split() else ""
-    if "=" in first_token:
-        raise ValueError("公钥不能包含 authorized_keys 选项")
+        raise ValueError("检测到疑似私钥。私钥绝不能提交：请重新生成密钥对并撤销可能泄露的凭据")
     parts = text.split()
     if len(parts) < 2:
         raise ValueError("公钥格式不正确")
@@ -109,6 +104,11 @@ def parse_public_key(raw: str) -> tuple[str, str]:
         raise ValueError("不支持的公钥类型（仅支持普通 SSH 公钥，不含证书/选项）")
     if not re.fullmatch(r"[A-Za-z0-9+/=]+", material):
         raise ValueError("公钥内容格式不正确")
+    # authorized_keys options (command=, environment=, from=...) must never
+    # be installed as authorization material (§8.3).
+    for option in parts[2:]:
+        if "=" in option or option.startswith('"'):
+            raise ValueError("公钥不能包含 authorized_keys 选项")
     comment = " ".join(parts[2:])[:128]
     normalized = f"{key_type} {material}" + (f" {comment}" if comment else "")
     return normalized, key_fingerprint(normalized)

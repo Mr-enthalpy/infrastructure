@@ -41,6 +41,8 @@ from ..identity import (
 )
 from ..legacy_audit import LegacyAuditResult, LegacyAuditRunner
 from ..members import load_members, public_member_data
+from ..membership import authorization as member_authz
+from ..membership import store as member_store
 from ..models import GPU, Allocation
 from ..stream import (
     FRAME_DATA,
@@ -222,6 +224,22 @@ class Broker:
             "writable_layer_gb": self.config.policy.writable_layer_gb,
             "docker_storage_budget_gb": self.config.policy.docker_storage_budget_gb,
         }
+
+    def _membership_denial(
+        self,
+        connection: Any,
+        identity: Any,
+        command: str,
+    ) -> dict[str, Any] | None:
+        """Unified member authorization for one command (§6.2)."""
+        return member_authz.check_for_command(
+            connection,
+            command=command,
+            is_admin=identity.is_admin,
+            uid=identity.uid,
+            membership_required=self.config.policy.membership_required,
+            now=self._now(),
+        )
 
     def _writable_layer_reservation_bytes(self, *, include_next_slot: bool) -> int:
         """Worst-case writable-layer growth promised to live allocations.
@@ -771,6 +789,11 @@ class Broker:
             if command not in {"file_put", "file_get"}:
                 raise BadRequest("expected file transfer command")
             self._check_args(args, {"id", "path"})
+            if self.config.policy.membership_required and not identity.is_admin:
+                with self._connection() as connection:
+                    denial = self._membership_denial(connection, identity, command)
+                if denial is not None:
+                    raise Forbidden(denial["message"])
             if not self.config.policy.file_transfer_enabled:
                 raise Forbidden("file transfer is disabled by policy")
             allocation_id = args.get("id")
@@ -977,6 +1000,11 @@ class Broker:
             if command != "shell":
                 raise BadRequest("expected shell command")
             self._check_args(args, {"id", "cols", "rows", "job"})
+            if self.config.policy.membership_required and not identity.is_admin:
+                with self._connection() as connection:
+                    denial = self._membership_denial(connection, identity, "shell")
+                if denial is not None:
+                    raise Forbidden(denial["message"])
             allocation_id = args.get("id")
             if not isinstance(allocation_id, str) or not allocation_id:
                 raise BadRequest("id must be a non-empty string")
@@ -1199,6 +1227,11 @@ class Broker:
                     identity = self.identity_resolver.resolve(uid, gid)
                 except (KeyError, RuntimeError) as exc:
                     raise Forbidden(f"peer identity failed: {exc}") from exc
+                if self.config.policy.membership_required and not identity.is_admin:
+                    with self._connection() as connection:
+                        denial = self._membership_denial(connection, identity, "tunnel")
+                    if denial is not None:
+                        raise Forbidden(denial["message"])
                 with self._connection() as connection:
                     store.ensure_user(
                         connection,
@@ -1381,6 +1414,43 @@ class Broker:
                         "mode": self._mode,
                     }
                 )
+            if command == "me":
+                self._check_args(args)
+                with self._connection() as connection:
+                    decision = member_store.check_access(connection, identity.uid, now=self._now())
+                    keys = (
+                        member_store.list_keys(connection, str(decision["member_id"]))
+                        if decision["member_id"]
+                        else []
+                    )
+                return _ok(
+                    {
+                        "uid": identity.uid,
+                        "username": identity.username,
+                        "admin": identity.is_admin,
+                        "membership": {
+                            "status": ("admin" if identity.is_admin else decision["status"]),
+                            "reason": decision["reason"],
+                            "valid_until": decision["valid_until"],
+                            "access_version": decision["access_version"],
+                        },
+                        "keys": [
+                            {
+                                "key_id": key["key_id"],
+                                "fingerprint": key["fingerprint"],
+                                "status": key["status"],
+                            }
+                            for key in keys
+                        ],
+                    }
+                )
+            if self._mode == "active":
+                # In monitor/maintenance modes everything is denied by the
+                # mode itself; report that first (honest, no info leaks).
+                with self._connection() as connection:
+                    denial = self._membership_denial(connection, identity, command)
+                if denial is not None:
+                    return _error(denial["code"], denial["message"])
             if command == "list":
                 self._check_args(args)
                 return _ok(await asyncio.to_thread(self._list))
@@ -1390,7 +1460,17 @@ class Broker:
             if command == "apply":
                 self._check_args(
                     args,
-                    {"gpus", "cpus", "memory_gb", "hours", "image", "note", "queue"},
+                    {
+                        "gpus",
+                        "gpu_count",
+                        "cpus",
+                        "memory_gb",
+                        "hours",
+                        "image",
+                        "note",
+                        "queue",
+                        "idempotency_key",
+                    },
                 )
                 return _ok(await self._apply(identity, args))
             if command == "queue_list":
@@ -1761,6 +1841,12 @@ class Broker:
         if gate_failure:
             raise Conflict(f"new allocations blocked by host safety gate: {gate_failure}")
         gpus = self._parse_gpus(args.get("gpus", []))
+        gpu_count = args.get("gpu_count")
+        if gpu_count is not None:
+            if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 0:
+                raise BadRequest("gpu_count must be a non-negative integer")
+            if gpus:
+                raise BadRequest("gpus 与 gpu_count 只能二选一")
         cpus = self._parse_positive_float(args.get("cpus"), "cpus")
         memory_gb = self._parse_positive_int(args.get("memory_gb"), "memory_gb")
         hours = self._parse_positive_int(
@@ -1792,6 +1878,15 @@ class Broker:
         workspace = self._workspace(identity.username)
         starts_at = self._now()
         expires_at = starts_at + timedelta(hours=hours)
+        idempotency_key = args.get("idempotency_key", "")
+        if not isinstance(idempotency_key, str) or len(idempotency_key) > 128:
+            raise BadRequest("idempotency_key must be a string of at most 128 characters")
+        with self._connection() as connection:
+            membership_valid_until = (
+                member_store.member_valid_until(connection, identity.uid)
+                if self.config.policy.membership_required and not identity.is_admin
+                else ""
+            )
         busy_reason: str | None = None
         if gpus:
             now = self._now()
@@ -1813,6 +1908,26 @@ class Broker:
                     busy_reason = f"GPU {index} is unmanaged: {gpu['state_reason']}"
                 elif state not in {"free", "allocated"}:
                     busy_reason = f"GPU {index} is {state}: {gpu['state_reason']}"
+            gpu_uuids = [str(row["uuid"]) for row in gpu_rows]
+        elif gpu_count:
+            # Server-side auto-selection (§3.2): the broker picks free GPUs
+            # during admission, never the client from a stale snapshot.
+            now = self._now()
+            with self._connection() as connection:
+                db_gpus = store.list_gpus(connection, now=now)
+                active_allocations = self._allocation_map(connection, now)
+            live = await asyncio.to_thread(self._live_resources)
+            if live.error:
+                raise DockerError(f"cannot determine GPU state for selection: {live.error}")
+            merged = self._merge_gpus(db_gpus, live, active_allocations)
+            free_indices = sorted(int(gpu["index"]) for gpu in merged if gpu["state"] == "free")
+            if len(free_indices) < gpu_count:
+                busy_reason = (
+                    f"当前空闲 GPU 数量不足：需要 {gpu_count} 张，当前空闲 {len(free_indices)} 张"
+                )
+            gpus = free_indices[:gpu_count]
+            with self._connection() as connection:
+                gpu_rows = store.gpus_for_indices(connection, gpus) if gpus else []
             gpu_uuids = [str(row["uuid"]) for row in gpu_rows]
         else:
             gpu_uuids = []
@@ -1892,9 +2007,12 @@ class Broker:
                     max_active_allocations_per_user=(
                         self.config.policy.max_active_allocations_per_user
                     ),
+                    idempotency_key=idempotency_key,
+                    membership_valid_until=membership_valid_until,
                     now=self._now(),
                     **self._container_storage_params(),
                 )
+                existing = store.get_allocation(connection, allocation_id, now=self._now())
         except (GpuBusy, InsufficientResources) as exc:
             if not (self.config.policy.queue_enabled and queue_requested):
                 raise
@@ -1909,6 +2027,10 @@ class Broker:
                 note=note,
                 reason=str(exc),
             )
+        # Idempotent replay (§3.3): a retried apply returns the original
+        # allocation without re-materializing anything.
+        if existing["status"] != "pending":
+            return existing
         return await self._materialize_allocation(allocation_id)
 
     async def _enqueue_allocation(
@@ -2177,6 +2299,7 @@ class Broker:
                     available_gpu_uuids=available_gpu_uuids,
                     backfill_enabled=self.config.policy.queue_backfill_enabled,
                     backfill_reserve_minutes=self.config.policy.queue_backfill_reserve_minutes,
+                    membership_required=self.config.policy.membership_required,
                     now=now,
                     **self._container_storage_params(),
                 )
