@@ -55,6 +55,11 @@ container_home_tmpfs_gb = 0
 # (protects the OS and Docker metadata from many quota-bounded containers
 # filling the disk together).
 min_free_docker_gb = 20
+# Global writable-layer budget: every development allocation reserves its
+# writable_layer_gb here (pending or active), so several quota-bounded
+# containers cannot together oversubscribe the disk. Set this below the disk
+# space that images, non-UDC containers, and the OS reserve.
+docker_storage_budget_gb = 500
 userns_mode = ""
 legacy_audit_required = true
 legacy_audit_script = "/usr/local/libexec/udc-resource/audit_legacy.sh"
@@ -68,6 +73,12 @@ queue_enabled = true
 max_queue_length = 100
 max_queued_allocations_per_user = 4
 max_queue_hours = 24
+# Backfill: a queued request whose GPUs are all free may run past a blocked
+# head, but it never gets a GPU an earlier request is waiting on. Once a
+# blocked request has waited this many minutes, backfilling stops so it is
+# served first (0 = strict FIFO, no backfill).
+queue_backfill_enabled = true
+queue_backfill_reserve_minutes = 30
 # Enable only after the target-host container-sshd and tunnel acceptance tests pass.
 vscode_enabled = false
 vscode_max_tunnels = 8

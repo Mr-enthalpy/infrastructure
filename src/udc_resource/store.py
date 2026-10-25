@@ -241,6 +241,8 @@ def _check_capacity(
     max_gpus_per_user: int,
     max_active_allocations_per_user: int,
     available_gpu_uuids: set[str] | None = None,
+    writable_layer_gb: int = 0,
+    docker_storage_budget_gb: int = 0,
 ) -> None:
     if len(set(gpu_uuids)) != len(gpu_uuids):
         raise GpuBusy("duplicate GPUs in request")
@@ -257,6 +259,24 @@ def _check_capacity(
         if busy:
             names = ", ".join(str(row["gpu_uuid"]) for row in busy)
             raise GpuBusy(f"GPU already allocated: {names}")
+    # Global writable-layer budget: every development allocation may grow up to
+    # writable_layer_gb, so several quota-bounded containers can together
+    # oversubscribe the disk even when each check passes. Reserve the full
+    # quota per active/pending allocation (conservative first version).
+    if writable_layer_gb > 0 and docker_storage_budget_gb > 0:
+        containers = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM allocations WHERE status IN ('pending', 'active')"
+            ).fetchone()[0]
+        )
+        slots = docker_storage_budget_gb // writable_layer_gb
+        if containers + 1 > slots:
+            raise InsufficientResources(
+                f"Docker writable-layer budget exhausted: {containers} containers "
+                f"reserve {containers * writable_layer_gb} GiB of the "
+                f"{docker_storage_budget_gb} GiB budget "
+                f"({writable_layer_gb} GiB each)"
+            )
     used = connection.execute(
         """
         SELECT COALESCE(SUM(cpus), 0) AS cpus,
@@ -388,6 +408,8 @@ def create_allocation(
     max_memory_gb_per_user: int | None = None,
     max_gpus_per_user: int = 4,
     max_active_allocations_per_user: int = 4,
+    writable_layer_gb: int = 0,
+    docker_storage_budget_gb: int = 0,
     now: datetime | None = None,
 ) -> str:
     allocation_id = uuid.uuid4().hex
@@ -412,6 +434,8 @@ def create_allocation(
             ),
             max_gpus_per_user=max_gpus_per_user,
             max_active_allocations_per_user=max_active_allocations_per_user,
+            writable_layer_gb=writable_layer_gb,
+            docker_storage_budget_gb=docker_storage_budget_gb,
         )
         _insert_allocation(
             connection,
@@ -726,8 +750,22 @@ def admit_next_queued(
     max_gpus_per_user: int,
     max_active_allocations_per_user: int,
     available_gpu_uuids: set[str] | None = None,
+    writable_layer_gb: int = 0,
+    docker_storage_budget_gb: int = 0,
+    backfill_enabled: bool = True,
+    backfill_reserve_minutes: int = 30,
     now: datetime | None = None,
 ) -> str | None:
+    """Admit the first runnable queued request in FIFO order.
+
+    Strict head-of-line blocking would idle GPUs that no earlier request is
+    waiting for, so with ``backfill_enabled`` a later request may run past a
+    blocked one when it does not compete for any GPU that request is waiting
+    on. The blocked request's own GPUs are never handed out, and once a
+    request has waited longer than ``backfill_reserve_minutes`` backfilling
+    stops entirely so it gets first claim when resources free up.
+    """
+
     current = now or utcnow()
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -739,6 +777,8 @@ def admit_next_queued(
             "ORDER BY priority DESC, created_at ASC, rowid",
             (current.isoformat(),),
         ).fetchall()
+        blocked_gpu_uuids: set[str] = set()
+        oldest_blocked: datetime | None = None
         for row in rows:
             queue_id = str(row["id"])
             try:
@@ -771,10 +811,30 @@ def admit_next_queued(
                     connection,
                     actor_uid=None,
                     action="queue_failed",
-                    detail={"queue_id": queue_id, "reason": "requested GPU no longer exists"},
+                    detail={
+                        "queue_id": queue_id,
+                        "reason": "requested GPU no longer exists",
+                    },
                     now=current,
                 )
                 continue
+            if blocked_gpu_uuids:
+                if not backfill_enabled:
+                    # Strict FIFO: the first unrunnable request blocks the rest.
+                    break
+                if oldest_blocked is not None:
+                    try:
+                        waited = current - oldest_blocked
+                    except (TypeError, ValueError):
+                        break
+                    if waited >= timedelta(minutes=backfill_reserve_minutes):
+                        # Starvation guard: backfilling must not delay a long
+                        # waiting request indefinitely. reserve_minutes=0
+                        # therefore disables backfill (strict FIFO).
+                        break
+                if blocked_gpu_uuids & set(gpu_uuids):
+                    # Contended resource: keep FIFO order for it.
+                    continue
             try:
                 _check_capacity(
                     connection,
@@ -789,12 +849,18 @@ def admit_next_queued(
                     max_gpus_per_user=max_gpus_per_user,
                     max_active_allocations_per_user=max_active_allocations_per_user,
                     available_gpu_uuids=available_gpu_uuids,
+                    writable_layer_gb=writable_layer_gb,
+                    docker_storage_budget_gb=docker_storage_budget_gb,
                 )
             except (GpuBusy, InsufficientResources):
-                # Strict queue order: a request that cannot run yet blocks
-                # later requests instead of letting them jump ahead.
-                connection.commit()
-                return None
+                blocked_gpu_uuids.update(gpu_uuids)
+                try:
+                    created = datetime.fromisoformat(str(row["created_at"]))
+                except (TypeError, ValueError):
+                    created = current
+                if oldest_blocked is None or created < oldest_blocked:
+                    oldest_blocked = created
+                continue
             allocation_id = uuid.uuid4().hex
             starts_at = current
             expires_at = current + timedelta(hours=int(row["hours"]))

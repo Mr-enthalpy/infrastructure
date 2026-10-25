@@ -204,6 +204,21 @@ class Broker:
         self._quota_failure = None
         return None
 
+    def _container_storage_params(self) -> dict[str, int]:
+        """Global writable-layer accounting parameters for capacity checks.
+
+        Only the development profile has a per-container writable-layer quota,
+        so the budget applies there; in the restricted profile every value is
+        zero and the check is skipped.
+        """
+
+        if self.config.policy.container_profile != "development":
+            return {"writable_layer_gb": 0, "docker_storage_budget_gb": 0}
+        return {
+            "writable_layer_gb": self.config.policy.writable_layer_gb,
+            "docker_storage_budget_gb": self.config.policy.docker_storage_budget_gb,
+        }
+
     def _run_storage_check(self) -> str | None:
         try:
             passed, detail = self.docker.storage_preflight()
@@ -1330,6 +1345,9 @@ class Broker:
             if command == "job_list":
                 self._check_args(args, {"id"})
                 return _ok(await self._job_list(identity, args))
+            if command == "job_files":
+                self._check_args(args, {"id"})
+                return _ok(await self._job_files(identity, args))
             if command == "job_logs":
                 self._check_args(args, {"id", "name", "tail"})
                 return _ok(await self._job_logs(identity, args))
@@ -1800,6 +1818,7 @@ class Broker:
                         self.config.policy.max_active_allocations_per_user
                     ),
                     now=self._now(),
+                    **self._container_storage_params(),
                 )
         except (GpuBusy, InsufficientResources) as exc:
             if not (self.config.policy.queue_enabled and queue_requested):
@@ -2040,7 +2059,10 @@ class Broker:
                         self.config.policy.max_active_allocations_per_user
                     ),
                     available_gpu_uuids=available_gpu_uuids,
+                    backfill_enabled=self.config.policy.queue_backfill_enabled,
+                    backfill_reserve_minutes=self.config.policy.queue_backfill_reserve_minutes,
                     now=now,
+                    **self._container_storage_params(),
                 )
             if allocation_id is None:
                 break
@@ -2161,23 +2183,41 @@ class Broker:
         allocation = self._job_allocation(identity, args)
         name = self._job_name(args.get("name"))
         command = args.get("command")
-        if (
-            not isinstance(command, list)
-            or not command
-            or any(not isinstance(item, str) for item in command)
+        if isinstance(command, str):
+            # Copy-pasteable shell command. It runs inside the member's own
+            # container as `bash -lc` with a fixed argv; the broker never
+            # interprets it and it grants nothing the member does not already
+            # have through `shell`.
+            shell_text = command.strip()
+            if not shell_text:
+                raise BadRequest("shell command must not be empty")
+            if "\x00" in shell_text:
+                raise BadRequest("shell command must not contain NUL bytes")
+            if len(shell_text) > 4096:
+                raise BadRequest("shell command must not exceed 4096 characters")
+            command_argv = ["bash", "-lc", shell_text]
+        elif (
+            isinstance(command, list)
+            and command
+            and len(command) <= 64
+            and all(isinstance(item, str) and item and len(item) <= 512 for item in command)
         ):
-            raise BadRequest("command must be a non-empty list of strings")
+            command_argv = command
+        else:
+            raise BadRequest(
+                "command must be a non-empty shell string or a list of argument strings"
+            )
         container_id = str(allocation["container_id"])
         log_path = self._job_log_path(allocation, name)
         await asyncio.to_thread(self._ensure_job_log, allocation, name)
-        await asyncio.to_thread(self.docker.start_job, container_id, name, command)
+        await asyncio.to_thread(self.docker.start_job, container_id, name, command_argv)
         with self._connection() as connection:
             store.record_event(
                 connection,
                 actor_uid=identity.uid,
                 action="job_started",
                 allocation_id=str(allocation["id"]),
-                detail={"name": name, "command": command},
+                detail={"name": name, "command": command_argv},
                 now=self._now(),
             )
             connection.commit()
@@ -2209,8 +2249,33 @@ class Broker:
             enriched.append(item)
         return {"id": allocation["id"], "jobs": enriched}
 
+    def _log_allocation(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        """Fetch an allocation for log access: owner or admin, any status.
+
+        Persistent job logs outlive the container (the workspace survives
+        release and expiry), so unlike container operations this may target
+        released or expired allocations.
+        """
+
+        allocation_id = args.get("id")
+        if not isinstance(allocation_id, str) or not allocation_id:
+            raise BadRequest("id must be a non-empty string")
+        with self._connection() as connection:
+            allocation = store.get_allocation(connection, allocation_id, now=self._now())
+        if allocation["owner_uid"] != identity.uid and not identity.is_admin:
+            raise Forbidden("only the owner or an admin may read these logs")
+        return allocation
+
+    async def _job_files(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation = self._log_allocation(identity, args)
+        files = await asyncio.to_thread(
+            workspace_io.list_workspace_logs,
+            str(allocation["workspace"]),
+        )
+        return {"id": allocation["id"], "files": files}
+
     async def _job_logs(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
-        allocation = self._job_allocation(identity, args)
+        allocation = self._log_allocation(identity, args)
         name = self._job_name(args.get("name"))
         tail = self._parse_positive_int(args.get("tail", 200), "tail")
         if tail > 10000:

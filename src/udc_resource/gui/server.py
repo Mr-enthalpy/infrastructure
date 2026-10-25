@@ -71,7 +71,14 @@ class SSHRunner:
         known_hosts = self.config.server.known_hosts.strip()
         if known_hosts:
             argv.extend(["-o", f"UserKnownHostsFile={os.path.expanduser(known_hosts)}"])
-        remote_command = shlex.join(["udc-resource", *args, "--json"])
+        argv_items = [*args]
+        if "--" in argv_items:
+            # The `--` separator ends udc-resource option parsing; --json must
+            # be consumed by the CLI itself, not appended to the job command.
+            argv_items.insert(argv_items.index("--"), "--json")
+        else:
+            argv_items.append("--json")
+        remote_command = shlex.join(["udc-resource", *argv_items])
         argv.extend([alias, remote_command])
         return argv
 
@@ -180,6 +187,7 @@ def create_app(
     app.router.add_post("/api/jobs/{allocation_id}/start", _api_job_start)
     app.router.add_post("/api/jobs/{allocation_id}/stop", _api_job_stop)
     app.router.add_get("/api/job-logs/{allocation_id}", _api_job_logs)
+    app.router.add_get("/api/job-history/{allocation_id}", _api_job_history)
     app.router.add_post("/api/vscode/{allocation_id}", _api_vscode)
     app.router.add_get("/api/admin/users", _api_admin_users)
     app.router.add_get("/api/admin/resources", _api_admin_resources)
@@ -334,16 +342,21 @@ async def _api_job_start(request: web.Request) -> web.Response:
     if not isinstance(name, str) or not JOB_RE.fullmatch(name):
         return _json(_error("bad_request", "invalid job name"), 400)
     command = body.get("command")
-    if (
-        not isinstance(command, list)
-        or not command
-        or len(command) > 64
-        or any(not isinstance(item, str) or not item or len(item) > 512 for item in command)
-    ):
-        return _json(_error("bad_request", "command must be a non-empty list of strings"), 400)
+    # A copy-pasteable shell string. It runs inside the member's own container
+    # as `bash -lc` with a fixed argv; the GUI never splits it on whitespace
+    # and it grants nothing beyond the member's existing shell access.
+    if not isinstance(command, str) or not command.strip() or len(command) > 4096:
+        return _json(_error("bad_request", "command must be a non-empty string"), 400)
     return await _remote(
         request,
-        ["job", "start", allocation_id, "--name", name, "--", *command],
+        [
+            "job",
+            "start",
+            allocation_id,
+            "--name",
+            name,
+            f"--shell={command}",
+        ],
     )
 
 
@@ -363,6 +376,13 @@ async def _api_job_logs(request: web.Request) -> web.Response:
         request,
         ["job", "logs", allocation_id, "--name", name, "--tail", str(tail)],
     )
+
+
+async def _api_job_history(request: web.Request) -> web.Response:
+    allocation_id = request.match_info["allocation_id"]
+    if not ALLOCATION_RE.fullmatch(allocation_id):
+        return _json(_error("bad_request", "invalid allocation id"), 400)
+    return await _remote(request, ["job", "files", allocation_id])
 
 
 async def _api_job_stop(request: web.Request) -> web.Response:
@@ -467,7 +487,10 @@ async def _api_vscode(request: web.Request) -> web.Response:
             message = str(stage.get("message") or "VS Code tunnel failed")
             await _stop_vscode_process(process)
             return _json(_error("internal", message), 500)
-        if stage_name in {"listening", "ready"}:
+        if stage_name in {"tunnel_verified", "ready"}:
+            # "listening" only means the local port is bound; success waits
+            # for the CLI's SSH probe to prove the full chain (host SSH,
+            # broker tunnel, container sshd, member key auth).
             processes.append(process)
             data: dict[str, Any] = {
                 "pid": process.pid,

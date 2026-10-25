@@ -60,6 +60,10 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 - 队列：
   - 顺序为 `priority DESC, created_at ASC, rowid`（插入序），且队列空检查位于
     `create_allocation` 的数据库事务内。
+  - 受约束 backfill：被阻塞请求封锁其申请的 GPU，后续请求只能在 GPU 完全不
+    相交时越过；等待超过 `queue_backfill_reserve_minutes` 后停止 backfill。
+  - Docker 全局可写层预算：`docker_storage_budget_gb` 按每个 pending/active
+    allocation 的 `writable_layer_gb` 预留，防止多个配额容器共同写满磁盘。
   - 严格队首阻塞；后续请求不得越过未过期队首。
   - `--no-queue` 表示不等待、不保留请求，但不得越过队列。
   - `queue_enabled = false` 仅阻止新排队请求，不允许直接申请绕过已有队列。
@@ -82,7 +86,12 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
     `container_home_tmpfs_gb > 0` 时改为等容量 tmpfs。
   - GUI VS Code 按钮通过 `--readiness-file` JSON 协议等待真实就绪
     （listening/ready/error），并显式传递配置路径；不再假成功。
-  - GUI 提供 job 启动与 `/workspace/.udc-logs/` 持久日志查看。
+  - GUI 提供 job 启动（整条 shell 命令原样传递，容器内以 `bash -lc` 执行）与
+    `/workspace/.udc-logs/` 持久日志查看；release 后仍可列出/读取历史日志
+    （`job files`、`job_logs` 不要求 active）。
+  - CLI 支持 `--remote <ssh-alias>` 把常规命令中继到服务器执行（本地交互命令
+    除外）；VS Code 隧道就绪前执行真实 SSH 探测（容器内 `/bin/true`），身份
+    优先继承 `ssh -G <alias>` 解析的 IdentityFile。
   - 容器 sshd 使用 inetd 模式，由 Broker 通过 Docker exec 隧道启动。
   - Host SSH 保持 key-only、`ForceCommand` 限制和转发禁用。
   - 容器 sshd 仅允许 local TCP forwarding，用于 Remote-SSH；remote、Unix-socket、
@@ -147,8 +156,11 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 - 成员配额闭环的解析在真实 XFS/ext4 上的行为：`lsattr -p` 的 project ID、
   继承探针文件、`xfs_quota report` 的块单位（代码按 512B/1K/4K/1M 容错）、
   `repquota -P` 的输出格式。
-- GUI VS Code readiness 文件协议、job 启动/日志端点，以及 Docker 容量闸门
-  （`min_free_docker_gb`）在真实主机上的阈值行为。
+- GUI VS Code readiness 文件协议（含 `tunnel_verified` 阶段的容器内 SSH 探测）、
+  job 启动/日志端点，以及 Docker 容量闸门（`min_free_docker_gb`、
+  `docker_storage_budget_gb`）在真实主机上的阈值行为。
+- 队列 backfill 与饥饿保护在真实多用户并发下的行为（逻辑已在 DB 层测试，但
+  实机 clock/GPU 状态变化更复杂）。
 
 ## 6. 下一会话执行顺序
 

@@ -60,6 +60,7 @@ class FakeDocker:
         self.shell_output = b"fake shell output\n"
         self.shells: list[FakeShellSession] = []
         self.jobs: dict[str, dict[str, dict[str, str]]] = {}
+        self.started_job_commands: list[tuple[str, str, list[str]]] = []
         self.fail_create = fail_create
         self.fail_remove = fail_remove
         self.storage_ok = True
@@ -176,6 +177,7 @@ class FakeDocker:
         if name in container_jobs:
             raise RuntimeError(f"job already exists: {name}")
         container_jobs[name] = {"created": "1", "attached": "0"}
+        self.started_job_commands.append((container_id, name, list(command)))
 
     def list_jobs(self, container_id: str) -> list[dict[str, str]]:
         return [

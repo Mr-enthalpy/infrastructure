@@ -443,6 +443,81 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         pass
 
 
+def _alias_identity(alias: str) -> Path | None:
+    """The identity file the member's own SSH config resolves for `alias`.
+
+    `ssh -G` prints the effective configuration without connecting. Using it
+    keeps the VS Code block on the same key the member actually uses for the
+    lab server instead of guessing a default key that may not be authorized.
+    """
+
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        return None
+    try:
+        result = subprocess.run(
+            [ssh, "-G", alias],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].strip().lower() == "identityfile":
+            candidate = Path(parts[1].strip()).expanduser()
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+async def _probe_container_ssh(host: str, ssh_config: Path, timeout: int) -> None:
+    """Prove the whole VS Code chain end to end before reporting success.
+
+    The probe connects through the managed SSH block: local listener -> host
+    SSH -> broker tunnel -> container sshd -> member key auth -> command
+    execution. A local bind alone proves none of that.
+    """
+
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        raise RuntimeError("ssh executable is not available")
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                subprocess.run,
+                [
+                    ssh,
+                    "-F",
+                    str(ssh_config),
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    f"ConnectTimeout={max(5, timeout)}",
+                    host,
+                    "/bin/true",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            ),
+            timeout=timeout + 15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("container SSH probe timed out") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        raise RuntimeError(f"container SSH probe failed (exit {result.returncode}): {detail}")
+
+
 async def _serve_vscode_tunnel(
     *,
     config: LabConfig,
@@ -572,6 +647,21 @@ async def _serve_vscode_tunnel(
     )
     typer.echo(f"local tunnel: 127.0.0.1:{port} -> {host} (allocation {allocation_id})")
     typer.echo(f"ssh config: {ssh_config}")
+    probe_timeout = max(30, config.gui.connect_timeout * 2)
+    try:
+        typer.echo("verifying container SSH connection…")
+        await _probe_container_ssh(host, ssh_config, probe_timeout)
+    except (RuntimeError, OSError, TimeoutError) as exc:
+        message = f"container SSH probe failed: {exc}"
+        _write_readiness(readiness_file, "error", code="probe_failed", message=message)
+        raise RuntimeError(str(exc)) from exc
+    _write_readiness(
+        readiness_file,
+        "tunnel_verified",
+        port=port,
+        uri=remote_uri,
+    )
+    typer.echo("container SSH verified")
     try:
         if launch_code:
             code = shutil.which("code")
@@ -624,8 +714,82 @@ def app_callback(
         envvar="UDC_RESOURCE_CONFIG",
         help="Path to the local TOML configuration.",
     ),
+    remote: str | None = typer.Option(
+        None,
+        "--remote",
+        help="Run the command on the given SSH alias instead of the local broker socket.",
+    ),
 ) -> None:
+    if remote is not None:
+        rest = _strip_local_options(sys.argv[1:], {"--config", "--remote"})
+        _dispatch_remote(remote, rest)
     ctx.obj = _config_path(config)
+
+
+def _strip_local_options(argv: list[str], names: set[str]) -> list[str]:
+    """Drop local-only options (with space or = values) before relaying."""
+
+    out: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token in names:
+            skip = True
+            continue
+        if any(token.startswith(f"{name}=") for name in names):
+            continue
+        out.append(token)
+    return out
+
+
+# Commands that stream over the local broker socket or drive local apps cannot
+# be relayed as plain remote CLI invocations.
+LOCAL_ONLY_COMMANDS = {"shell", "vscode", "gui", "tunnel", "file", "menu"}
+
+
+def _dispatch_remote(alias: str, rest: list[str]) -> NoReturn:
+    """Run `udc-resource <rest>` on the given SSH alias and relay the result.
+
+    This is the local-workstation path for everyday commands: the member's
+    ForceCommand only allows `udc-resource`, so relaying stays inside the same
+    whitelist as an interactive SSH session.
+    """
+
+    if not rest:
+        _fail("bad_request", "no command given for --remote", False)
+    if rest[0] == "job" and len(rest) > 1 and rest[1] == "attach":
+        _fail(
+            "bad_request",
+            "job attach needs the local broker socket; run it on the server",
+            False,
+        )
+    if rest[0] in LOCAL_ONLY_COMMANDS:
+        _fail(
+            "bad_request",
+            f"'{rest[0]}' is a local/interactive command and cannot run via --remote",
+            False,
+        )
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        _fail("ssh_unavailable", "ssh executable is not available", False)
+    argv = [
+        ssh,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "LogLevel=ERROR",
+        alias,
+        shlex.join(["udc-resource", *rest]),
+    ]
+    try:
+        completed = subprocess.run(argv, check=False)
+    except OSError as exc:
+        _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
+    raise SystemExit(completed.returncode)
 
 
 @app.command()
@@ -1165,12 +1329,25 @@ def job_start(
     ctx: typer.Context,
     allocation_id: str = typer.Argument(..., help="Allocation id."),
     name: str = typer.Option(..., "--name", help="Job name."),
+    shell: str | None = typer.Option(
+        None,
+        "--shell",
+        help="Run this shell command inside the container via `bash -lc`.",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Start a detached tmux job with a persistent workspace log."""
-    command = list(ctx.args)
-    if not command:
-        raise typer.BadParameter("provide a command after --")
+    command: str | list[str]
+    if shell is not None:
+        if ctx.args:
+            raise typer.BadParameter("use either --shell or a command after --, not both")
+        if not shell.strip():
+            raise typer.BadParameter("shell command must not be empty")
+        command = shell
+    else:
+        command = list(ctx.args)
+        if not command:
+            raise typer.BadParameter("provide a command after -- or use --shell")
     config = _load(ctx)
     data = _request(
         _make_client(config),
@@ -1185,6 +1362,25 @@ def job_start(
     typer.echo(f"job: {data['name']}")
     typer.echo(f"session: {data['session']}")
     typer.echo(f"log: {data['log']}")
+
+
+@job_app.command("files")
+def job_files(
+    ctx: typer.Context,
+    allocation_id: str = typer.Argument(..., help="Allocation id (any status)."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """List persistent job log files, including released allocations."""
+    config = _load(ctx)
+    data = _request(_make_client(config), "job_files", json_output, id=allocation_id)
+    if json_output:
+        return
+    files = data.get("files", [])
+    if not files:
+        typer.echo("no job log files")
+        return
+    for item in files:
+        typer.echo(f"{item['name']}  {item.get('bytes', 0)} bytes")
 
 
 @job_app.command("list")
@@ -1623,7 +1819,9 @@ def vscode_command(
     if identity_path is None and configured_identity:
         identity_path = Path(configured_identity).expanduser()
     if identity_path is None:
-        identity_path = _default_identity()
+        # Prefer the key the member's own SSH config resolves for this alias;
+        # default key names are only a last resort.
+        identity_path = _alias_identity(alias) or _default_identity()
     if identity_path is not None and not identity_path.is_file():
         fail("bad_request", f"SSH identity file not found: {identity_path}")
     config_path = (

@@ -64,6 +64,7 @@ class PolicyConfig:
     container_home: str = ""
     container_home_tmpfs_gb: int = 0
     min_free_docker_gb: int = 20
+    docker_storage_budget_gb: int = 0
     userns_mode: str = ""
     legacy_audit_required: bool = True
     legacy_audit_script: str = "/usr/local/libexec/udc-resource/audit_legacy.sh"
@@ -77,6 +78,8 @@ class PolicyConfig:
     max_queue_length: int = 100
     max_queued_allocations_per_user: int = 4
     max_queue_hours: int = 24
+    queue_backfill_enabled: bool = True
+    queue_backfill_reserve_minutes: int = 30
     vscode_enabled: bool = False
     vscode_max_tunnels: int = 8
     vscode_identity_file: str = ""
@@ -225,6 +228,7 @@ def load_config(path: str | Path) -> LabConfig:
         container_home=str(policy_raw.get("container_home", "")),
         container_home_tmpfs_gb=int(policy_raw.get("container_home_tmpfs_gb", 0)),
         min_free_docker_gb=int(policy_raw.get("min_free_docker_gb", 20)),
+        docker_storage_budget_gb=int(policy_raw.get("docker_storage_budget_gb", 0)),
         userns_mode=str(policy_raw.get("userns_mode", "")),
         legacy_audit_required=bool(policy_raw.get("legacy_audit_required", True)),
         legacy_audit_script=str(
@@ -248,6 +252,8 @@ def load_config(path: str | Path) -> LabConfig:
         max_queue_length=int(policy_raw.get("max_queue_length", 100)),
         max_queued_allocations_per_user=int(policy_raw.get("max_queued_allocations_per_user", 4)),
         max_queue_hours=int(policy_raw.get("max_queue_hours", 24)),
+        queue_backfill_enabled=bool(policy_raw.get("queue_backfill_enabled", True)),
+        queue_backfill_reserve_minutes=int(policy_raw.get("queue_backfill_reserve_minutes", 30)),
         vscode_enabled=bool(policy_raw.get("vscode_enabled", False)),
         vscode_max_tunnels=int(policy_raw.get("vscode_max_tunnels", 8)),
         vscode_identity_file=str(policy_raw.get("vscode_identity_file", "")),
@@ -314,6 +320,10 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("policy.container_home_tmpfs_gb must not exceed 64")
     if policy.min_free_docker_gb < 0:
         raise ValueError("policy.min_free_docker_gb must not be negative")
+    if policy.docker_storage_budget_gb < 0:
+        raise ValueError("policy.docker_storage_budget_gb must not be negative")
+    if policy.queue_backfill_reserve_minutes < 0:
+        raise ValueError("policy.queue_backfill_reserve_minutes must not be negative")
     if policy.container_home:
         if not policy.container_home.startswith("/"):
             raise ValueError("policy.container_home must be an absolute path")

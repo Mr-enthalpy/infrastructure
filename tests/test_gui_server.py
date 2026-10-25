@@ -67,6 +67,8 @@ class FakeRunner:
                 "session": "udc-train",
                 "log": "/workspace/.udc-logs/train.log",
             }
+        elif args[:2] == ["job", "files"]:
+            data = {"id": args[2], "files": [{"name": "train.log", "bytes": 42}]}
         elif args[:2] == ["job", "logs"]:
             data = {"id": args[2], "name": args[4], "logs": "epoch 1\n"}
         elif args[:2] == ["job", "stop"]:
@@ -361,41 +363,58 @@ async def test_job_start_and_persistent_log_endpoints(monitor_config):
         started = await client.post(
             "/api/jobs/alloc-1/start",
             headers=_headers(),
-            data=json.dumps({"name": "train", "command": ["python", "train.py", "-e", "10"]}),
+            data=json.dumps({"name": "train", "command": "python train.py --output 'one two'"}),
         )
         assert started.status == 200
         payload = await started.json()
         assert payload["ok"] is True
         assert payload["data"]["log"] == "/workspace/.udc-logs/train.log"
+        # The command travels verbatim as --shell; the GUI must not split it.
         assert runner.calls[-1][1] == [
             "job",
             "start",
             "alloc-1",
             "--name",
             "train",
-            "--",
-            "python",
-            "train.py",
-            "-e",
-            "10",
+            "--shell=python train.py --output 'one two'",
         ]
         bad = await client.post(
             "/api/jobs/alloc-1/start",
             headers=_headers(),
-            data=json.dumps({"name": "bad name!", "command": ["python"]}),
+            data=json.dumps({"name": "bad name!", "command": "python"}),
         )
         assert bad.status == 400
         empty = await client.post(
             "/api/jobs/alloc-1/start",
             headers=_headers(),
-            data=json.dumps({"name": "train", "command": []}),
+            data=json.dumps({"name": "train", "command": "   "}),
         )
         assert empty.status == 400
         logs = await client.get("/api/job-logs/alloc-1?name=train&tail=50", headers=_headers())
         assert logs.status == 200
         assert (await logs.json())["data"]["logs"] == "epoch 1\n"
+        history = await client.get("/api/job-history/alloc-1", headers=_headers())
+        assert history.status == 200
+        assert (await history.json())["data"]["files"][0]["name"] == "train.log"
     finally:
         await client.close()
+
+
+def test_ssh_runner_puts_json_before_separator(monitor_config):
+    import shlex
+
+    runner = gui_server.SSHRunner(monitor_config, "member-alias", None)
+    argv = runner._argv(
+        "member-alias",
+        ["job", "start", "alloc-1", "--name", "train", "--", "python", "train.py", "-e", "10"],
+    )
+    remote = shlex.split(argv[-1])
+    assert remote[0] == "udc-resource"
+    # --json must be consumed by udc-resource itself; everything after the
+    # `--` separator belongs to the training command.
+    assert remote.index("--json") < remote.index("--")
+    assert remote[remote.index("--") + 1 :] == ["python", "train.py", "-e", "10"]
+    assert remote[remote.index("--json") :] == ["--json", "--", "python", "train.py", "-e", "10"]
 
 
 class FakeVscodeProcess:
@@ -441,11 +460,11 @@ def _fake_vscode_config(monitor_config):
     )
 
 
-async def test_vscode_endpoint_waits_for_readiness(monitor_config, monkeypatch):
+async def test_vscode_endpoint_waits_for_real_readiness(monitor_config, monkeypatch):
     monkeypatch.setattr(
         gui_server.subprocess,
         "Popen",
-        lambda argv, **kwargs: FakeVscodeProcess(argv, stage="listening"),
+        lambda argv, **kwargs: FakeVscodeProcess(argv, stage="tunnel_verified"),
     )
     runner = FakeRunner()
     app = gui_server.create_app(
@@ -461,13 +480,44 @@ async def test_vscode_endpoint_waits_for_readiness(monitor_config, monkeypatch):
         assert response.status == 200
         payload = await response.json()
         assert payload["ok"] is True
-        assert payload["data"]["stage"] == "listening"
+        assert payload["data"]["stage"] == "tunnel_verified"
         assert payload["data"]["port"] == 39111
         assert payload["data"]["pid"] == 4242
         argv = FakeVscodeProcess.last.argv
         assert "--config" in argv
         assert argv[argv.index("--config") + 1] == "/etc/udc-resource/config.toml"
         assert "--readiness-file" in argv
+    finally:
+        await client.close()
+
+
+async def test_vscode_endpoint_keeps_waiting_while_only_listening(
+    monitor_config,
+    monkeypatch,
+):
+    """`listening` alone must not be reported as success anymore."""
+
+    monkeypatch.setattr(
+        gui_server.subprocess,
+        "Popen",
+        lambda argv, **kwargs: FakeVscodeProcess(argv, stage="listening"),
+    )
+    # Shrink the deadline so the test does not wait the production 90s.
+    monkeypatch.setattr(gui_server, "VSCODE_READY_TIMEOUT_SECONDS", 1)
+    runner = FakeRunner()
+    app = gui_server.create_app(
+        _fake_vscode_config(monitor_config),
+        member_alias=runner.member_alias,
+        runner=runner,
+        token="test-token",
+    )
+    client = await _client(app)
+    try:
+        response = await client.post("/api/vscode/alloc-1", headers=_headers())
+        assert response.status == 500
+        payload = await response.json()
+        assert "did not report readiness" in payload["error"]["message"]
+        assert FakeVscodeProcess.last.terminated is True
     finally:
         await client.close()
 

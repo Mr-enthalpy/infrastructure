@@ -386,3 +386,127 @@ def test_job_start_passes_command_argv(monkeypatch):
     assert args["id"] == "alloc-1"
     assert args["name"] == "train"
     assert args["command"] == ["python", "train.py"]
+
+
+def test_gui_job_start_argv_parses_as_cli(monkeypatch):
+    """End-to-end: SSHRunner._argv output must parse as the CLI expects.
+
+    Regression test for the GUI job start bug: --json was appended after the
+    `--` separator and ended up inside the training command.
+    """
+    import shlex
+
+    from udc_resource.config import load_config
+    from udc_resource.gui import server as gui_server
+
+    config = load_config(CONFIG)
+    ssh_runner = gui_server.SSHRunner(config, "member-alias", None)
+    argv = ssh_runner._argv(
+        "member-alias",
+        ["job", "start", "alloc-1", "--name", "train", "--", "python", "train.py", "-e", "10"],
+    )
+    remote_tokens = shlex.split(argv[-1])
+    assert remote_tokens[0] == "udc-resource"
+    fake = FakeClient(
+        {"ok": True, "data": {"name": "train", "session": "udc-train", "log": "/workspace/log"}}
+    )
+    monkeypatch.setattr(cli, "_make_client", lambda cfg: fake)
+    result = runner.invoke(cli.app, ["--config", str(CONFIG), *remote_tokens[1:]])
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [
+        (
+            "job_start",
+            {
+                "id": "alloc-1",
+                "name": "train",
+                "command": ["python", "train.py", "-e", "10"],
+            },
+        )
+    ]
+
+
+def test_job_start_shell_flag(monkeypatch):
+    fake = FakeClient(
+        {"ok": True, "data": {"name": "train", "session": "udc-train", "log": "/workspace/log"}}
+    )
+    result = _invoke(
+        monkeypatch,
+        fake,
+        [
+            "job",
+            "start",
+            "alloc-1",
+            "--name",
+            "train",
+            "--shell",
+            "python train.py --output 'one two'",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert fake.calls == [
+        (
+            "job_start",
+            {
+                "id": "alloc-1",
+                "name": "train",
+                "command": "python train.py --output 'one two'",
+            },
+        )
+    ]
+
+
+def test_job_start_rejects_shell_and_positional_together(monkeypatch):
+    fake = FakeClient()
+    result = _invoke(
+        monkeypatch,
+        fake,
+        ["job", "start", "alloc-1", "--name", "train", "--shell", "x", "--", "y"],
+    )
+    assert result.exit_code != 0
+    assert fake.calls == []
+
+
+def test_job_files_command(monkeypatch):
+    fake = FakeClient(
+        {"ok": True, "data": {"id": "alloc-1", "files": [{"name": "train.log", "bytes": 42}]}}
+    )
+    result = _invoke(monkeypatch, fake, ["job", "files", "alloc-1"])
+    assert result.exit_code == 0, result.output
+    assert "train.log" in result.output
+    assert "42 bytes" in result.output
+    assert fake.calls == [("job_files", {"id": "alloc-1"})]
+
+
+def test_remote_mode_relays_command(monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    recorded = {}
+
+    def fake_run(argv, **kwargs):
+        recorded["argv"] = list(argv)
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    # _dispatch_remote reads sys.argv directly; CliRunner does not patch it.
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["udc-resource", "--config", str(CONFIG), "--remote", "amax", "queue", "list"],
+    )
+    result = runner.invoke(cli.app, ["--config", str(CONFIG), "--remote", "amax", "queue", "list"])
+    assert result.exit_code == 0
+    assert recorded["argv"][-2] == "amax"
+    assert recorded["argv"][-1] == "udc-resource queue list"
+    assert "--config" not in recorded["argv"][-1]
+
+
+def test_remote_mode_rejects_local_only_commands(monkeypatch):
+    for head in ("shell", "vscode", "gui", "tunnel", "file"):
+        result = runner.invoke(cli.app, ["--remote", "amax", head, "alloc-1"])
+        assert result.exit_code != 0, head
+
+
+def test_remote_mode_rejects_job_attach(monkeypatch):
+    result = runner.invoke(cli.app, ["--remote", "amax", "job", "attach", "alloc-1"])
+    assert result.exit_code != 0

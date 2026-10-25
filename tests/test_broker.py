@@ -1427,3 +1427,180 @@ async def test_concurrent_applies_queue_behind_existing_request(tmp_path, active
     assert len(admitted) == 1
     remaining = await _call(broker, "queue_list", {}, BOB)
     assert len(remaining["data"]["queue"]) == 3
+
+
+async def test_backfill_admits_disjoint_queued_request(tmp_path, active_config):
+    """A blocked head must not idle a GPU nobody else is waiting for."""
+    fake = FakeDocker()
+    fake.add_process(GPUProcess(gpu_uuid="GPU-0", pid=4242, used_mib=1024, process_name="python"))
+    broker, fake = _broker(tmp_path, active_config, docker=fake)
+    head = await _call(broker, "apply", {"gpus": [0], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert head["data"]["status"] == "queued"
+    tail = await _call(broker, "apply", {"gpus": [7], "cpus": 8, "memory_gb": 32}, BOB)
+    # The enqueue path immediately schedules; backfill admits the tail.
+    assert tail["data"]["status"] == "admitted"
+    assert tail["data"].get("allocation_id")
+    assert fake.created and fake.created[-1].gpus == ("GPU-7",)
+    status = await _call(broker, "queue_get", {"id": head["data"]["queue_id"]}, ALICE)
+    assert status["data"]["queue"]["status"] == "queued"
+
+
+async def test_backfill_never_takes_the_contended_gpu(tmp_path, active_config):
+    fake = FakeDocker()
+    fake.add_process(GPUProcess(gpu_uuid="GPU-0", pid=4242, used_mib=1024, process_name="python"))
+    broker, fake = _broker(tmp_path, active_config, docker=fake)
+    head = await _call(broker, "apply", {"gpus": [0], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert head["data"]["status"] == "queued"
+    tail = await _call(broker, "apply", {"gpus": [0], "cpus": 8, "memory_gb": 32}, BOB)
+    assert tail["data"]["status"] == "queued"
+    assert fake.created == []
+    fake.processes.clear()
+    admitted = await broker._schedule_queue()
+    assert len(admitted) == 1
+    remaining = await _call(broker, "queue_list", {}, BOB)
+    assert len(remaining["data"]["queue"]) == 1
+
+
+async def test_backfill_starvation_guard_switches_to_strict_fifo(tmp_path, active_config):
+    now_holder = {"now": FIXED}
+    fake = FakeDocker()
+    fake.add_process(GPUProcess(gpu_uuid="GPU-0", pid=4242, used_mib=1024, process_name="python"))
+    broker, fake = _broker(tmp_path, active_config, docker=fake, clock=lambda: now_holder["now"])
+    config = replace(
+        active_config,
+        policy=replace(active_config.policy, queue_backfill_reserve_minutes=30),
+    )
+    broker.config = config
+    head = await _call(broker, "apply", {"gpus": [0], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert head["data"]["status"] == "queued"
+
+    # Inside the reserve window: a disjoint request may backfill.
+    now_holder["now"] = FIXED + timedelta(minutes=10)
+    tail = await _call(broker, "apply", {"gpus": [7], "cpus": 8, "memory_gb": 32}, BOB)
+    assert tail["data"]["status"] == "admitted"
+
+    # Past the reserve window: backfill stops so the head is served first.
+    now_holder["now"] = FIXED + timedelta(minutes=45)
+    tail2 = await _call(broker, "apply", {"gpus": [6], "cpus": 8, "memory_gb": 32}, BOB)
+    assert tail2["data"]["status"] == "queued"
+
+
+async def test_writable_layer_budget_blocks_oversubscription(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=0,
+            docker_storage_budget_gb=20,
+        ),
+    )
+    broker, fake = _broker(tmp_path, config)
+    first = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert first["ok"] is True
+    second = await _call(broker, "apply", {"gpus": [2], "cpus": 8, "memory_gb": 32}, BOB)
+    assert second["data"]["status"] == "queued"
+    assert second["data"].get("allocation_id") is None
+    released = await _call(broker, "release", {"id": first["data"]["id"]}, ALICE)
+    assert released["ok"] is True
+    # The release path schedules the queue itself; the freed budget slot lets
+    # the queued request through without an extra manual scheduling pass.
+    queue = await _call(broker, "queue_get", {"id": second["data"]["queue_id"]}, BOB)
+    assert queue["data"]["queue"]["status"] == "admitted"
+    assert queue["data"]["queue"].get("allocation_id")
+
+
+async def test_job_start_shell_validation(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    applied = await _call(broker, "apply", {"gpus": [2], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+    empty = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "train", "command": "   "},
+        ALICE,
+    )
+    assert empty["ok"] is False
+    assert empty["error"]["code"] == "bad_request"
+    nul = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "train", "command": "python\x00train.py"},
+        ALICE,
+    )
+    assert nul["ok"] is False
+    oversize = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "train", "command": "python " + "a" * 5000},
+        ALICE,
+    )
+    assert oversize["ok"] is False
+
+
+@pytest.mark.linux
+@pytest.mark.skipif(
+    not workspace_io.supported(),
+    reason="descriptor-relative job logs require Linux",
+)
+async def test_job_start_accepts_copy_paste_shell_command(tmp_path, active_config):
+    broker, fake = _broker(tmp_path, active_config)
+    applied = await _call(broker, "apply", {"gpus": [2], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+    started = await _call(
+        broker,
+        "job_start",
+        {
+            "id": allocation_id,
+            "name": "train",
+            "command": "python train.py --output 'experiment one'",
+        },
+        ALICE,
+    )
+    assert started["ok"] is True
+    assert fake.started_job_commands == [
+        (
+            applied["data"]["container_id"],
+            "train",
+            ["bash", "-lc", "python train.py --output 'experiment one'"],
+        )
+    ]
+
+
+async def test_job_files_survive_release(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    applied = await _call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".udc-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "train.log").write_bytes(b"epoch 1\nepoch 2\n")
+    released = await _call(broker, "release", {"id": allocation_id}, ALICE)
+    assert released["ok"] is True
+    files = await _call(broker, "job_files", {"id": allocation_id}, ALICE)
+    assert files["ok"] is True
+    assert files["data"]["files"] == [{"name": "train.log", "bytes": 16}]
+    denied = await _call(broker, "job_files", {"id": allocation_id}, BOB)
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "forbidden"
+
+
+@pytest.mark.linux
+@pytest.mark.skipif(
+    not workspace_io.supported(),
+    reason="descriptor-relative job logs require Linux",
+)
+async def test_job_logs_survive_release(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+    applied = await _call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".udc-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "train.log").write_bytes(b"epoch 1\nepoch 2\n")
+    released = await _call(broker, "release", {"id": allocation_id}, ALICE)
+    assert released["ok"] is True
+    logs = await _call(broker, "job_logs", {"id": allocation_id, "name": "train"}, ALICE)
+    assert logs["ok"] is True
+    assert logs["data"]["logs"] == "epoch 1\nepoch 2\n"

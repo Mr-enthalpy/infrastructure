@@ -398,10 +398,12 @@
       : "";
     const shell = active ? `<button data-action="shell" data-id="${id}">shell</button>` : "";
     const logs = allocation.container_id ? `<button data-action="logs" data-id="${id}">logs</button>` : "";
+    // Persistent job logs outlive the container; offer them for every status.
+    const history = `<button data-action="history" data-id="${id}">history</button>`;
     const vscode = active && state.config?.vscode_enabled
       ? `<button data-action="vscode" data-id="${id}">VS Code</button>`
       : "";
-    return `${shell}${vscode}${logs}${release}`;
+    return `${shell}${vscode}${logs}${history}${release}`;
   }
 
   function bindActions(root) {
@@ -413,6 +415,7 @@
         if (action === "release") releaseAllocation(id);
         if (action === "shell") openTerminal(id);
         if (action === "logs") openLogs(id);
+        if (action === "history") openJobHistory(id);
         if (action === "vscode") openVscode(id);
       });
     });
@@ -529,8 +532,10 @@
     const data = new FormData(form);
     const allocationId = String(data.get("allocation") || "");
     const name = String(data.get("name") || "").trim();
-    const command = String(data.get("command") || "").trim().split(/\s+/).filter(Boolean);
-    if (!allocationId || !name || !command.length) {
+    // Send the command verbatim: the container runs it via `bash -lc`, so
+    // quotes and spaces survive (e.g. --output "experiment one").
+    const command = String(data.get("command") || "").trim();
+    if (!allocationId || !name || !command) {
       errorTarget.textContent = "allocation、任务名和命令都不能为空";
       return;
     }
@@ -552,8 +557,9 @@
     try {
       const payload = await api(`/api/vscode/${encodeURIComponent(id)}`, { method: "POST" });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const stage = payload.data?.stage === "ready" ? "VS Code is opening" : "tunnel verified (container SSH reachable)";
       const detail = payload.data?.uri ? `: ${payload.data.uri}` : "";
-      flash(`VS Code tunnel is listening${detail}; check the VS Code window.`, "ok");
+      flash(`${stage}${detail}`, "ok");
     } catch (error) {
       flash(String(error.message || error), "error");
     }
@@ -593,12 +599,49 @@
     }
   }
 
+  async function openJobHistory(id) {
+    closeTerminal();
+    $("#terminal-modal").hidden = true;
+    $("#logs-modal").hidden = true;
+    $("#history-modal").hidden = false;
+    $("#modal-backdrop").hidden = false;
+    $("#history-modal-title").textContent = "Job history";
+    const target = $("#history-list");
+    target.textContent = "loading…";
+    try {
+      const payload = await api(`/api/job-history/${encodeURIComponent(id)}`);
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const files = payload.data.files || [];
+      if (!files.length) {
+        target.className = "allocation-list empty";
+        target.textContent = "No log files.";
+        return;
+      }
+      target.className = "allocation-list";
+      target.innerHTML = files.map((file) => `
+        <div class="allocation-item">
+          <div><div class="id">${esc(file.name)}</div></div>
+          <div class="muted">${esc(file.bytes ?? 0)} bytes</div>
+          <div class="row-actions"><button data-log="${esc(String(file.name).replace(/\.log$/, ""))}">view</button></div>
+        </div>
+      `).join("");
+      target.querySelectorAll("button[data-log]").forEach((button) => {
+        button.addEventListener("click", () => openJobLogs(id, button.dataset.log));
+      });
+    } catch (error) {
+      target.className = "allocation-list empty";
+      target.textContent = String(error.message || error);
+    }
+  }
+
   function closeModal() {
     closeTerminal();
     $("#modal-backdrop").hidden = true;
     $("#logs-modal").hidden = true;
     $("#terminal-modal").hidden = true;
+    $("#history-modal").hidden = true;
     $("#logs-content").textContent = "";
+    $("#history-list").textContent = "";
   }
 
   function openTerminal(id, job = "") {

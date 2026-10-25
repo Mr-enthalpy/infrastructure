@@ -16,6 +16,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..errors import BadRequest, Conflict, Forbidden, InternalError, NotFound
 
@@ -391,6 +392,56 @@ def regular_file_size(workspace: str | Path, parts: tuple[str, ...]) -> int | No
         return info.st_size if stat.S_ISREG(info.st_mode) else None
     finally:
         os.close(parent_fd)
+
+
+def list_workspace_logs(workspace: str | Path) -> list[dict[str, int]]:
+    """List regular log files directly inside ``<workspace>/.udc-logs``.
+
+    Used for the historical job-log view: tmux sessions disappear when a
+    training run ends, but the log files persist for the lifetime of the
+    workspace. Names and sizes only; content is read through
+    :func:`tail_file` with the same symlink resistance.
+    """
+
+    if supported():
+        root_fd = _open_root(workspace)
+        try:
+            try:
+                logs_fd = os.open(".udc-logs", _DIR_FLAGS, dir_fd=root_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES}:
+                    return []
+                raise _map_error(exc, target=".udc-logs") from exc
+            try:
+                files: list[dict[str, Any]] = []
+                for name in os.listdir(logs_fd):
+                    try:
+                        info = os.stat(name, dir_fd=logs_fd, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(info.st_mode):
+                        files.append({"name": name, "bytes": info.st_size})
+                return sorted(files, key=lambda item: item["name"])
+            finally:
+                os.close(logs_fd)
+        finally:
+            os.close(root_fd)
+    if os.name == "posix":
+        raise InternalError("descriptor-relative job-log access is unavailable")
+    # Windows test fallback: reject a symlinked .udc-logs, then stat without
+    # following final symlinks.
+    logs_dir = Path(workspace) / ".udc-logs"
+    if logs_dir.is_symlink() or not logs_dir.is_dir():
+        return []
+    fallback_files: list[dict[str, Any]] = []
+    for entry in logs_dir.iterdir():
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            fallback_files.append({"name": entry.name, "bytes": info.st_size})
+    return sorted(fallback_files, key=lambda item: item["name"])
 
 
 def tail_file(workspace: str | Path, parts: tuple[str, ...], tail: int) -> str:

@@ -38,6 +38,20 @@ Broker 仅在 `active` 模式下调度队列，且必须同时满足以下条件
 allocation；容器创建或 workspace 准备失败时，将 allocation 标记为 `failed` 并
 释放 claim。
 
+队列使用受约束的 backfill 而非严格队首阻塞：
+
+- 一个被阻塞的请求（GPU 忙、预算不足）会"封锁"它所申请的 GPU；后续请求只有
+  在申请的 GPU 与所有被封锁 GPU 完全不相交时才允许越过它。
+- 后来的请求永远拿不到队首正在等待的资源——竞争同一 GPU 的请求保持 FIFO。
+- 饥饿保护：一旦某个被阻塞的请求等待超过
+  `queue_backfill_reserve_minutes`（默认 30），backfill 完全停止，队首请求在
+  资源释放时优先获得准入。`queue_backfill_reserve_minutes = 0` 或
+  `queue_backfill_enabled = false` 退回严格 FIFO。
+- CPU-only 请求不受被封锁 GPU 请求的 GPU 封锁影响，可以 backfill。
+
+存在未过期排队请求时，新的直接申请仍必须进入队列（`--no-queue` 不变），由
+调度器在准入时机按上述规则处理。
+
 所有 `apply` 都必须尊重队列。存在未过期的 `queued` 请求时，必须先触发调度；若
 队首仍无法准入，直接申请必须进入队列，或在 `--no-queue` 下被拒绝，不得越过队列。
 只有队列为空且资源可用时，申请才可直接创建 allocation。队列空检查位于数据库
