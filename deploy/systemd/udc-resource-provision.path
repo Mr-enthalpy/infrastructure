@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the UDC provisioning spool for new operations
+
+[Path]
+PathExistsGlob=/var/lib/udc-resource/provision/requests/*.json
+Unit=udc-resource-provision.service
+
+[Install]
+WantedBy=multi-user.target

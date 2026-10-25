@@ -1591,8 +1591,7 @@ class Broker:
                 with self._connection() as connection:
                     owner_member_keys = (
                         member_store.active_keys(connection, int(owner_uid))
-                        if self.config.policy.membership_required
-                        and int(owner_uid) > 0
+                        if self.config.policy.membership_required and int(owner_uid) > 0
                         else []
                     )
                     connecter_member_keys = (

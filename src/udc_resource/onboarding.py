@@ -93,9 +93,7 @@ def _write_managed_fragment(config: LabConfig, host: str) -> Path:
     except OSError:
         existing = ""
     if include_line not in existing.splitlines():
-        user_config.write_text(
-            f"{include_line}\n{existing}", encoding="utf-8"
-        )
+        user_config.write_text(f"{include_line}\n{existing}", encoding="utf-8")
     return fragment
 
 

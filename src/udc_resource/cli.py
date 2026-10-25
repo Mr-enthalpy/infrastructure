@@ -1625,9 +1625,7 @@ def join_command(
             "purpose": typer.prompt("申请用途"),
             "contact": typer.prompt("用于核验的联系方式"),
             "nickname": typer.prompt("昵称（可选）", default=""),
-            "public_contact": typer.prompt(
-                "是否公开协作联系方式？(y/N)", default="n"
-            ),
+            "public_contact": typer.prompt("是否公开协作联系方式？(y/N)", default="n"),
             "agree_terms": "1",
             "public_keys": [typer.prompt("SSH 公钥（.pub 文件内容，一行）")],
         }
@@ -1785,8 +1783,7 @@ def menu_command(ctx: typer.Context) -> None:
             typer.echo(f"released: {data['id']}  status={data['status']}")
         elif choice == "6":
             typer.echo(
-                "更多命令见 udc-resource --help；工作台：在你自己的电脑运行 "
-                "udc-resource gui。"
+                "更多命令见 udc-resource --help；工作台：在你自己的电脑运行 udc-resource gui。"
             )
         else:
             typer.echo("unknown choice")

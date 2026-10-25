@@ -116,6 +116,7 @@
         const admin = await api("/api/admin/users");
         if (admin.ok) {
           state.adminEnabled = true;
+          void document.getElementById("membership-panel")?.removeAttribute("hidden");
           $("#admin-tab").hidden = false;
           renderAdminUsers(admin.data.users || []);
         }
@@ -770,6 +771,113 @@
     }
   }
 
+  async function refreshMembership() {
+    if (!state.adminEnabled) return;
+    try {
+      const [requests, members] = await Promise.all([
+        api("/api/admin/membership/requests"),
+        api("/api/admin/membership/members"),
+      ]);
+      if (requests.ok) renderMembershipRequests(requests.data || []);
+      if (members.ok) renderMembershipMembers(members.data || []);
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  function renderMembershipRequests(data) {
+    const target = $("#membership-requests");
+    const requests = data.requests || [];
+    if (!requests.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "暂无申请。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = requests.map((request) => `
+      <div class="allocation-item">
+        <div><div class="id">${esc(request.display_name || request.username)}</div>
+          <div class="muted">${esc(request.request_id)} · ${esc(request.status)}</div></div>
+        <div class="muted">${esc(request.affiliation || "")}<br>${esc(request.purpose || "")}</div>
+        <div class="muted">${(request.keys || []).map((key) => esc(key.fingerprint)).join("<br>")}</div>
+        <div class="row-actions">
+          <button data-maction="approve" data-request="${esc(request.request_id)}">批准</button>
+          <button data-maction="reject" data-request="${esc(request.request_id)}">拒绝</button>
+        </div>
+      </div>
+    `).join("");
+    target.querySelectorAll("button[data-maction]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const id = button.dataset.request;
+        const action = button.dataset.maction;
+        let body = { request_id: id };
+        if (action === "reject") {
+          const note = window.prompt("拒绝原因（申请人可见）：");
+          if (!note) return;
+          body.review_note = note;
+        } else {
+          if (!window.confirm(`批准 ${id} 的加入申请？`)) return;
+          body.review_note = "GUI 批准";
+        }
+        try {
+          const payload = await api(
+            `/api/admin/membership/requests/${action}`,
+            { method: "POST", body },
+          );
+          if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+          flash(`申请 ${id}：${action === "approve" ? "已批准，正在开户" : "已拒绝"}`, "ok");
+          refreshMembership();
+        } catch (error) {
+          flash(String(error.message || error), "error");
+        }
+      });
+    });
+  }
+
+  function renderMembershipMembers(data) {
+    const target = $("#membership-members");
+    const members = data.members || [];
+    if (!members.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "暂无成员。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = members.map((member) => `
+      <div class="allocation-item">
+        <div><div class="id">${esc(member.display_name || member.linux_username)}</div>
+          <div class="muted">${esc(member.member_id)}</div></div>
+        <div class="muted">${esc(member.status)} · uid ${esc(member.linux_uid ?? "—")}</div>
+        <div class="muted">${member.valid_until ? `至 ${esc(member.valid_until)}` : "无固定期限"}</div>
+        <div class="row-actions">
+          <button data-member="${esc(member.member_id)}" data-mstatus="${esc(member.status)}">
+            ${member.status === "suspended" ? "恢复" : "暂停"}
+          </button>
+        </div>
+      </div>
+    `).join("");
+    target.querySelectorAll("button[data-member]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const id = button.dataset.member;
+        const suspended = button.dataset.mstatus === "suspended";
+        const action = suspended ? "resume" : "suspend";
+        const reason = window.prompt(`${action === "suspend" ? "暂停" : "恢复"}原因（必填）：`);
+        if (!reason) return;
+        try {
+          const payload = await api(
+            `/api/admin/membership/${action}`,
+            { method: "POST", body: { member_id: id, reason } },
+          );
+          if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+          flash(`成员 ${id}：${suspended ? "已恢复" : "已暂停"}`, "ok");
+          refreshMembership();
+        } catch (error) {
+          flash(String(error.message || error), "error");
+        }
+      });
+    });
+  }
+
   async function refreshAdmin() {
     if (!state.adminEnabled) return;
     try {
@@ -781,6 +889,7 @@
       if (users.ok) renderAdminUsers(users.data.users || []);
       if (resources.ok) renderAdminResources(resources.data);
       if (audit.ok) renderAdminAudit(audit.data.events || []);
+      await refreshMembership();
     } catch (error) {
       flash(String(error.message || error), "error");
     }
@@ -928,6 +1037,7 @@
     $("#mode-maintenance").addEventListener("click", () => changeBrokerMode("maintenance"));
     $("#mode-active").addEventListener("click", () => changeBrokerMode("active"));
     $("#admin-audit").addEventListener("click", refreshAdmin);
+    $("#membership-refresh")?.addEventListener("click", refreshMembership);
     $("#admin-reconcile").addEventListener("click", async () => {
       try {
         const payload = await api("/api/admin/reconcile", { method: "POST" });

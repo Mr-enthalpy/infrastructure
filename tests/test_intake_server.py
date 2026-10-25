@@ -136,9 +136,7 @@ async def test_cancel_with_receipt(client, intake_db):
     payload = await submitted.json()
     request_id = payload["data"]["request_id"]
     receipt = payload["data"]["receipt_secret"]
-    cancelled = await client.post(
-        f"/api/requests/{request_id}/cancel", json={"receipt": receipt}
-    )
+    cancelled = await client.post(f"/api/requests/{request_id}/cancel", json={"receipt": receipt})
     assert cancelled.status == 200
     assert (await cancelled.json())["data"]["status"] == "cancelled"
 

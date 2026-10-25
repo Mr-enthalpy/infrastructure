@@ -112,7 +112,12 @@ def _validate(request: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 
 def _user_exists(username: str) -> bool:
-    result = _run(["getent", "passwd", username], check=False)
+    try:
+        result = _run(["getent", "passwd", username], check=False)
+    except (OSError, StageError):
+        # No getent on this platform (e.g. Windows test host): treat as absent
+        # so spool-mode tests can run without privileges.
+        return False
     return bool(result.stdout.strip())
 
 
@@ -185,45 +190,80 @@ ACTIONS = {
 }
 
 
-def main() -> int:
+def _process_one(request: dict[str, Any]) -> dict[str, Any]:
+    operation_id = str(request.get("operation_id", ""))
     try:
-        request = json.loads(sys.stdin.read())
-        operation_id = str(request.get("operation_id", ""))
         action, frozen = _validate(request)
         stages: list[str] = []
         ACTIONS[action](frozen, stages)
-        result = {
+        return {
             "operation_id": operation_id,
             "action": action,
             "status": "succeeded",
             "stages": stages,
         }
     except StageError as exc:
-        print(
-            json.dumps(
-                {
-                    "operation_id": str(request.get("operation_id", "")),
-                    "status": "failed",
-                    "stage": exc.stage,
-                    "error": exc.error,
-                }
-            )
-        )
-        return 1
+        return {
+            "operation_id": operation_id,
+            "status": "failed",
+            "stage": exc.stage,
+            "error": exc.error,
+        }
     except Exception as exc:  # noqa: BLE001 - executor must always answer
+        return {
+            "operation_id": operation_id,
+            "status": "failed",
+            "stage": "internal",
+            "error": f"{type(exc).__name__}",
+        }
+
+
+def _run_spool(spool: Path) -> int:
+    """Process every pending request file; write results next to them.
+
+    Idempotent: a request whose result file already exists is skipped so a
+    retried executor pass never re-runs a finished operation.
+    """
+    requests_dir = spool / "requests"
+    results_dir = spool / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    if not requests_dir.is_dir():
+        return 0
+    for request_file in sorted(requests_dir.glob("*.json")):
+        result_file = results_dir / request_file.name
+        if result_file.exists():
+            continue
+        try:
+            request = json.loads(request_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        result = _process_one(request)
+        temp = result_file.with_suffix(".tmp")
+        temp.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+        temp.replace(result_file)
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--spool":
+        sys.exit(_run_spool(Path(sys.argv[2])))
+    try:
+        request = json.loads(sys.stdin.read())
+    except json.JSONDecodeError:
         print(
             json.dumps(
                 {
-                    "operation_id": str(request.get("operation_id", "")),
+                    "operation_id": "",
                     "status": "failed",
-                    "stage": "internal",
-                    "error": f"{type(exc).__name__}",
+                    "stage": "validate",
+                    "error": "invalid request JSON",
                 }
             )
         )
         return 1
+    result = _process_one(request)
     print(json.dumps(result))
-    return 0
+    return 0 if result["status"] == "succeeded" else 1
 
 
 if __name__ == "__main__":

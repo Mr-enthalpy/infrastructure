@@ -1,0 +1,22 @@
+[Unit]
+Description=UDC membership intake (low-privilege application entry)
+After=network.target
+
+[Service]
+Type=simple
+User=udc-intake
+Group=udc-intake
+ExecStart=/opt/udc-resource/.venv/bin/python -m udc_resource.enrollment.server
+Environment=UDC_RESOURCE_CONFIG=/etc/udc-resource/config.toml
+# Intake owns ONLY its own store; it never sees the broker socket, member
+# database, Docker, or GPUs (goal member-onboarding-and-ux.md §9.2).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/udc-resource-intake
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

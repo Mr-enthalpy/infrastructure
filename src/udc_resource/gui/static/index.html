@@ -119,6 +119,15 @@
 
     <section id="tab-admin" class="tab-panel">
       <div id="admin-content">
+        <div class="panel" id="membership-panel" hidden>
+          <h2>加入申请</h2>
+          <div class="actions">
+            <button id="membership-refresh" class="ghost">刷新申请</button>
+          </div>
+          <div id="membership-requests" class="allocation-list empty">No requests.</div>
+          <h2>成员</h2>
+          <div id="membership-members" class="allocation-list empty">No members.</div>
+        </div>
         <div class="panel">
           <h2>Broker mode</h2>
           <p class="muted">active 需要配置中 deployment_allowed=true，并应由管理员明确批准。</p>

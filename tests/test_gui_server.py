@@ -28,7 +28,22 @@ class FakeRunner:
                 "ok": False,
                 "error": {"code": "forbidden", "message": "admin SSH alias is not configured"},
             }
-        if args[:1] == ["list"]:
+        if args[:2] == ["admin", "requests"]:
+            if args[2] == "list":
+                data = {"requests": [{"request_id": "req-1", "status": "pending_review"}]}
+            else:
+                decided = "approved" if args[2] == "approve" else "rejected"
+                data = {"request_id": args[3], "status": decided}
+        elif args[:2] == ["admin", "members"]:
+            if args[2] == "list":
+                data = {
+                    "members": [{"member_id": "m1", "status": "active", "linux_username": "alice"}]
+                }
+            else:
+                data = {"member_id": args[3], "status": "suspended"}
+        elif args[:2] == ["admin", "operations"]:
+            data = {"operation_id": args[3], "status": "succeeded"}
+        elif args[:1] == ["list"]:
             data = {
                 "server": "amax",
                 "mode": "monitor",
@@ -705,3 +720,42 @@ async def test_stop_vscode_process_lets_windows_child_clean_up(tmp_path):
 
     assert process.poll() is not None
     assert cleaned.exists(), "child cleanup handler did not run"
+
+
+async def test_membership_admin_endpoints(monitor_config):
+    runner = FakeRunner()
+    runner.admin_alias = "admin-alias"
+    client = await _client(_app(monitor_config, runner))
+    try:
+        requests = await client.get("/api/admin/membership/requests", headers=_headers())
+        assert requests.status == 200
+        payload = await requests.json()
+        assert payload["data"]["requests"][0]["request_id"] == "req-1"
+        approve = await client.post(
+            "/api/admin/membership/requests/approve",
+            headers=_headers(),
+            data=json.dumps({"request_id": "req-1", "review_note": "ok"}),
+        )
+        assert approve.status == 200
+        reject_missing = await client.post(
+            "/api/admin/membership/requests/reject",
+            headers=_headers(),
+            data=json.dumps({"request_id": "req-1"}),
+        )
+        assert reject_missing.status == 400
+        members = await client.get("/api/admin/membership/members", headers=_headers())
+        assert (await members.json())["data"]["members"][0]["member_id"] == "m1"
+        suspend_missing_reason = await client.post(
+            "/api/admin/membership/suspend",
+            headers=_headers(),
+            data=json.dumps({"member_id": "m1"}),
+        )
+        assert suspend_missing_reason.status == 400
+        retry = await client.post(
+            "/api/admin/membership/retry",
+            headers=_headers(),
+            data=json.dumps({"operation_id": "op-1"}),
+        )
+        assert retry.status == 200
+    finally:
+        await client.close()
