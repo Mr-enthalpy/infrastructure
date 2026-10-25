@@ -1,161 +1,224 @@
-# UDC infrastructure deployment
+# UDC infrastructure deployment guide
 
-Deployment scripts for the `infrastructure` repository. They install and verify
-the `udc-resource` broker, CLI, SSH restrictions, udev rule, and systemd unit.
+## 1. Scope and safety requirements
 
-**Do not run these files on amax while training is active.** The code is
-implemented, but deployment still requires training completion and explicit
-administrator approval.
+This directory contains the deployment and verification tooling for the
+`udc-resource` broker, CLI, SSH policy, udev rule, systemd units, development
+container image, and host-side verification scripts.
 
-## Order
+Deployment is prohibited while the host is serving training workloads or when
+explicit administrator approval has not been recorded. The current project
+status, target-host unknowns, and approved next steps are maintained in
+[`docs/handoff.md`](../docs/handoff.md). The acceptance procedure is defined in
+[`docs/acceptance.md`](../docs/acceptance.md).
 
-1. Run `bash deploy/preflight.sh --config lab/resources.local.toml` and
-   `bash deploy/audit_legacy.sh` (both read-only):
-   Docker, systemd, NVIDIA runtime, udev, sshd, groups, cgroup, disk,
-   `/dev/nvidia*` permissions, legacy root/sudo/SSH/privileged-container access.
-   For the development profile, preflight also requires the `overlay2` driver,
-   an XFS DockerRootDir mounted with `prjquota`/`pquota`, `xfs_quota`, and a
-   workspace root mounted `nosuid` (container root is host root without a user
-   namespace, so setuid files written through the workspace bind must be
-   ignored by the host).
-   The GPU permission gate also requires `stat`, `su`, `getent`, `udevadm`, and
-   `getfacl` (the `acl` package); preflight fails if any is missing.
-2. Install Python 3.12 (uv or deadsnakes), then run:
+All verification scripts marked as read-only must be executed before any
+state-changing step. A read-only script must be reviewed before execution; it
+must not stop containers, restart Docker or NVIDIA services, alter allocations,
+or modify users, groups, SSH configuration, or storage.
+
+## 2. Preconditions
+
+The following conditions must be satisfied before installation:
+
+- Training has ended and the lab owner has approved deployment.
+- A verified administrator SSH session is available and remains open during
+  SSH and systemd changes.
+- Python 3.12 is installed on the host. The system Python may be older and must
+  not be used as the production runtime.
+- `lab/resources.local.toml` contains the target host inventory and remains
+  excluded from Git.
+- The read-only checks in Section 3 pass. For the development profile, the
+  storage, quota, and `nosuid` requirements in Section 5 are mandatory.
+
+## 3. Read-only pre-deployment checks
+
+Run the following commands from the repository root as root on the target host:
+
+```bash
+bash deploy/preflight.sh --config lab/resources.local.toml
+bash deploy/audit_legacy.sh --production
+```
+
+`preflight.sh` checks Docker, systemd, the NVIDIA runtime, udev, sshd, required
+groups, cgroup configuration, disk capacity, `/dev/nvidia*` permissions, and the
+development-profile storage requirements. `audit_legacy.sh` inventories legacy
+root, sudo, SSH, Docker, GPU, and privileged-container access. Both scripts are
+read-only.
+
+The GPU permission gate also requires `stat`, `su`, `getent`, `udevadm`, and
+`getfacl` (provided by the `acl` package). `preflight.sh` must fail if any of
+these tools is unavailable.
+
+## 4. Installation sequence
+
+1. Validate the installer in dry-run mode:
 
    ```bash
    bash deploy/install_server.sh --dry-run --skip-preflight
+   ```
+
+2. Install the broker, CLI, login wrapper, member shell, verification scripts,
+   systemd units, udev rule, and SSH drop-in:
+
+   ```bash
    bash deploy/install_server.sh --yes
    ```
 
-   The installer is idempotent. It refuses to modify the host without `--yes`,
-   does not overwrite an existing config unless `--force-config`, does not start
-   the broker unless `--start`. A fresh database starts in `monitor`; a
-   reinstall with active/pending leases preserves `active` or `maintenance`
-   so lease expiry is never silently paused. Before changing config, systemd,
-   udev, sshd, or symlink files it creates a timestamped backup under
-   `/var/backups/udc-resource/`; validation failures trigger an EXIT trap that
-   restores those files and, when the broker was stopped, the SQLite state
-   snapshot. Group creation and a live broker's database are retained (the
-   rollback warns instead of replacing state under a running daemon). Keep an
-   existing admin SSH session open regardless.
-3. Create member accounts with:
+   The installer is idempotent. It does not modify the host without `--yes`, does
+   not overwrite an existing configuration unless `--force-config` is supplied,
+   and does not start the broker unless `--start` is supplied. A fresh database
+   starts in `monitor` mode. A reinstall with active/pending leases preserves
+   `active` or `maintenance` so lease expiry is not silently paused.
+
+   Before changing the configuration, systemd units, udev rules, sshd
+   configuration, or managed symlinks, the installer creates a timestamped
+   backup under `/var/backups/udc-resource/`. Validation failures trigger an EXIT
+   trap that restores the backed-up files and, when the broker was stopped, the
+   SQLite state snapshot. Group creation and a live broker database are retained;
+   rollback warns rather than replacing state under a running daemon.
+
+3. Create member accounts with an explicit SSH key:
 
    ```bash
    bash deploy/create_user.sh --yes --ssh-key /path/to/key.pub udc-alice
    ```
 
-   Members get `udc-members` + `udc-cli`, SSH `ForceCommand`, and the
-   root-owned `/usr/local/libexec/udc-resource/member-shell` login shell. The
-   installer does not change existing account shells; re-run `create_user.sh`
-   for each existing member before active mode. Admins use `--admin`, keep a
-   normal shell, and must not be in `udc-members`.
-4. Install the udev rule (done by the installer) and verify host GPU access is
-   denied to a test member. `verify_gpu_permissions.sh` checks every
-   `/dev/nvidia*` node, its NVIDIA/misc udev subsystem, mode/owner,
-   unexpected ACLs, forbidden groups (`udc-gpu`, `video`, `render`, Docker,
-   sudo, admins), and direct member read/write failures. Omit `--member` to
-   check every effective `udc-members` account, or use `--json` for the
-   Broker gate format. Re-run it after reboot and after the NVIDIA driver
-   recreates nodes.
-5. The installer selects `monitor` for a fresh install. On reinstall it keeps
-   `active`/`maintenance` when leases exist, so the expiry worker cannot be
-   paused accidentally.
-6. Install the sshd drop-in, run `sshd -t`, then reload. The member match block
-   is key-only (`AuthenticationMethods publickey`, password and keyboard
-   interactive disabled), sets `PermitUserRC no`, disables forwarding/tunnels,
-   and forces the login wrapper. Keep an admin SSH session open while changing
-   SSH.
-7. Start in monitor-only mode:
+   Members receive `udc-members` and `udc-cli` membership, the SSH
+   `ForceCommand`, and the root-owned
+   `/usr/local/libexec/udc-resource/member-shell` login shell. The installer does
+   not change existing account shells; run `create_user.sh` for every existing
+   member before active mode. Administrators use `--admin`, retain a normal
+   shell, and must not be members of `udc-members`.
+
+4. Install and validate the SSH policy. The installer installs the sshd drop-in,
+   runs `sshd -t`, and reloads sshd. The member match block is key-only
+   (`AuthenticationMethods publickey`), disables password and keyboard-interactive
+   authentication, sets `PermitUserRC no`, disables forwarding and tunnels, and
+   applies the login wrapper. Keep the verified administrator session open.
+
+5. Verify that the installed udev rule denies host GPU access to a test member:
+
+   ```bash
+   bash deploy/verify_gpu_permissions.sh --member udc-alice --expected-gpus 8
+   ```
+
+   Omit `--member` to check every effective `udc-members` account. Use `--json`
+   for the Broker gate format. Re-run the check after a reboot and after the
+   NVIDIA driver recreates device nodes.
+
+6. Apply per-directory workspace project quotas before enabling active
+   allocations or file transfer. The command is a dry run unless `--yes` is
+   supplied:
+
+   ```bash
+   bash deploy/configure_quotas.sh \
+     --workspace-root /data1/udc-users \
+     --limit-gb 200 \
+     --yes
+   ```
+
+   XFS and ext4 mounts must have project quotas enabled during a maintenance
+   window. The script does not remount `/data1`. Re-run it after adding members
+   and verify each member's project hard limit with `xfs_quota -x -c 'report -p
+   -b -h' <mount>` on XFS or `repquota -P <mount>` on ext4.
+
+7. Start the broker in monitor-only mode and run the read-only security
+   acceptance:
 
    ```bash
    systemctl start udc-resource-broker
    bash deploy/verify_monitor_only.sh --member udc-alice
    ```
 
-   The verifier is read-only: it checks ForceCommand, socket permissions,
-   Docker/GPU denials, monitor mode, and that Docker/GPU state is unchanged over
-   the snapshot window (default 10 minutes) and all GPU/NVIDIA device
-   permissions through `verify_gpu_permissions.sh`.
+   The verifier checks `ForceCommand`, socket permissions, Docker/GPU denials,
+   monitor mode, and the absence of Docker/GPU state changes during the snapshot
+   window (default: 10 minutes). It also invokes
+   `verify_gpu_permissions.sh` for every visible NVIDIA device.
 
-   `monitor` is read-only and never expires leases. If active/pending leases
-   exist, use `maintenance`: it blocks new applies but keeps expiry and
-   reconciliation running. The broker refuses `admin mode monitor` while leases
-   or managed containers exist.
-8. Only after explicit approval, switch to active mode and run a CPU then
-   single-GPU acceptance allocation.
+   `monitor` is read-only and never expires leases. When active or pending leases
+   exist, use `maintenance`: it blocks new applications while continuing expiry
+   and reconciliation. The broker refuses `admin mode monitor` while leases or
+   managed containers exist.
 
-See `docs/legacy-access-revocation.md` for the formal legacy administrator
-revocation and verification checklist, `docs/jobs-and-transfer.md` for detached
-tmux jobs and restricted file transfer, and `docs/acceptance.md` for the
-destructive active-mode acceptance.
+8. Only after explicit approval and completion of the read-only checks may the
+   broker be switched to active mode and the CPU and single-GPU acceptance
+   allocations be created. Do not run the destructive acceptance procedure on a
+   host that is still serving training containers or other users' allocations.
 
-## Files
+## 5. Development-profile gates
 
-- `preflight.sh` (read-only checks; run before installing anything)
-- `audit_legacy.sh` (read-only legacy root/sudo/SSH/privileged-container audit)
-- `install_server.sh` (idempotent installer; `--dry-run`, `--yes`, `--start`, `--no-timers`)
-- `create_user.sh` (member/admin account and optional SSH key setup)
-- `member-shell.sh` (root-owned member login shell installed by the installer)
-- `verify_gpu_permissions.sh` (read-only all-GPU/NVIDIA device permission acceptance; supports `--json` and no-member mode)
-- `verify_monitor_only.sh` (read-only monitor-only security acceptance)
-- `check_disk.sh` (workspace free-space alert; exit 0/1/2)
-- `configure_quotas.sh` (XFS/ext4 project quotas; dry-run by default, `--yes` to apply)
-- `rotate_job_logs.py` (symlink-safe job-log rotation)
-- `acceptance_active.py` (destructive active-mode acceptance; see `docs/acceptance.md`)
-- `systemd/udc-resource-broker.service`
-- `systemd/udc-resource-logrotate.service` / `.timer`
-- `systemd/udc-resource-disk-check.service` / `.timer`
-- `udev/99-udc-gpu.rules`
-- `sshd/60-udc-resource.conf`
-- `docker/Dockerfile.base`
-- `docker/sshd_config`
-- `docker/bootstrap.sh`
-- `../lab/members.example.toml` (public collaborator directory example)
+The development container profile is allowed only when all of the following
+conditions hold:
 
-Before enabling file transfer, run `configure_quotas.sh` during a maintenance
-window and schedule `check_disk.sh --min-free-gb 50` (or a systemd timer). The
-example config enables the development profile with a writable rootfs,
-passwordless container `sudo`, a per-allocation tmpfs HOME, a `storage_opt`
-writable-layer quota, PID limits, and an optional GPU group. The container is
-still unprivileged at the Docker level: no privileged mode, Docker socket,
-host PID/network namespace, or host system mounts. `userns_mode` is empty by
-default and accepts `host` only for an explicit daemon-level decision.
-Validate the real image, Docker storage driver, GPU group, container sshd,
-and namespace mode on the target host before active acceptance.
+- The Docker storage driver is `overlay2`.
+- DockerRootDir is on XFS mounted with `prjquota` or `pquota`.
+- `xfs_quota` is installed and operational.
+- Workspace project quotas are available and the workspace root exists.
+- The workspace filesystem is mounted with `nosuid`. Without a user namespace,
+  container UID 0 maps to host UID 0; `nosuid` prevents setuid or file-capability
+  binaries written through the workspace bind from being honored by the host.
 
-The development profile requires `overlay2` on XFS with project quotas; if
-`preflight.sh --config` reports any of those checks as failed, do not enable
-the profile. VS Code support additionally requires the image built from
-`deploy/docker/Dockerfile.base`; it remains gated until the target container
-sshd, tunnel teardown, and quota tests pass.
+If any condition fails, the development profile must remain disabled. Do not
+weaken the check or bypass it by using `userns_mode = "host"` without validating
+GPU devices and bind mounts first.
 
-The broker socket must be `root:udc-cli 0660`; members must not get Docker,
-sudo, or GPU device groups. The container must not mount the host Docker socket.
-`install_server.sh` never creates or stops containers.
-
-## Member display directory and disk controls
-
-Copy `lab/members.example.toml` to `/etc/udc-resource/members.toml` (root-owned,
-mode 0644) to add an optional Chinese display name, nickname, and **public**
-contact for each Linux account. The broker exposes only `display_name`,
-`nickname`, and `public_contact`; never put private phone numbers, private
-email, or student IDs in this file. The GUI and `list` output use these fields
-for GPU cards, allocations, and unmanaged processes.
-
-Before enabling file transfer, apply per-directory project quotas with:
+Build the base image only on the target host after the storage checks pass:
 
 ```bash
-bash deploy/configure_quotas.sh --workspace-root /data1/udc-users \
-  --limit-gb 200 --yes
+docker build -f deploy/docker/Dockerfile.base -t udc-base:2026.10 deploy/docker
 ```
 
-The command is a dry-run unless `--yes` is supplied. XFS/ext4 mounts must have
-`prjquota` enabled during a maintenance window; the script will not remount
-`/data1`. Schedule `deploy/check_disk.sh --path /data1/udc-users --min-free-gb 50`
-(cron or a systemd timer) for free-space alerts. The installer installs and
-enables `udc-resource-logrotate.timer` and `udc-resource-disk-check.timer` by
-default; use `install_server.sh --no-timers` to leave them disabled. The log
-timer calls the descriptor-relative `rotate_job_logs.py` helper rather than
-logrotate's symlink-following copytruncate path; the disk timer runs
-`check_disk.sh` and exits non-zero for warning/critical thresholds so the
-failure is visible in `systemctl --failed` and the journal.
+Record the immutable image digest and use that digest for acceptance. A floating
+tag is not acceptable for acceptance evidence.
+
+## 6. File transfer and VS Code
+
+`file_transfer_enabled` and `vscode_enabled` remain `false` until their
+respective target-host tests pass. File transfer requires TOCTOU-safe handling,
+working per-directory quotas, and target-host acceptance. VS Code requires a
+verified container sshd, Broker tunnel lifecycle, quota enforcement, and
+allocation release/expiry behavior.
+
+The local listener for VS Code must bind only to `127.0.0.1`. The generated SSH
+config disables host-key verification for the loopback-only alias; the local
+account, not the container host key, is the trust boundary. Host SSH forwarding
+must remain disabled.
+
+## 7. systemd timers and operational controls
+
+The installer installs and enables `udc-resource-logrotate.timer` and
+`udc-resource-disk-check.timer` by default. Use `--no-timers` to leave them
+disabled. The log timer invokes the descriptor-relative
+`rotate_job_logs.py` helper instead of a logrotate `copytruncate` rule. The disk
+timer runs `check_disk.sh` and exits non-zero for warning and critical
+thresholds so failures are visible in `systemctl --failed` and the journal.
+
+The broker socket must be owned by `root:udc-cli` with mode `0660`. Members must
+not receive Docker, sudo, GPU device group, `video`, or `render` access. The
+container must not mount the host Docker socket.
+
+## 8. File inventory
+
+- `preflight.sh`: read-only host and development-profile preflight.
+- `audit_legacy.sh`: read-only legacy root/sudo/SSH/privileged-container audit.
+- `install_server.sh`: idempotent installer; supports `--dry-run`, `--yes`,
+  `--start`, and `--no-timers`.
+- `create_user.sh`: member/admin account and optional SSH key setup.
+- `member-shell.sh`: root-owned member login shell installed by the installer.
+- `verify_gpu_permissions.sh`: read-only GPU/NVIDIA device permission
+  verification; supports `--json` and no-member mode.
+- `verify_monitor_only.sh`: read-only monitor-only security acceptance.
+- `check_disk.sh`: workspace free-space alert; exits 0, 1, or 2.
+- `configure_quotas.sh`: XFS/ext4 project quota setup; dry-run by default.
+- `rotate_job_logs.py`: symlink-safe job-log rotation.
+- `acceptance_active.py`: destructive active-mode acceptance harness; see
+  `docs/acceptance.md`.
+- `systemd/udc-resource-broker.service`: hardened broker unit.
+- `systemd/udc-resource-logrotate.service` and `.timer`: log rotation timer.
+- `systemd/udc-resource-disk-check.service` and `.timer`: disk alert timer.
+- `udev/99-udc-gpu.rules`: NVIDIA device-node ownership rule.
+- `sshd/60-udc-resource.conf`: member SSH match block.
+- `docker/Dockerfile.base`, `docker/sshd_config`, `docker/bootstrap.sh`:
+  development container definitions.
+- `../lab/members.example.toml`: public member-directory example.

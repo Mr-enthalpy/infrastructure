@@ -1,27 +1,38 @@
 # Active-mode acceptance
 
-This acceptance is **destructive by design** and must only run after training
-has ended, the lab owner has approved, and a dedicated test GPU and test
-accounts are available. Do not run it on amax while training containers or
-other users' allocations are present.
+## 1. Purpose and authorization
 
-The script refuses to run without:
+This procedure verifies the security and functional boundaries of the deployed
+resource broker. It changes host and database state and is therefore restricted
+to a dedicated test allocation and an approved maintenance window.
 
-- `--yes`
-- `--allow-test-container`
-- `--allow-db-time-travel`
-- two distinct SSH aliases for member accounts
-- public member-directory entries for the supplied local member usernames
-- `policy.file_transfer_enabled = true` only after quotas and TOCTOU tests pass
-- an explicit `--gpu` index that is currently `free`
-- an empty active/pending allocation set
-- a passing `audit_legacy.sh --production` (invalid root keys are fatal unless
-  `allow_root_ssh_keys=true` is explicitly configured)
+The procedure must not be executed on any host while training containers or
+other users' allocations are present. On amax, it additionally requires training
+to have ended and explicit approval from the lab owner. It requires:
 
-## Run
+- a dedicated test GPU that is currently `free`;
+- two distinct dedicated member accounts and SSH aliases;
+- public member-directory entries for the supplied local member usernames;
+- no active or pending allocation before the test starts;
+- a passing `audit_legacy.sh --production` run; invalid root SSH keys are fatal
+  unless `allow_root_ssh_keys = true` is explicitly configured;
+- a successful development-profile preflight when testing the development
+  container or VS Code;
+- `policy.file_transfer_enabled = true` only for the controlled file-transfer
+  portion after quota and TOCTOU preconditions pass;
+- `policy.vscode_enabled = true` only for the controlled VS Code portion after
+  container-sshd and tunnel preconditions pass.
 
-Run as root **on the server**, with root's SSH config able to log in as the two
-member accounts:
+The harness is `deploy/acceptance_active.py`. It refuses to run without
+`--yes`, `--allow-test-container`, and `--allow-db-time-travel`. It records the
+allocations and temporary holder containers it creates and removes its own
+temporary holder container on exit. It does not delete workspaces or other
+users' containers.
+
+## 2. Preconditions and execution context
+
+Run the harness as root on the server. Root's SSH configuration must be able to
+log in as the two member accounts.
 
 ```bash
 cd /path/to/infrastructure
@@ -36,152 +47,201 @@ cd /path/to/infrastructure
   --yes
 ```
 
-`--member-a-user` / `--member-b-user` are local Linux usernames used to test
-Docker and every NVIDIA device node through
-`deploy/verify_gpu_permissions.sh`; the SSH aliases alone only prove that
-ForceCommand rejects arbitrary commands.
+`--member-a-user` and `--member-b-user` are local Linux usernames. They are used
+to test Docker and every NVIDIA device node through
+`deploy/verify_gpu_permissions.sh`; SSH aliases alone only demonstrate that
+`ForceCommand` rejects arbitrary commands.
 
-The script records its own test allocations and removes the temporary holder
-container on exit. It does not delete workspaces or other users' containers.
+Before starting, verify the read-only prerequisites in
+[`docs/handoff.md`](handoff.md) and `deploy/preflight.sh`. Record the current
+`docker ps -a` and `nvidia-smi` output as the baseline.
 
-## Five checks
+## 3. Read-only prerequisites
 
-1. **Real SSH boundary**
-   - member CLI `list --json` succeeds;
-   - `bash`, `docker ps`, and arbitrary GPU probes are rejected through SSH;
-   - socket parent mode is `0711 root:root` and the member can reach the
-     broker socket through the CLI;
-   - if local users are supplied, direct `docker ps`, `nvidia-smi`, and read/write
-     access to every `/dev/nvidia*` node fail for those accounts;
-     `verify_gpu_permissions.sh` checks all eight visible GPUs, every additional
-     NVIDIA node, effective group membership, ACLs, and the installed
-     `KERNEL=="nvidia*"` udev rule. Re-run it after a reboot and after reloading
-     the NVIDIA driver.
-   - `list` exposes only the public member-directory fields (`display_name`,
-     `nickname`, `public_contact`), and each supplied local member has a
-     profile. Private contact fields must not appear in the response.
+The following checks must pass before authorizing active mode. They do not
+modify host state and must be retained as evidence:
 
-2. **Concurrent same-GPU apply**
-   - two members apply for the same test GPU at the same time with
-     `--no-queue`;
-   - exactly one receives `ok=true`;
-   - the other receives `gpu_busy`;
-   - the winner is released and the GPU returns to `free`.
+- `preflight.sh --config <config>` reports the selected container profile as
+  valid.
+- For the development profile, Docker uses `overlay2`; DockerRootDir is on XFS
+  with `prjquota` or `pquota`; `xfs_quota` is available; workspace project quotas
+  are enabled; and the workspace filesystem is mounted `nosuid`.
+- Confirm the `nosuid` mount directly with
+  `findmnt -no OPTIONS -T /data1/udc-users`. Without a user namespace, container
+  root is host root; a setuid file written through the workspace bind must not
+  be honored by the host.
+- The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`
+  are installed.
+- After `configure_quotas.sh`, or after adding a member, confirm that the test
+  member's workspace has the configured project hard limit. Use
+  `xfs_quota -x -c 'report -p -b -h' <mount>` on XFS or
+  `repquota -P <mount>` on ext4. A mount-support check alone is insufficient.
+- The broker unit reports the expected hardening properties:
+  `ProtectHome=read-only`, `ProtectSystem=strict`, and a `ReadWritePaths` set
+  that includes the configured workspace, state database, and broker runtime
+  directory.
+- Build `deploy/docker/Dockerfile.base` on the target host, record the image
+  digest, and use the digest rather than a floating tag for acceptance.
 
-3. **Legacy GPU holder without compute**
-   - a temporary running container is created with Docker GPU access and
-     `sleep infinity`, so it has no CUDA compute process;
-   - member apply with `--no-queue` for that GPU must fail with `gpu_busy`, and
-     default apply must create a queued request without creating a GPU claim;
-   - the temporary container is always removed. A stopped legacy container
-     must not block a GPU and is reported as historical only.
+## 4. Five active-mode checks
 
-4. **Expiry, restart, SSH disconnect, jobs, workspace**
-   - a test allocation and a CPU-only bystander allocation are created;
-   - a marker is written through an SSH PTY shell, then the SSH client is
-     terminated; the allocation container must stay running;
-   - restricted file `put`/`get` transfers the exact bytes through SSH and the
-     broker, while a `..` traversal path is rejected as `forbidden`;
-   - a detached `tmux` job writes `job-started` to its workspace log; two
-     attach sessions are terminated without killing the job; the log must be
-     readable afterward;
-   - the broker is restarted; the allocation, marker, detached job, and job log
-     must survive; the job must reattach after the restart;
-   - the job is stopped, then with `--allow-db-time-travel`, only the test
-     allocation's `expires_at` is moved near-term in SQLite;
-   - expiry worker stops the container, marks the allocation `expired`, releases
-     the claim, and keeps the workspace marker;
-   - the bystander is unaffected.
+### 4.1 Real SSH boundary
 
-5. **Queue admission and cancellation**
-    - member A holds the test GPU, then member B applies for the same GPU with
-      queueing enabled; B receives `queue_id` with state `queued` and no GPU
-      claim;
-    - A releases the GPU; within the expiry/scheduling interval B's request
-      becomes `admitted`, its allocation becomes `active`, and the GPU is
-      claimed by B only;
-    - repeat with a second queued request and cancel it as its owner; it must
-      become `cancelled`, create no allocation, and leave the GPU free;
-    - `queue list --history` shows the terminal state; `queue list --all` is
-      rejected for a member and accepted for an admin;
-    - queue admission must pause (not guess) when live GPU detection fails.
+- A member CLI `list --json` request succeeds.
+- `bash`, `docker ps`, and arbitrary GPU probes are rejected through SSH.
+- The broker socket parent directory has mode `0711 root:root`, and the member
+  can reach the broker socket only through the CLI.
+- If local users are supplied, direct `docker ps`, `nvidia-smi`, and read/write
+  access to every `/dev/nvidia*` node fail for those accounts.
+  `verify_gpu_permissions.sh` checks all eight visible GPUs, every additional
+  NVIDIA node, effective group membership, ACLs, and the installed
+  `KERNEL=="nvidia*"` udev rule. Re-run it after a reboot and after reloading the
+  NVIDIA driver.
+- `list` exposes only the public member-directory fields `display_name`,
+  `nickname`, and `public_contact`. Each supplied local member must have a
+  profile. Private contact fields must not appear in the response.
 
-## Development container and VS Code acceptance
+### 4.2 Concurrent same-GPU apply
 
-Run this only on a dedicated test allocation after the five checks and only
-when the host is not serving other users. It must not stop, restart, or alter
-training containers.
+- Two members request the same test GPU concurrently with `--no-queue`.
+- Exactly one request returns `ok=true`.
+- The other returns `gpu_busy`.
+- The winner releases the GPU, and the GPU returns to `free`.
 
-1. **Storage and image preflight**
-   - `preflight.sh --config <config>` reports the development profile as valid:
-     `overlay2`, XFS DockerRootDir with `prjquota`/`pquota`, `xfs_quota`,
-     workspace project quotas, and a workspace filesystem mounted `nosuid`.
-     Confirm the last point with `findmnt -no OPTIONS -T /data1/udc-users`;
-     container root is host root without a user namespace, so a setuid file
-     written through the workspace bind must not be honored by the host.
-   - The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`
-     are installed.
-   - After `configure_quotas.sh` (or after adding a member), confirm the test
-     member's workspace directory has the configured project hard limit with
-     `xfs_quota -x -c 'report -p -b -h' <mount>` (XFS) or `repquota -P <mount>`
-     (ext4). A quota gate that only sees mount support is not enough.
-   - Build `deploy/docker/Dockerfile.base` on the target host and record the
-     image digest; do not use a floating tag for acceptance.
-2. **Container privilege boundary**
-   - Apply for the test GPU with the development profile and wait for active.
-   - Inside the container, `id` shows the member UID; `sudo -n true` succeeds;
-     `sudo -n cat /etc/shadow` succeeds only inside the container.
-   - From the host, the member still cannot run a host shell, `docker`, or
-     `nvidia-smi`; host root is never reachable from the container.
-   - Inspect the container: no `Privileged`, no `/var/run/docker.sock`, no host
-     PID/network namespace, no host system mounts, and `storage_opt` is present.
-3. **Disposable versus persistent state**
-   - Write a marker under `/workspace` and a marker under `$HOME`.
-   - Release and re-apply; the `/workspace` marker survives and the `$HOME`
-     marker is gone (fresh tmpfs).
-   - Confirm the writable-layer quota rejects growth beyond the configured
-     `writable_layer_gb` without affecting `/workspace`.
-4. **Broker-mediated VS Code tunnel**
-   - With `vscode_enabled = true`, run `udc-resource vscode <allocation-id>`;
-     VS Code connects as the member UID and opens `/workspace`.
-   - The local listener is bound to `127.0.0.1` only. The generated SSH config
-     disables host-key verification for the loopback-only alias; confirm no
-     non-loopback listener and document that the trust boundary is the local
-     account, not the container host key.
-   - Host SSH forwarding remains disabled; the host login wrapper still rejects
-     arbitrary commands and a direct `ssh -L` attempt. The container sshd may
-     allow local TCP forwarding for Remote-SSH, but no remote/Unix-socket
-     forwarding, agent forwarding, or tun devices.
-   - Opening more than `vscode_max_tunnels` connections is refused, including
-     concurrent attempts that race the slot check.
-   - Release and expiry cancel the tunnel; the container sshd process and Docker
-     exec session exit, and no worker thread remains blocked.
-5. **Gates remain closed**
-   - File transfer stays disabled until TOCTOU-safe handling and quota tests
-     pass.
-   - A failed GPU audit, workspace quota check, or storage preflight blocks new
-     allocations while existing tasks continue and can still be released.
+### 4.3 Legacy GPU holder without compute
 
-Retain the image digest, `docker inspect` security fields, preflight output,
-tunnel logs, and the before/after workspace and HOME marker results.
+- A temporary running container is created with Docker GPU access and
+  `sleep infinity`, so it has no CUDA compute process.
+- A member apply with `--no-queue` for that GPU must fail with `gpu_busy`.
+  A default apply must create a queued request without creating a GPU claim.
+- The temporary container is removed in all cases. A stopped legacy container
+  must not block a GPU and is reported as historical only.
 
-## Evidence to retain
+### 4.4 Expiry, restart, SSH disconnect, jobs, and workspace
 
-Save the script output plus:
+- A test allocation and a CPU-only bystander allocation are created.
+- A marker is written through an SSH PTY shell, then the SSH client is
+  terminated. The allocation container must remain running.
+- Restricted file `put` and `get` transfer the exact bytes through SSH and the
+  broker, while a `..` traversal path is rejected as `forbidden`. The policy gate
+  may be enabled only for this controlled acceptance run after the quota and
+  TOCTOU preconditions are met, and must be disabled immediately afterward.
+- A detached tmux job writes `job-started` to its workspace log. Two attach
+  sessions are terminated without killing the job; the log must remain readable.
+- The broker is restarted. The allocation, marker, detached job, and job log
+  must survive, and the job must reattach after the restart.
+- The job is stopped. With `--allow-db-time-travel`, only the test allocation's
+  `expires_at` is moved near-term in SQLite.
+- The expiry worker stops the container, marks the allocation `expired`,
+  releases the claim, and keeps the workspace marker.
+- The CPU-only bystander is unaffected.
 
-- member `list --json` before/after;
-- `systemctl status udc-resource-broker`;
-- `docker ps -a` before/after;
-- test allocation `status` before/after expiry;
-- workspace marker path and existence;
-- queue request before/after release and cancellation, including `queue list
-  --history --json`;
-- `audit_legacy.sh --production` JSON output (or human output) and
-  `verify_gpu_permissions.sh` output before/after reboot;
+### 4.5 Queue admission and cancellation
+
+- Member A holds the test GPU. Member B applies for the same GPU with queueing
+  enabled.
+- B receives a `queue_id` with state `queued` and no GPU claim.
+- A releases the GPU. Within the expiry/scheduling interval, B's request becomes
+  `admitted`, its allocation becomes `active`, and the GPU is claimed only by B.
+- Repeat with a second queued request and cancel it as its owner. It must become
+  `cancelled`, create no allocation, and leave the GPU free.
+- `queue list --history` shows the terminal state. `queue list --all` is rejected
+  for a member and accepted for an administrator.
+- Queue admission must pause rather than guess when live GPU detection fails.
+- A direct apply must not bypass an unexpired queued request even when
+  `queue_enabled = false`. `--no-queue` means no waiting and no retained request;
+  it does not permit queue jumping.
+
+## 5. Development container and VS Code acceptance
+
+Execute this phase only on a dedicated test allocation after the five checks in
+Section 4 pass, and only when the host is not serving other users. It must not
+stop, restart, or alter training containers.
+
+### 5.1 Storage and image preflight
+
+- `preflight.sh --config <config>` reports the development profile as valid:
+  `overlay2`, XFS DockerRootDir with `prjquota`/`pquota`, working `xfs_quota`,
+  workspace project quotas, and a workspace filesystem mounted `nosuid`.
+- The image is built from `deploy/docker/Dockerfile.base`; its digest is recorded;
+  the configured image reference is pinned to that digest for acceptance.
+- The GPU audit prerequisites are present.
+
+### 5.2 Container privilege boundary
+
+- Apply for the test GPU with the development profile and wait for `active`.
+- Inside the container, `id` shows the member UID; `sudo -n true` succeeds;
+  `sudo -n cat /etc/shadow` succeeds only inside the container.
+- From the host, the member still cannot obtain a host shell, run `docker`, or run
+  `nvidia-smi`.
+- `docker inspect` confirms: `Privileged` is false; the Docker socket is not
+  mounted; host PID and network namespaces are not used; no host system
+  directories are mounted; and `storage_opt` is present.
+
+### 5.3 Disposable and persistent state
+
+- Write one marker under `/workspace` and one under `$HOME`.
+- Release and re-apply. The `/workspace` marker must survive; the `$HOME` marker
+  must be absent because HOME is a fresh tmpfs.
+- Confirm that the writable-layer quota rejects growth beyond
+  `writable_layer_gb` and that the rejection does not affect `/workspace`.
+
+### 5.4 Broker-mediated VS Code tunnel
+
+- With `vscode_enabled = true`, run `udc-resource vscode <allocation-id>`.
+  VS Code must connect as the member UID and open `/workspace`.
+- The local listener must bind only to `127.0.0.1`. The generated SSH config
+  disables host-key verification for the loopback-only alias. Confirm that no
+  non-loopback listener exists and document that the local account, not the
+  container host key, is the trust boundary.
+- Host SSH forwarding must remain disabled. The host login wrapper must reject
+  arbitrary commands and direct `ssh -L` attempts. The container sshd may allow
+  local TCP forwarding for Remote-SSH, but remote forwarding, Unix-socket
+  forwarding, agent forwarding, and tun devices must remain disabled.
+- Opening more than `vscode_max_tunnels` connections must be refused, including
+  concurrent attempts that race the slot check.
+- Release and expiry must cancel the tunnel. The container sshd process and the
+  Docker exec session must exit, and no worker thread may remain blocked.
+
+### 5.5 Closed gates
+
+- File transfer must remain disabled outside the controlled acceptance run until
+  TOCTOU-safe handling and quota tests pass.
+- A failed GPU audit, workspace quota check, or storage preflight must block new
+  allocations while existing tasks continue and remain releasable.
+
+## 6. Evidence to retain
+
+Retain the complete command output and the following artifacts:
+
+- member `list --json` output before and after the test;
+- `systemctl status udc-resource-broker` and relevant journal excerpts;
+- `docker ps -a` before and after the test;
+- test allocation status before and after expiry;
+- workspace marker path and existence result;
+- queue request state before and after release and cancellation, including
+  `queue list --history --json`;
+- `audit_legacy.sh --production` output and `verify_gpu_permissions.sh` output
+  before and after reboot;
 - development-profile preflight output, image digest, and `docker inspect`
   security fields;
-- VS Code tunnel logs and cancellation evidence.
+- VS Code tunnel logs and cancellation evidence;
+- operator name, timestamps, and approval reference for every state change.
 
-Abort immediately if an unmanaged container is touched, a GPU is double
-allocated, a non-owner can release, or another user's container/workspace is
-affected.
+## 7. Abort and recovery criteria
+
+Abort the procedure immediately and preserve logs if any of the following
+occurs:
+
+- an unmanaged container is started, stopped, removed, or otherwise modified;
+- a GPU is allocated to more than one allocation;
+- a non-owner can release or stop another user's allocation;
+- another user's container or workspace is affected;
+- a queue request jumps ahead of an unexpired queued request;
+- a security gate fails open;
+- the broker cannot be stopped or restarted cleanly.
+
+After aborting, release only the test allocations created by the harness, remove
+only the harness-created temporary container, and leave existing training
+containers and unmanaged resources untouched. Record the state of the database
+and the test workspace before and after recovery.

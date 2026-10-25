@@ -1,9 +1,14 @@
-# 实验室 GPU 服务器资源管理器 — Vibe Coding 规格
+# 实验室 GPU 服务器资源管理器 — 需求与设计规格
 
-版本：2026-10-22  
-目标执行者：新的独立 coding session  
-部署目标：先只针对 amax 一台服务器  
-当前状态：**不部署**。amax 仍在训练；先完成实现、测试和 monitor-only 验收。
+- 版本：2026-10-22
+- 文档状态：初始需求与设计基线，保留用于追溯设计意图
+- 部署目标：首期仅针对 amax 一台服务器
+- 编写时状态：**不部署**。amax 仍在训练；先完成实现、测试和 monitor-only 验收。
+
+> 本文档描述初始设计目标。当前实施状态、部署边界和验收流程以
+> [README.md](README.md)、[docs/handoff.md](docs/handoff.md) 和
+> [docs/acceptance.md](docs/acceptance.md) 为准。文中“当前状态”均指
+> 2026-10-22 编写时的状态。
 
 ---
 
