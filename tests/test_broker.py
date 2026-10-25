@@ -1785,3 +1785,70 @@ async def test_restored_active_mode_requires_mandatory_gates(tmp_path, monitor_c
     broker, _ = _broker(tmp_path, config)
     response = await _call(broker, "ping", {}, ALICE)
     assert response["data"]["mode"] == "monitor"
+
+
+async def test_double_failure_keeps_resource_claims(tmp_path, active_config):
+    """Identity-init failure AND container removal failure must not release
+    the GPU claims or the storage budget: the orphan may still be running."""
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=1,
+            docker_storage_budget_gb=20,
+        ),
+    )
+    docker = FakeDocker(fail_identity_init=True, fail_remove=True)
+    broker, docker = _broker(tmp_path, config, docker=docker)
+    failed = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert failed["ok"] is False
+    status = await _call(broker, "status", {}, ALICE)
+    assert status["data"]["allocations"][0]["status"] == "cleanup_pending"
+    # The container reference was recorded before initialization, so a
+    # restarted broker can still find the orphan.
+    assert status["data"]["allocations"][0]["container_id"]
+    assert len(docker.initialized_identity) == 0
+
+    # The GPU claim survives: nobody else can take GPU 1.
+    second = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, BOB)
+    assert second["data"]["status"] == "queued"
+    # The writable-layer budget still counts the pending cleanup.
+    third = await _call(broker, "apply", {"gpus": [2], "cpus": 8, "memory_gb": 32}, BOB)
+    assert third["data"]["status"] == "queued"
+
+
+async def test_reconcile_finalizes_cleanup_pending(tmp_path, active_config):
+    from udc_resource import store as store_module
+
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            container_profile="development",
+            container_read_only=False,
+            container_sudo=True,
+            writable_layer_gb=20,
+            min_free_docker_gb=1,
+            docker_storage_budget_gb=20,
+        ),
+    )
+    docker = FakeDocker(fail_identity_init=True, fail_remove=True)
+    broker, docker = _broker(tmp_path, config, docker=docker)
+    failed = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert failed["ok"] is False
+    docker.fail_remove = False
+    docker.fail_identity_init = False
+
+    summary = await asyncio.to_thread(broker.reconcile_once)
+    assert summary["cleanup_retried"] == 1
+    with broker._connection() as connection:
+        rows = store_module.list_allocations(connection, now=broker._now())
+    assert rows[0]["status"] == "failed"
+    # The claim is released only after the container is confirmed gone: GPU 1
+    # can be allocated again immediately.
+    freed = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, BOB)
+    assert freed["data"]["status"] == "active"

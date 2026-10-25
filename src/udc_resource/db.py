@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS allocations (
     owner_uid INTEGER NOT NULL,
     owner_name TEXT NOT NULL,
     status TEXT NOT NULL
-        CHECK (status IN ('pending', 'active', 'released', 'expired', 'failed')),
+        CHECK (status IN ('pending', 'active', 'released', 'expired', 'failed', 'cleanup_pending')),
     image TEXT NOT NULL,
     cpus REAL NOT NULL CHECK (cpus > 0),
     memory_gb INTEGER NOT NULL CHECK (memory_gb > 0),

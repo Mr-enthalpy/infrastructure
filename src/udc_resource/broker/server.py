@@ -2003,6 +2003,19 @@ class Broker:
                     now=self._now(),
                 )
             raise DockerError(f"container creation failed: {exc}") from exc
+        # Record the container reference before any later step can fail, so a
+        # restarted broker can still find and clean up the orphan.
+        try:
+            with self._connection() as connection:
+                store.record_container(
+                    connection,
+                    allocation_id,
+                    container_id=container.id,
+                    container_name=container.name,
+                    now=self._now(),
+                )
+        except Exception:
+            logger.exception("could not record container %s", container.id)
 
         async def _fail_activated_container(step: str, exc: Exception) -> NoReturn:
             logger.exception("%s failed for %s", step, allocation_id)
@@ -2017,14 +2030,27 @@ class Broker:
                     step,
                 )
             with self._connection() as connection:
-                store.fail_allocation(
-                    connection,
-                    allocation_id,
-                    reason=f"{step} failed: {exc}",
-                    now=self._now(),
-                )
+                if cleanup_failed:
+                    # The orphan container may still be running: keep the GPU
+                    # claims and CPU/memory/storage reservations (non-terminal
+                    # state) until reconciliation confirms the removal.
+                    store.mark_cleanup_pending(
+                        connection,
+                        allocation_id,
+                        reason=f"{step} failed: {exc}",
+                        now=self._now(),
+                    )
+                else:
+                    store.fail_allocation(
+                        connection,
+                        allocation_id,
+                        reason=f"{step} failed: {exc}",
+                        now=self._now(),
+                    )
             if cleanup_failed:
-                raise InternalError(f"{step} failed and container cleanup failed") from exc
+                raise InternalError(
+                    f"{step} failed and container cleanup is pending; resources remain reserved"
+                ) from exc
             raise InternalError("allocation could not be activated") from exc
 
         # The container only becomes usable once its member identity exists:

@@ -44,6 +44,9 @@ DEV_CAPABILITIES = (
     "SETGID",
     "SETPCAP",
     "SETUID",
+    # sshd's pre-auth privilege separation chroots into /var/empty; without
+    # CAP_SYS_CHROOT the container sshd dies before the SSH banner.
+    "SYS_CHROOT",
 )
 
 

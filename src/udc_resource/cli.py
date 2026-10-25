@@ -370,7 +370,7 @@ def _managed_config_lock(ssh_config: Path, timeout: float = 15.0):
         os.close(fd)
 
 
-def _sweep_stale_managed_blocks(path: Path) -> int:
+def _sweep_stale_managed_blocks(path: Path, ssh_config: Path | None = None) -> int:
     """Remove managed SSH blocks whose local tunnel port is no longer open.
 
     After a hard kill (or a crashed GUI) a leftover block only ever points at
@@ -396,8 +396,28 @@ def _sweep_stale_managed_blocks(path: Path) -> int:
         return body
 
     updated = pattern.sub(_replace, existing)
-    if removed and updated != existing:
+    if not removed or updated == existing:
+        return removed
+    if updated.strip():
         _atomic_config_write(path, updated)
+        return removed
+    # Every block was stale: drop the file and, when asked, our Include
+    # directive so the user's config returns to its pre-tunnel shape.
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return removed
+    if ssh_config is None:
+        return removed
+    user_config = _config_target(ssh_config)
+    try:
+        user_text = user_config.read_text(encoding="utf-8")
+    except OSError:
+        return removed
+    directive = _include_directive(path)
+    cleaned = re.sub(rf"(?m)^\s*{re.escape(directive)}\n?", "", user_text)
+    if cleaned != user_text:
+        _atomic_config_write(user_config, cleaned)
     return removed
 
 
@@ -549,7 +569,6 @@ def _remove_managed_block(
     ssh_config: Path,
     allocation_id: str,
     *,
-    added_include: bool,
     own_port: int,
 ) -> None:
     """Drop this process's block — unless a newer tunnel for the SAME
@@ -577,18 +596,20 @@ def _remove_managed_block(
             ):
                 return
         updated = pattern.sub("", existing)
+        file_empty = not updated.strip()
         try:
-            if not updated.strip():
+            if file_empty:
                 # ssh tolerates a missing Include target; dropping the empty
-                # file keeps the user's config directory clean. Another
-                # allocation's blocks would keep the file non-empty, so its
-                # Include directive survives.
+                # file keeps the user's config directory clean.
                 managed_file.unlink(missing_ok=True)
             elif updated != existing:
                 _atomic_config_write(managed_file, updated)
         except OSError:
             pass
-        if not added_include:
+        # The Include directive goes only when NO allocation block remains:
+        # another allocation's tunnel may still need it regardless of which
+        # process originally added the directive.
+        if not file_empty:
             return
         user_config = _config_target(ssh_config)
         try:
@@ -700,33 +721,31 @@ async def _probe_container_ssh(host: str, ssh_config: Path, timeout: int) -> Non
     if ssh is None:
         raise RuntimeError("ssh executable is not available")
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                subprocess.run,
-                [
-                    ssh,
-                    "-F",
-                    str(ssh_config),
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    f"ConnectTimeout={max(5, timeout)}",
-                    host,
-                    "/bin/true",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            ),
-            timeout=timeout + 15,
+        process = await asyncio.create_subprocess_exec(
+            ssh,
+            "-F",
+            str(ssh_config),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={max(5, timeout)}",
+            host,
+            "/bin/true",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("container SSH probe timed out") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[:300]
-        raise RuntimeError(f"container SSH probe failed (exit {result.returncode}): {detail}")
+    except OSError as exc:
+        raise RuntimeError(f"cannot start the SSH probe: {exc}") from exc
+    try:
+        _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError:
+        # Cancelling the wait alone would leak the ssh child; kill and reap.
+        process.kill()
+        await process.wait()
+        raise RuntimeError("container SSH probe timed out") from None
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()[:300]
+        raise RuntimeError(f"container SSH probe failed (exit {process.returncode}): {detail}")
 
 
 async def _serve_vscode_tunnel(
@@ -863,10 +882,9 @@ async def _serve_vscode_tunnel(
         raise RuntimeError("could not bind the local VS Code tunnel")
     port = int(sockets[0].getsockname()[1])
     remote_uri = f"vscode-remote://ssh-remote+{host}/workspace"
-    added_include = False
     try:
         block = _managed_block(allocation_id, host, port, username, identity)
-        added_include = _install_managed_block(ssh_config, allocation_id, block)
+        _install_managed_block(ssh_config, allocation_id, block)
         _write_readiness(
             readiness_file,
             "listening",
@@ -938,12 +956,7 @@ async def _serve_vscode_tunnel(
         server.close()
         for process in list(children):
             await _terminate_process(process)
-        _remove_managed_block(
-            ssh_config,
-            allocation_id,
-            added_include=added_include,
-            own_port=port,
-        )
+        _remove_managed_block(ssh_config, allocation_id, own_port=port)
 
 
 def _parse_gpu_indices(raw: str) -> list[int]:
@@ -2152,7 +2165,7 @@ def vscode_command(
     )
     # Blocks from previous hard-killed tunnels would otherwise accumulate:
     # drop the ones whose local listener is already gone.
-    _sweep_stale_managed_blocks(_managed_config_file(config_path))
+    _sweep_stale_managed_blocks(_managed_config_file(config_path), config_path)
     host = f"udc-{allocation_id}"
     try:
         asyncio.run(

@@ -104,6 +104,15 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
   - 队列自动准入前重新执行 GPU 审计与 workspace 配额闸门，与直接申请同等新鲜。
   - GUI 在 Windows 上以 CTRL_BREAK_EVENT 优雅停止隧道子进程（CLI 安装
     SIGBREAK 处理器完成清理），CLI 启动时清扫本地端口已关闭的失效 SSH 配置块。
+  - development profile 的 capabilities 在 cap_drop=ALL 之上精确补回十项，
+    含 sshd 预认证权限分离所需的 SYS_CHROOT；不得以 SYS_ADMIN/--privileged
+    替代。
+  - 容器创建后立即记录 container_id；身份初始化或激活失败且容器清理也失败时，
+    allocation 进入非终态 cleanup_pending：GPU claim 与 CPU/内存/存储预算保持
+    占用，reconcile 周期重试清理并在确认容器消失后 finalize 为 failed。
+  - 托管 SSH 配置的 Include 指令只在托管文件中不再有任何 allocation 块时才
+    移除（跨 allocation 安全）；同一 allocation 的新旧隧道由端口存活判定接管。
+  - VS Code 探测改为可追踪的异步子进程，超时显式 kill 并回收。
   - 容器身份初始化同时建立与宿主 udc-gpu 同 GID 的容器内补充组并把成员加入
     （sshd 登录从容器 /etc/group 重建补充组，docker group_add 只覆盖 exec 路径）；
     验收要求两条登录路径分别检查 `id -G`、`nvidia-smi`、`torch.cuda`。

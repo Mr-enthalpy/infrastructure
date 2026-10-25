@@ -266,7 +266,8 @@ def _check_capacity(
     if writable_layer_gb > 0 and docker_storage_budget_gb > 0:
         containers = int(
             connection.execute(
-                "SELECT COUNT(*) FROM allocations WHERE status IN ('pending', 'active')"
+                "SELECT COUNT(*) FROM allocations "
+                "WHERE status IN ('pending', 'active', 'cleanup_pending')"
             ).fetchone()[0]
         )
         slots = docker_storage_budget_gb // writable_layer_gb
@@ -282,7 +283,7 @@ def _check_capacity(
         SELECT COALESCE(SUM(cpus), 0) AS cpus,
                COALESCE(SUM(memory_gb), 0) AS memory_gb
         FROM allocations
-        WHERE status IN ('pending', 'active')
+        WHERE status IN ('pending', 'active', 'cleanup_pending')
         """
     ).fetchone()
     if float(used["cpus"]) + cpus > max_cpus:
@@ -299,7 +300,7 @@ def _check_capacity(
                COALESCE(SUM(cpus), 0) AS cpus,
                COALESCE(SUM(memory_gb), 0) AS memory_gb
         FROM allocations
-        WHERE owner_uid = ? AND status IN ('pending', 'active')
+        WHERE owner_uid = ? AND status IN ('pending', 'active', 'cleanup_pending')
         """,
         (owner_uid,),
     ).fetchone()
@@ -322,7 +323,7 @@ def _check_capacity(
         connection.execute(
             "SELECT COUNT(*) FROM allocation_gpus AS ag "
             "JOIN allocations AS a ON a.id = ag.allocation_id "
-            "WHERE a.owner_uid = ? AND a.status IN ('pending', 'active')",
+            "WHERE a.owner_uid = ? AND a.status IN ('pending', 'active', 'cleanup_pending')",
             (owner_uid,),
         ).fetchone()[0]
     )
@@ -971,6 +972,86 @@ def fail_allocation(
         raise
 
 
+def record_container(
+    connection: sqlite3.Connection,
+    allocation_id: str,
+    *,
+    container_id: str,
+    container_name: str,
+    now: datetime | None = None,
+) -> None:
+    """Persist the container reference immediately after creation.
+
+    Activation may still fail (identity initialization, cleanup); recording
+    the ID early lets a restarted broker find and clean up the orphan.
+    """
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = _allocation_row(connection, allocation_id)
+        if row["status"] not in ("pending", "active"):
+            raise Conflict(f"allocation {allocation_id} is not pending or active")
+        connection.execute(
+            "UPDATE allocations SET container_id = ?, container_name = ? WHERE id = ?",
+            (container_id, container_name, allocation_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def mark_cleanup_pending(
+    connection: sqlite3.Connection,
+    allocation_id: str,
+    *,
+    reason: str,
+    now: datetime | None = None,
+) -> None:
+    """Mark an allocation as awaiting container cleanup.
+
+    Unlike fail_allocation this keeps the GPU claims and the CPU/memory/
+    storage reservations: the Docker container could not be removed and may
+    still be running, so releasing resources here would under-count them.
+    Reconciliation retries the removal and finalizes with fail_allocation
+    once the container is confirmed gone.
+    """
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = _allocation_row(connection, allocation_id)
+        if row["status"] not in ("pending", "active"):
+            raise Conflict(f"allocation {allocation_id} is not pending or active")
+        connection.execute(
+            "UPDATE allocations SET status = 'cleanup_pending' WHERE id = ?",
+            (allocation_id,),
+        )
+        record_event(
+            connection,
+            actor_uid=int(row["owner_uid"]),
+            action="allocation_cleanup_pending",
+            allocation_id=allocation_id,
+            detail={"reason": reason},
+            now=now,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def list_cleanup_pending(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    current = now or utcnow()
+    rows = connection.execute(
+        "SELECT * FROM allocations WHERE status = 'cleanup_pending' ORDER BY created_at ASC, id",
+    ).fetchall()
+    return [allocation_to_dict(connection, row, now=current) for row in rows]
+
+
 def _finish_allocation(
     connection: sqlite3.Connection,
     allocation_id: str,
@@ -1103,7 +1184,7 @@ def list_allocation_events(
 
 def active_lease_count(connection: sqlite3.Connection) -> int:
     row = connection.execute(
-        "SELECT COUNT(*) FROM allocations WHERE status IN ('pending', 'active')"
+        "SELECT COUNT(*) FROM allocations WHERE status IN ('pending', 'active', 'cleanup_pending')"
     ).fetchone()
     return int(row[0]) if row else 0
 

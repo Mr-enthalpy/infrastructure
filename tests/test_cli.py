@@ -638,7 +638,7 @@ def test_managed_include_wins_over_host_wildcard(tmp_path, monkeypatch):
         assert values.get("user") == "alice"
         assert values.get("port") == "22222"
     finally:
-        cli._remove_managed_block(user_config, "abc123", added_include=True, own_port=22222)
+        cli._remove_managed_block(user_config, "abc123", own_port=22222)
     text = user_config.read_text(encoding="utf-8")
     assert "udc-vscode-config" not in text
 
@@ -660,14 +660,14 @@ def test_vscode_config_removal_respects_live_block(tmp_path):
 
         # A newer process overwrote the port and is still running: the older
         # process (own_port is dead) must leave the block alone.
-        cli._remove_managed_block(config, "abc123", added_include=True, own_port=1)
+        cli._remove_managed_block(config, "abc123", own_port=1)
         managed = config.parent / "udc-vscode-config"
         assert "udc-abc123" in managed.read_text(encoding="utf-8")
         assert "udc-vscode-config" in config.read_text(encoding="utf-8")
 
         # Once the port is dead the block is stale and gets removed along
         # with the Include directive we added.
-        cli._remove_managed_block(config, "abc123", added_include=True, own_port=live_port)
+        cli._remove_managed_block(config, "abc123", own_port=live_port)
         assert not managed.exists() or "udc-abc123" not in managed.read_text(encoding="utf-8")
         assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
     finally:
@@ -815,3 +815,73 @@ def test_attach_is_never_relayed(tmp_path, monkeypatch):
     )
     runner.invoke(cli.app, ["--config", str(CONFIG), "job", "attach", "alloc-1"])
     assert calls == []
+
+
+def test_vscode_config_include_survives_other_allocation(tmp_path):
+    """Closing allocation A must not strand allocation B's tunnel alias."""
+    config = tmp_path / "config"
+    block_a = cli._managed_block("aaaa", "udc-aaaa", 22001, "alice", None)
+    block_b = cli._managed_block("bbbb", "udc-bbbb", 22002, "alice", None)
+    assert cli._install_managed_block(config, "aaaa", block_a) is True
+    assert cli._install_managed_block(config, "bbbb", block_b) is False
+
+    # A exits: its block goes, but B's block keeps the file non-empty, so the
+    # Include directive must survive.
+    cli._remove_managed_block(config, "aaaa", own_port=22001)
+    managed = config.parent / "udc-vscode-config"
+    text = config.read_text(encoding="utf-8")
+    assert "udc-vscode-config" in text
+    assert "udc-bbbb" in managed.read_text(encoding="utf-8")
+
+    # B exits last: the file empties and the Include goes with it.
+    cli._remove_managed_block(config, "bbbb", own_port=22002)
+    assert not managed.exists() or "udc-bbbb" not in managed.read_text(encoding="utf-8")
+    assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
+
+
+def test_sweep_clears_include_when_all_blocks_stale(tmp_path):
+    config = tmp_path / "config"
+    block = cli._managed_block("cccc", "udc-cccc", 1, "alice", None)
+    cli._install_managed_block(config, "cccc", block)
+    removed = cli._sweep_stale_managed_blocks(
+        config.parent / "udc-vscode-config",
+        config,
+    )
+    assert removed == 1
+    assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
+
+
+def test_probe_timeout_kills_ssh_child(tmp_path, monkeypatch):
+    """A probe timeout must terminate and reap the ssh child process."""
+
+    class FakeAsyncProcess:
+        def __init__(self):
+            self.killed = False
+            self.reaped = False
+            self.returncode = None
+
+        async def communicate(self):
+            import asyncio as asyncio_module
+
+            await asyncio_module.sleep(30)
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.reaped = True
+            return -9
+
+    fake = FakeAsyncProcess()
+
+    async def fake_exec(*argv, **kwargs):
+        return fake
+
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", fake_exec)
+    import asyncio as asyncio_module
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio_module.run(cli._probe_container_ssh("udc-x", tmp_path / "config", 1))
+    assert fake.killed and fake.reaped

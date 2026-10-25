@@ -252,13 +252,14 @@ Procedure (one allocated test GPU, one test member):
 5. Restore the original mode/owner on the host node immediately and verify
    with `diff before.txt after-restored.txt`.
 
-Record the complete transcript. If container root can mutate host nodes, note
-it in the acceptance report together with the compensating controls that must
-then be treated as load-bearing: the continuous GPU-permission audit (device
-fingerprint changes block new allocations), the absence of host mounts and
-Docker socket in the container, and workspace `nosuid`. Evaluate a
-`userns-remap` configuration as a follow-up; do not enable it without the
-dedicated verification listed in the handoff.
+Record the complete transcript. If container root can mutate host device
+nodes, member rollout of the development profile is BLOCKED: the periodic
+GPU audit is a compensating detection-and-admission control only — it cannot
+protect tasks that are already running on an affected node. In that case a
+stronger isolation mechanism (user namespace remapping or equivalent) must be
+implemented and re-verified before the development profile is opened, and the
+absence of host mounts, Docker socket, and workspace `nosuid` remain
+load-bearing requirements regardless.
 
 ### 5.7 Closed gates
 

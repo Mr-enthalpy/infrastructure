@@ -36,6 +36,8 @@ def reconcile(
         "orphaned": 0,
         "list_failed": 0,
         "unsafe_skipped": 0,
+        "cleanup_retried": 0,
+        "cleanup_failed": 0,
     }
     try:
         containers = docker.list_containers()
@@ -96,6 +98,82 @@ def reconcile(
             summary["pending_failed"] += 1
         except Exception:
             logger.exception("could not fail stale pending allocation %s", allocation["id"])
+
+    # Allocations whose container cleanup failed earlier keep their resource
+    # reservations; retry the removal and finalize only once the container is
+    # confirmed gone.
+    cleanup_pending = store.list_cleanup_pending(connection, now=current)
+    for allocation in cleanup_pending:
+        allocation_id = str(allocation["id"])
+        container_id = str(allocation["container_id"] or "")
+        if not container_id:
+            # Nothing to clean up (should not happen); finalize directly.
+            try:
+                store.fail_allocation(
+                    connection,
+                    allocation_id,
+                    reason=str(allocation["note"] or "cleanup pending without container"),
+                    now=current,
+                )
+                summary["cleanup_retried"] += 1
+            except Exception:
+                logger.exception("could not finalize cleanup for %s", allocation_id)
+                summary["cleanup_failed"] += 1
+            continue
+        candidates = list(by_allocation.get(allocation_id, []))
+        direct = by_id.get(container_id)
+        if direct is not None and direct not in candidates:
+            candidates.append(direct)
+        unsafe = [
+            container
+            for container in candidates
+            if not matches_managed_allocation(container, allocation_id, container_id)
+        ]
+        if unsafe:
+            summary["cleanup_failed"] += 1
+            logger.critical(
+                "refusing to clean cleanup_pending allocation %s: container identity mismatch",
+                allocation_id,
+            )
+            continue
+        if not candidates:
+            # Container is gone from Docker already; safe to finalize.
+            try:
+                store.fail_allocation(
+                    connection,
+                    allocation_id,
+                    reason="container removed after cleanup failure",
+                    now=current,
+                )
+                summary["cleanup_retried"] += 1
+            except Exception:
+                logger.exception("could not finalize cleanup for %s", allocation_id)
+                summary["cleanup_failed"] += 1
+            continue
+        removed_ok = True
+        for container in candidates:
+            try:
+                docker.remove_container(container.id)
+            except Exception:
+                removed_ok = False
+                logger.exception(
+                    "cleanup retry could not remove container %s",
+                    container.id,
+                )
+        if not removed_ok:
+            summary["cleanup_failed"] += 1
+            continue
+        try:
+            store.fail_allocation(
+                connection,
+                allocation_id,
+                reason="container cleaned after activation failure",
+                now=current,
+            )
+            summary["cleanup_retried"] += 1
+        except Exception:
+            logger.exception("could not finalize cleanup for %s", allocation_id)
+            summary["cleanup_failed"] += 1
 
     active = store.list_allocations(connection, statuses=("active",), now=current)
     for allocation in active:
