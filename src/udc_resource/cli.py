@@ -390,9 +390,10 @@ def _atomic_config_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         # Windows OpenSSH refuses SSH config files carrying the OWNER RIGHTS
-        # ACE that tempfile.mkstemp adds on modern CPython. Create the temp
-        # file with plain open() instead so it inherits the parent directory's
-        # ACL (user + SYSTEM + Administrators), which ssh accepts.
+        # ACE (S-1-3-4) that CPython's tempfile hardening can leave behind.
+        # Whatever the source, set an explicit ACL after the atomic rename:
+        # only the current user, SYSTEM, and Administrators — exactly what
+        # ssh's permission check accepts.
         temp_path = path.parent / f"{path.name}.{os.getpid()}.{secrets.token_hex(8)}.udc-tmp"
         try:
             fd = os.open(
@@ -403,6 +404,25 @@ def _atomic_config_write(path: Path, text: str) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(text)
             os.replace(temp_path, path)
+            username = os.environ.get("USERNAME", "")
+            if username:
+                subprocess.run(
+                    [
+                        "icacls",
+                        str(path),
+                        "/inheritance:r",
+                        "/grant:r",
+                        f"{username}:F",
+                        "/grant:r",
+                        "SYSTEM:F",
+                        "/grant:r",
+                        "Administrators:F",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                )
         except BaseException:
             try:
                 temp_path.unlink(missing_ok=True)
