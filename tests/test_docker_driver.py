@@ -791,11 +791,14 @@ def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_pat
     script = fake_client.api.exec_create_kwargs["cmd"][2]
     assert "udc-gpu:x:64000:alice" in script
     assert 'grep -q "^[^:]*:[^:]*:64000:" /etc/group' in script
+    # Write the script to an LF file instead of piping via stdin: Windows
+    # text-mode pipes translate newlines and some bash builds choke on CRLF.
+    script_file = tmp_path / "identity.sh"
+    script_file.write_text(script, encoding="utf-8", newline="\n")
     proc = subprocess.run(
-        ["bash", "-n"],
-        input=script,
-        text=True,
+        ["bash", "-n", str(script_file)],
         capture_output=True,
+        text=True,
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
