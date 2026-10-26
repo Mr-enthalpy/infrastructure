@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from udc_resource.broker import workspace_io
-from udc_resource.errors import BadRequest, Forbidden
+from citespec_resource.broker import workspace_io
+from citespec_resource.errors import BadRequest, Forbidden
 
 requires_linux = pytest.mark.skipif(
     not workspace_io.supported(),
@@ -62,7 +62,7 @@ def test_atomic_upload_creates_directories_and_replaces(tmp_path: Path):
     upload.commit()
 
     assert destination.read_bytes() == b"new"
-    assert not list(destination.parent.glob(".udc-upload-*"))
+    assert not list(destination.parent.glob(".citespec-upload-*"))
     assert workspace_io.regular_file_size(workspace, ("nested", "model.bin")) == 3
 
 
@@ -74,7 +74,7 @@ def test_upload_abort_cleans_temporary_file(tmp_path: Path):
     os.write(upload.fd, b"partial")
     upload.abort()
     assert not (workspace / "new" / "file.bin").exists()
-    assert not list((workspace / "new").glob(".udc-upload-*"))
+    assert not list((workspace / "new").glob(".citespec-upload-*"))
 
 
 @requires_linux
@@ -108,19 +108,19 @@ def test_job_logs_are_regular_and_symlink_safe(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     workspace_io.ensure_job_log(workspace, "train")
-    log = workspace / ".udc-logs" / "train.log"
+    log = workspace / ".citespec-logs" / "train.log"
     assert log.is_file()
     log.write_text("line 1\nline 2\n", encoding="utf-8")
-    assert workspace_io.regular_file_size(workspace, (".udc-logs", "train.log")) == 14
-    assert workspace_io.tail_file(workspace, (".udc-logs", "train.log"), 1) == "line 2\n"
+    assert workspace_io.regular_file_size(workspace, (".citespec-logs", "train.log")) == 14
+    assert workspace_io.tail_file(workspace, (".citespec-logs", "train.log"), 1) == "line 2\n"
 
     with pytest.raises(BadRequest):
         workspace_io.ensure_job_log(workspace, "../escape")
 
     fifo_workspace = tmp_path / "fifo-workspace"
     fifo_workspace.mkdir()
-    (fifo_workspace / ".udc-logs").mkdir()
-    os.mkfifo(fifo_workspace / ".udc-logs" / "train.log")
+    (fifo_workspace / ".citespec-logs").mkdir()
+    os.mkfifo(fifo_workspace / ".citespec-logs" / "train.log")
     with pytest.raises(Forbidden):
         workspace_io.ensure_job_log(fifo_workspace, "train")
 
@@ -128,6 +128,6 @@ def test_job_logs_are_regular_and_symlink_safe(tmp_path: Path):
     linked_workspace.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    (linked_workspace / ".udc-logs").symlink_to(outside, target_is_directory=True)
+    (linked_workspace / ".citespec-logs").symlink_to(outside, target_is_directory=True)
     with pytest.raises(Forbidden):
         workspace_io.ensure_job_log(linked_workspace, "train")

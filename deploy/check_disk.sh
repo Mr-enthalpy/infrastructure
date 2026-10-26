@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-ROOT=/data1
+ROOT=/home/data1/citespec-users
 WARN_PERCENT=85
 CRIT_PERCENT=95
 MIN_FREE_GB=0
@@ -13,7 +13,7 @@ usage() {
 usage: check_disk.sh [options]
 
 Options:
-  --path PATH          Workspace/data path to inspect (default: /data1).
+  --path PATH          Workspace/data path to inspect (default: /home/data1/citespec-users).
   --warn-percent N     Warning threshold (default: 85).
   --crit-percent N     Critical threshold (default: 95).
   --min-free-gb N      Minimum free GiB before failure (default: 0).

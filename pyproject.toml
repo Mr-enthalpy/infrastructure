@@ -3,9 +3,9 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "udc-resource"
+name = "citespec-resource"
 version = "0.1.0"
-description = "Timed, non-preemptive shared GPU resource broker for the UDC lab"
+description = "Timed, non-preemptive shared GPU resource broker for the Citespec lab"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,20 +24,23 @@ dev = [
   "ruff>=0.6",
   "mypy>=1.10",
 ]
+browser = [
+  "playwright>=1.45",
+]
 
 [project.scripts]
-udc-resource = "udc_resource.cli:app"
-udc-resource-login = "udc_resource.login_wrapper:main"
+citespec-resource = "citespec_resource.cli:app"
+citespec-resource-login = "citespec_resource.login_wrapper:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["udc_resource*"]
+include = ["citespec_resource*"]
 
 [tool.setuptools.package-data]
-udc_resource = ["gui/static/**/*"]
+citespec_resource = ["gui/static/**/*", "enrollment/static/**/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -56,7 +59,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-"src/udc_resource/cli.py" = ["B008"]
+"src/citespec_resource/cli.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.11"

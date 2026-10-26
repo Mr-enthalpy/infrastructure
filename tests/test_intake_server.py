@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from udc_resource.enrollment import server as intake_server
-from udc_resource.enrollment import store as intake_store
+from citespec_resource.enrollment import server as intake_server
+from citespec_resource.enrollment import store as intake_store
 
 ONBOARDING = {
     "guide_url": "https://lab.example.invalid/compute",
@@ -83,14 +83,23 @@ async def test_submit_with_valid_invitation_returns_receipt_once(client, intake_
     receipt = payload["data"]["receipt_secret"]
     assert request_id and receipt
 
-    # Status requires the receipt; guessing ids yields 404 (AC-09).
-    ok = await client.get(f"/api/requests/{request_id}?receipt={receipt}")
+    # Status requires the receipt in a POST body; guessing ids yields 404
+    # (AC-09) and a receipt in the URL is not a supported route at all.
+    ok = await client.post(
+        "/api/requests/status", json={"request_id": request_id, "receipt": receipt}
+    )
     assert ok.status == 200
     assert (await ok.json())["data"]["status"] == "pending_review"
-    bad = await client.get(f"/api/requests/{request_id}?receipt=wrong")
+    bad = await client.post(
+        "/api/requests/status", json={"request_id": request_id, "receipt": "wrong"}
+    )
     assert bad.status == 404
-    guessed = await client.get("/api/requests/000000?receipt=x")
+    guessed = await client.post(
+        "/api/requests/status", json={"request_id": "000000", "receipt": "x"}
+    )
     assert guessed.status == 404
+    url_leak = await client.get(f"/api/requests/{request_id}?receipt={receipt}")
+    assert url_leak.status == 404
 
 
 async def test_private_key_submission_is_rejected_cleanly(client, intake_db):
@@ -119,6 +128,44 @@ async def test_oversized_body_is_rejected(client):
         headers={"Content-Type": "application/json"},
     )
     assert response.status in (400, 413)
+
+
+async def test_public_html_intake_page_is_served_with_security_headers(client):
+    response = await client.get("/")
+    assert response.status == 200
+    assert "text/html" in response.headers["Content-Type"]
+    body = await response.text()
+    assert "申请使用共享 GPU 资源" in body
+    assert 'id="apply-form"' in body
+    assert 'id="status-form"' in body
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+    assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
+
+
+async def test_submit_rate_limit_is_enforced(intake_db):
+    app = intake_server.create_app(
+        requests_db=intake_db,
+        onboarding=ONBOARDING,
+        rate_limits={"submit": (1, 60.0), "status": (1, 60.0), "cancel": (1, 60.0)},
+    )
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        first = await client.post(
+            "/api/requests",
+            json={"invite_id": "x", "invite_secret": "y", "application": {}},
+        )
+        assert first.status == 400
+        second = await client.post(
+            "/api/requests",
+            json={"invite_id": "x", "invite_secret": "y", "application": {}},
+        )
+        assert second.status == 429
+        assert second.headers["Retry-After"] == "60"
+    finally:
+        await client.close()
 
 
 async def test_cancel_with_receipt(client, intake_db):

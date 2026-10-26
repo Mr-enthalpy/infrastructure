@@ -6,17 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from citespec_resource import store
+from citespec_resource.broker import workspace_io
+from citespec_resource.broker.docker_driver import ContainerInfo, GPUProcess
+from citespec_resource.broker.server import Broker
+from citespec_resource.db import connect, init_db
+from citespec_resource.gpu_audit import GpuAuditResult
+from citespec_resource.identity import Identity
+from citespec_resource.legacy_audit import LegacyAuditResult
+from citespec_resource.models import GPU
+from citespec_resource.workspace_quota import QuotaCheckResult
 from tests.fakes import FakeDocker, FakeIdentityResolver, FakeShellSession
-from udc_resource import store
-from udc_resource.broker import workspace_io
-from udc_resource.broker.docker_driver import ContainerInfo, GPUProcess
-from udc_resource.broker.server import Broker
-from udc_resource.db import connect, init_db
-from udc_resource.gpu_audit import GpuAuditResult
-from udc_resource.identity import Identity
-from udc_resource.legacy_audit import LegacyAuditResult
-from udc_resource.models import GPU
-from udc_resource.workspace_quota import QuotaCheckResult
 
 FIXED = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 ALICE = Identity(uid=1000, gid=1000, username="alice", role="member", is_admin=False)
@@ -25,7 +25,7 @@ ADMIN = Identity(uid=0, gid=0, username="root", role="admin", is_admin=True)
 
 
 def _passing_member_quota(workspace, uid, limit):
-    from udc_resource.workspace_quota import MemberQuotaResult
+    from citespec_resource.workspace_quota import MemberQuotaResult
 
     return MemberQuotaResult(
         True,
@@ -45,6 +45,7 @@ def _broker(
     quota_check=None,
     member_quota_check=None,
     member_quota_provision=None,
+    provisioning=None,
     clock=None,
 ):
     fake_docker = docker or FakeDocker()
@@ -67,6 +68,7 @@ def _broker(
         or (lambda: QuotaCheckResult(True, "filesystem supports project quotas")),
         member_quota_check=member_quota_check or _passing_member_quota,
         member_quota_provision=member_quota_provision or _passing_member_quota,
+        provisioning=provisioning,
         clock=clock or (lambda: FIXED),
     )
     broker.initialize()
@@ -315,34 +317,34 @@ def test_managed_container_match_requires_container_owner_and_gpus(tmp_path, act
     }
     container = ContainerInfo(
         id="container-1",
-        name="udc-alice",
-        image="udc-base:2026.10",
+        name="citespec-alice",
+        image="citespec-base:2026.10",
         status="running",
         labels={
-            "udc.managed": "true",
-            "udc.allocation": "alloc-1",
-            "udc.owner": "alice",
+            "citespec.managed": "true",
+            "citespec.allocation": "alloc-1",
+            "citespec.owner": "alice",
         },
         gpu_refs=("GPU-1",),
     )
     assert broker._managed_container_matches(container, allocations, gpus) is True
     wrong_owner = ContainerInfo(
         id="container-1",
-        name="udc-alice",
-        image="udc-base:2026.10",
+        name="citespec-alice",
+        image="citespec-base:2026.10",
         status="running",
         labels={
-            "udc.managed": "true",
-            "udc.allocation": "alloc-1",
-            "udc.owner": "bob",
+            "citespec.managed": "true",
+            "citespec.allocation": "alloc-1",
+            "citespec.owner": "bob",
         },
         gpu_refs=("GPU-1",),
     )
     assert broker._managed_container_matches(wrong_owner, allocations, gpus) is False
     wrong_container = ContainerInfo(
         id="container-2",
-        name="udc-alice",
-        image="udc-base:2026.10",
+        name="citespec-alice",
+        image="citespec-base:2026.10",
         status="running",
         labels=container.labels,
         gpu_refs=("GPU-1",),
@@ -350,8 +352,8 @@ def test_managed_container_match_requires_container_owner_and_gpus(tmp_path, act
     assert broker._managed_container_matches(wrong_container, allocations, gpus) is False
     wrong_gpu = ContainerInfo(
         id="container-1",
-        name="udc-alice",
-        image="udc-base:2026.10",
+        name="citespec-alice",
+        image="citespec-base:2026.10",
         status="running",
         labels=container.labels,
         gpu_refs=("GPU-2",),
@@ -838,13 +840,13 @@ async def test_release_pending_allocation_removes_container_by_label(tmp_path, a
     fake.add_container(
         ContainerInfo(
             id="pending-container",
-            name="udc-alice-pending",
+            name="citespec-alice-pending",
             image=active_config.image.base,
             status="running",
             labels={
-                "udc.managed": "true",
-                "udc.owner": ALICE.username,
-                "udc.allocation": allocation_id,
+                "citespec.managed": "true",
+                "citespec.owner": ALICE.username,
+                "citespec.allocation": allocation_id,
             },
         )
     )
@@ -901,7 +903,7 @@ async def test_monitor_mode_does_not_stop_or_reconcile(tmp_path, monitor_config)
             connection,
             allocation_id,
             container_id="existing-container",
-            container_name="udc-alice-existing",
+            container_name="citespec-alice-existing",
             now=FIXED.replace(hour=0),
         )
     finally:
@@ -909,13 +911,13 @@ async def test_monitor_mode_does_not_stop_or_reconcile(tmp_path, monitor_config)
     fake.add_container(
         ContainerInfo(
             id="existing-container",
-            name="udc-alice-existing",
+            name="citespec-alice-existing",
             image=monitor_config.image.base,
             status="running",
             labels={
-                "udc.managed": "true",
-                "udc.owner": ALICE.username,
-                "udc.allocation": allocation_id,
+                "citespec.managed": "true",
+                "citespec.owner": ALICE.username,
+                "citespec.allocation": allocation_id,
             },
         )
     )
@@ -1143,7 +1145,7 @@ async def test_initialize_promotes_monitor_with_lease_to_maintenance(tmp_path, m
             connection,
             allocation_id,
             container_id="existing-container",
-            container_name="udc-alice-existing",
+            container_name="citespec-alice-existing",
             now=FIXED.replace(hour=0),
         )
     finally:
@@ -1292,10 +1294,10 @@ async def test_job_lifecycle(tmp_path, active_config):
         ALICE,
     )
     assert started["ok"] is True
-    assert started["data"]["session"] == "udc-train"
+    assert started["data"]["session"] == "citespec-train"
     assert "train" in fake.jobs[container_id]
     log_path = (
-        Path(active_config.server.workspace_root) / ALICE.username / ".udc-logs" / "train.log"
+        Path(active_config.server.workspace_root) / ALICE.username / ".citespec-logs" / "train.log"
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_bytes(b"epoch 1\nepoch 2\n")
@@ -1310,7 +1312,7 @@ async def test_job_lifecycle(tmp_path, active_config):
 
 
 async def test_apply_verifies_and_self_heals_member_quota(tmp_path, active_config):
-    from udc_resource.workspace_quota import MemberQuotaResult
+    from citespec_resource.workspace_quota import MemberQuotaResult
 
     config = replace(
         active_config,
@@ -1352,7 +1354,7 @@ async def test_apply_blocks_when_member_quota_cannot_be_enforced(
     active_config,
     monkeypatch,
 ):
-    from udc_resource.workspace_quota import MemberQuotaResult
+    from citespec_resource.workspace_quota import MemberQuotaResult
 
     config = replace(
         active_config,
@@ -1584,7 +1586,7 @@ async def test_job_files_survive_release(tmp_path, active_config):
     broker, _ = _broker(tmp_path, active_config)
     applied = await _call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, ALICE)
     allocation_id = applied["data"]["id"]
-    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".udc-logs"
+    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".citespec-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "train.log").write_bytes(b"epoch 1\nepoch 2\n")
     released = await _call(broker, "release", {"id": allocation_id}, ALICE)
@@ -1606,7 +1608,7 @@ async def test_job_logs_survive_release(tmp_path, active_config):
     broker, _ = _broker(tmp_path, active_config)
     applied = await _call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, ALICE)
     allocation_id = applied["data"]["id"]
-    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".udc-logs"
+    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".citespec-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "train.log").write_bytes(b"epoch 1\nepoch 2\n")
     released = await _call(broker, "release", {"id": allocation_id}, ALICE)
@@ -1765,8 +1767,8 @@ async def test_admin_mode_active_requires_mandatory_gates(tmp_path, monitor_conf
 
 async def test_restored_active_mode_requires_mandatory_gates(tmp_path, monitor_config):
     """A persisted active mode must not survive a policy that lost its gates."""
-    from udc_resource import store
-    from udc_resource.db import init_db
+    from citespec_resource import store
+    from citespec_resource.db import init_db
 
     config = replace(
         monitor_config,
@@ -1822,7 +1824,7 @@ async def test_double_failure_keeps_resource_claims(tmp_path, active_config):
 
 
 async def test_reconcile_finalizes_cleanup_pending(tmp_path, active_config):
-    from udc_resource import store as store_module
+    from citespec_resource import store as store_module
 
     config = replace(
         active_config,

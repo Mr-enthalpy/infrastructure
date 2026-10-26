@@ -1,0 +1,42 @@
+[Unit]
+Description=Citespec membership provisioning executor (root, fixed actions only)
+After=network.target
+# A normal import can emit inspect/provision requests in a short burst. Do not
+# let systemd's default start limit reject a legitimate request.
+StartLimitIntervalSec=0
+
+[Service]
+# Goal member-onboarding-and-ux.md §8.2: narrow root-owned executor. It reads
+# one request JSON per invocation (fixed actions, field whitelist) via the
+# spool directory the broker writes into, and never accepts shell strings,
+# arbitrary paths, UIDs, groups, or unit names.
+Type=oneshot
+Environment=CITESPEC_RESOURCE_WORKSPACE_ROOT=/home/data1/citespec-users
+ExecStart=/opt/citespec-resource/.venv/bin/python /usr/local/libexec/citespec-resource/provision_executor.py --spool /var/lib/citespec-resource/provision
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+# The executor must scrub legacy ~/.ssh/authorized_keys and create/verify member
+# homes, so it needs real access to /home. It is not a general root shell: fixed
+# argv only, no network, no arbitrary paths or names from the broker.
+ProtectHome=false
+ReadWritePaths=/etc /home /home/data1/citespec-users /var/lib/citespec-resource/provision
+PrivateTmp=true
+# The fixed executor must run setquota(8) against the workspace block device.
+# PrivateDevices would hide /dev/sdb1 and make project-quota provisioning fail.
+PrivateDevices=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+# No network needed for account/key/quota work.
+
+[Install]
+WantedBy=multi-user.target

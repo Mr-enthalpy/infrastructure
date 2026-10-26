@@ -27,10 +27,10 @@ lab owner has approved deployment.
 | Data volume | `/data1` (shared volume; usage changes) |
 | Docker | 28.1.1 observed previously |
 | Python | 3.10.12 observed previously; deployment baseline is 3.12 |
-| Workspace root | `/data1/udc-users`; created by the installer |
-| Broker socket | `/run/udc-resource/broker.sock` |
-| Broker state | `/var/lib/udc-resource/state.db` |
-| Base image | `udc-base:2026.10` |
+| Workspace root | `/data1/citespec-users`; created by the installer |
+| Broker socket | `/run/citespec-resource/broker.sock` |
+| Broker state | `/var/lib/citespec-resource/state.db` |
+| Base image | `citespec-base:2026.10` |
 
 The GPU workload observed on 2026-10-22 at approximately 17:03 CST was a
 transient snapshot, not a reservation. It must not be used as current state.
@@ -43,7 +43,7 @@ Query `nvidia-smi` and the broker before launching any workload.
 - Use `deploy/install_server.sh --dry-run` before a real `--yes` installation.
   The installer does not create allocations and initially enforces monitor mode.
 - Use `deploy/create_user.sh` for member and administrator accounts.
-  Administrators must not be members of `udc-members`.
+  Administrators must not be members of `citespec-members`.
 - Use `deploy/verify_monitor_only.sh --member <user>` for the read-only
   monitor-only acceptance window.
 - The host Python is 3.10.12. Install Python 3.12 through `uv` or the deadsnakes
@@ -61,7 +61,7 @@ Query `nvidia-smi` and the broker before launching any workload.
 
 - Members have independent Linux accounts and no `sudo`, Docker, or GPU device
   group membership.
-- Member SSH is restricted by `ForceCommand` to the `udc-resource` CLI.
+- Member SSH is restricted by `ForceCommand` to the `citespec-resource` CLI.
 - The broker runs as root through systemd and is the only component with Docker
   access.
 - GPU device ACLs and forced-command configuration must be verified on the

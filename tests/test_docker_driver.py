@@ -10,17 +10,17 @@ from types import SimpleNamespace
 import pytest
 from docker.errors import NotFound
 
-from udc_resource.broker import docker_driver
-from udc_resource.broker.docker_driver import DockerDriver, DockerTunnelSession
-from udc_resource.errors import DockerError
-from udc_resource.models import Allocation
+from citespec_resource.broker import docker_driver
+from citespec_resource.broker.docker_driver import DockerDriver, DockerTunnelSession
+from citespec_resource.errors import DockerError
+from citespec_resource.models import Allocation
 
 
 class FakeContainer:
     def __init__(
         self,
         container_id: str = "container-1",
-        name: str = "udc-alice-test",
+        name: str = "citespec-alice-test",
         status: str = "running",
         labels: dict[str, str] | None = None,
     ) -> None:
@@ -28,7 +28,7 @@ class FakeContainer:
         self.name = name
         self.status = status
         self.attrs = {
-            "Config": {"Labels": labels or {}, "Image": "udc-base:2026.10"},
+            "Config": {"Labels": labels or {}, "Image": "citespec-base:2026.10"},
             "State": {"Status": status},
         }
         self.stopped = False
@@ -50,7 +50,7 @@ class FakeContainers:
         self.run_kwargs = kwargs
         container = FakeContainer(
             container_id="new-container",
-            name=kwargs.get("name", "udc-test"),
+            name=kwargs.get("name", "citespec-test"),
             labels=kwargs.get("labels"),
         )
         self.items[container.id] = container
@@ -133,7 +133,7 @@ def _allocation(tmp_path: Path) -> Allocation:
         gpus=("GPU-3", "GPU-5"),
         cpus=8.0,
         memory_gb=32,
-        image="udc-base:2026.10",
+        image="citespec-base:2026.10",
         workspace=str(tmp_path / "alice"),
         note="",
         starts_at=datetime(2026, 10, 22, tzinfo=UTC),
@@ -172,11 +172,11 @@ def test_create_container_uses_expected_isolation(monkeypatch, active_config, tm
     assert kwargs is not None
     assert kwargs["command"] == ["sleep", "infinity"]
     assert kwargs["labels"] == {
-        "udc.managed": "true",
-        "udc.owner": "alice",
-        "udc.allocation": allocation.id,
-        "udc.gpus": "GPU-3,GPU-5",
-        "udc.profile": "restricted",
+        "citespec.managed": "true",
+        "citespec.owner": "alice",
+        "citespec.allocation": allocation.id,
+        "citespec.gpus": "GPU-3,GPU-5",
+        "citespec.profile": "restricted",
     }
     assert kwargs["nano_cpus"] == 8_000_000_000
     assert kwargs["mem_limit"] == "32g"
@@ -227,7 +227,7 @@ def test_development_profile_creates_disposable_admin_container(active_config, t
     assert "SETUID" in kwargs["cap_add"]
     assert "SETGID" in kwargs["cap_add"]
     assert kwargs["storage_opt"] == {"size": "20G"}
-    assert kwargs["labels"]["udc.profile"] == "development"
+    assert kwargs["labels"]["citespec.profile"] == "development"
     assert kwargs["environment"]["HOME"] == "/home/alice"
     # Default HOME lives in the quota-bounded writable layer, not a tmpfs.
     assert "/home/alice" not in kwargs["tmpfs"]
@@ -521,11 +521,11 @@ def test_list_and_get_containers(active_config):
     fake_client = FakeClient()
     driver._client = fake_client
     fake_client.containers.items["container-1"] = FakeContainer(
-        labels={"udc.managed": "true", "udc.allocation": "alloc-1"}
+        labels={"citespec.managed": "true", "citespec.allocation": "alloc-1"}
     )
     containers = driver.list_containers()
     assert len(containers) == 1
-    assert containers[0].labels["udc.allocation"] == "alloc-1"
+    assert containers[0].labels["citespec.allocation"] == "alloc-1"
     assert driver.get_container("container-1") is not None
     assert driver.get_container("missing") is None
 
@@ -577,7 +577,7 @@ def test_create_cpu_only_container_omits_device_requests(active_config, tmp_path
     kwargs = fake_client.containers.run_kwargs
     assert kwargs is not None
     assert "device_requests" not in kwargs
-    assert kwargs["labels"]["udc.gpus"] == ""
+    assert kwargs["labels"]["citespec.gpus"] == ""
 
 
 class FakeShellSocket:
@@ -738,13 +738,13 @@ def test_start_job_uses_tmux_and_workspace_log(active_config):
     driver.start_job("container-1", "train", ["python", "train.py", "--lr", "1e-4"])
     assert [call[1]["cmd"] for call in api.calls[:2]] == [
         ["tmux", "-V"],
-        ["tmux", "has-session", "-t", "udc-train"],
+        ["tmux", "has-session", "-t", "citespec-train"],
     ]
     detached = api.calls[2][1]
-    assert detached["cmd"][:5] == ["tmux", "new-session", "-d", "-s", "udc-train"]
+    assert detached["cmd"][:5] == ["tmux", "new-session", "-d", "-s", "citespec-train"]
     assert detached["cmd"][5] == "-c"
-    assert "mkdir -p /workspace/.udc-logs" in detached["cmd"][-1]
-    assert ">> /workspace/.udc-logs/train.log 2>&1" in detached["cmd"][-1]
+    assert "mkdir -p /workspace/.citespec-logs" in detached["cmd"][-1]
+    assert ">> /workspace/.citespec-logs/train.log 2>&1" in detached["cmd"][-1]
     assert any(call[1].get("detach") for call in api.exec_calls)
 
 
@@ -756,20 +756,20 @@ def test_list_and_stop_jobs(active_config):
     driver._client = client
     api.outputs["exec-1"] = (
         0,
-        b"udc-train|1700000000|0\nother|1700000001|1\n",
+        b"citespec-train|1700000000|0\nother|1700000001|1\n",
     )
     jobs = driver.list_jobs("container-1")
     assert jobs == [
         {
             "name": "train",
-            "session": "udc-train",
+            "session": "citespec-train",
             "created": "1700000000",
             "attached": "0",
         }
     ]
     api.outputs["exec-2"] = (0, b"")
     driver.stop_job("container-1", "train")
-    assert api.calls[1][1]["cmd"] == ["tmux", "kill-session", "-t", "udc-train"]
+    assert api.calls[1][1]["cmd"] == ["tmux", "kill-session", "-t", "citespec-train"]
 
 
 def _working_bash() -> str | None:
@@ -808,7 +808,7 @@ def _working_bash() -> str | None:
 
 def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_path, monkeypatch):
     """SSH logins rebuild groups from the container /etc/group, so the member
-    needs a supplementary group with the host udc-gpu GID inside the container
+    needs a supplementary group with the host citespec-gpu GID inside the container
     as well — docker's group_add only covers the docker-exec path."""
     bash = _working_bash()
     if bash is None:
@@ -832,7 +832,7 @@ def test_identity_script_installs_gpu_supplementary_group(active_config, tmp_pat
     monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
     driver.initialize_container_identity("container-1", _allocation(tmp_path))
     script = fake_client.api.exec_create_kwargs["cmd"][2]
-    assert "udc-gpu:x:64000:alice" in script
+    assert "citespec-gpu:x:64000:alice" in script
     assert 'grep -q "^[^:]*:[^:]*:64000:" /etc/group' in script
     # Write the script to an LF file instead of piping via stdin: Windows
     # text-mode pipes translate newlines and some bash builds choke on CRLF.
@@ -866,7 +866,7 @@ def test_identity_script_without_gpu_group(active_config, tmp_path, monkeypatch)
     monkeypatch.setattr(docker_driver, "os", SimpleNamespace(name="posix", path=os.path))
     driver.initialize_container_identity("container-1", _allocation(tmp_path))
     script = fake_client.api.exec_create_kwargs["cmd"][2]
-    assert "udc-gpu" not in script
+    assert "citespec-gpu" not in script
 
 
 def test_prepare_container_ssh_merges_instead_of_overwriting(active_config):
@@ -899,7 +899,7 @@ def test_prepare_container_ssh_merges_instead_of_overwriting(active_config):
     assert 'cat "$home/.ssh/authorized_keys"' in script
     assert "awk '!seen[$0]++'" in script
     assert "tail -n 40" in script
-    assert "authorized_keys.udc" in script
+    assert "authorized_keys.citespec" in script
     assert "ssh-ed25519 AAAA-new-key alice" in script
 
 

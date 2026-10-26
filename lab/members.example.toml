@@ -1,4 +1,4 @@
-# Optional public collaborator directory.  Copy to /etc/udc-resource/members.toml
+# Optional public collaborator directory.  Copy to /etc/citespec-resource/members.toml
 # on the broker host (mode 0644) and keep private contact details out of it.
 #
 # Only display_name, nickname, and public_contact are exposed.  Do not put
@@ -6,11 +6,11 @@
 # here; use local administrator records instead.
 
 [members.alice]
-display_name = "张伟"
+display_name = "Alice Example"
 nickname = "alice"
 public_contact = "alice@example.invalid"
 
 [members.bob]
-display_name = "李娜"
+display_name = "Bob Example"
 nickname = "bob"
 public_contact = ""

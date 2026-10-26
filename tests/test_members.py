@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from udc_resource.members import load_members, public_member_data
+from citespec_resource.members import load_members, public_member_data
 
 
 def test_missing_directory_is_empty(tmp_path: Path):
@@ -41,9 +41,9 @@ nickname = "bob"
 def test_example_member_directory_is_valid():
     example = Path(__file__).resolve().parents[1] / "lab" / "members.example.toml"
     members = load_members(example)
-    assert members["alice"].display_name == "张伟"
+    assert members["alice"].display_name == "Alice Example"
     assert public_member_data(members, "bob") == {
-        "display_name": "李娜",
+        "display_name": "Bob Example",
         "nickname": "bob",
     }
 

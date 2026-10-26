@@ -37,8 +37,8 @@
 
 2. **强制级别**
    - 成员独立 Linux 账号。
-   - 成员不加入 `sudo`、`docker`、`udc-gpu` 组。
-   - 成员 SSH 使用 `ForceCommand`，只能执行 `udc-resource` 白名单子命令。
+   - 成员不加入 `sudo`、`docker`、`citespec-gpu` 组。
+   - 成员 SSH 使用 `ForceCommand`，只能执行 `citespec-resource` 白名单子命令。
    - 普通成员不能拿到普通 host shell。
    - 成员不能直接打开 `/dev/nvidia*`。
    - 容器内 root；容器外普通成员非 root。
@@ -47,7 +47,7 @@
    - 后来者只能申请空闲 GPU。
    - 非 owner 不能释放/停止他人 allocation。
    - 只有管理员可以强制释放。
-   - Broker 启动/重启只管理带 `udc.managed=true` 标签的容器；未知容器标记为“未纳管”，不杀。
+   - Broker 启动/重启只管理带 `citespec.managed=true` 标签的容器；未知容器标记为“未纳管”，不杀。
 
 4. **时间**
    - 默认 12 小时，最长 36 小时。
@@ -68,7 +68,7 @@
 - Python 3.11+
 - Broker：`asyncio` Unix domain socket + 换行分隔 JSON；`sqlite3`；Docker SDK for Python
 - CLI：Typer（或 argparse；若用 Typer，锁定版本）
-- GUI：`udc-resource gui` 启动本地 `127.0.0.1` Web UI；静态 HTML/CSS/JS；不引入 Node 构建
+- GUI：`citespec-resource gui` 启动本地 `127.0.0.1` Web UI；静态 HTML/CSS/JS；不引入 Node 构建
 - 服务：systemd
 - 数据：SQLite WAL
 - 测试：pytest；FakeDocker + 可控时钟
@@ -82,18 +82,18 @@ GUI 视觉可使用本地打包的轻量 CSS（如 Pico.css/Bootstrap 单文件�
 
 ```text
 本地工作站
-  udc-resource gui
+  citespec-resource gui
       │  本地 127.0.0.1 Web UI
-      │  subprocess: ssh <alias> udc-resource ... --json
+      │  subprocess: ssh <alias> citespec-resource ... --json
       ▼
 amax sshd
-  ForceCommand /usr/local/bin/udc-resource-login
-      │  仅允许 udc-resource 子命令
+  ForceCommand /usr/local/bin/citespec-resource-login
+      │  仅允许 citespec-resource 子命令
       ▼
-udc-resource CLI（以成员 UID 运行）
+citespec-resource CLI（以成员 UID 运行）
       │  Unix socket JSON，SO_PEERCRED
       ▼
-udc-resource-broker（root systemd）
+citespec-resource-broker（root systemd）
       ├── SQLite
       ├── Docker / NVIDIA runtime
       └── nvidia-smi / ps 对账
@@ -107,22 +107,22 @@ udc-resource-broker（root systemd）
 
 ### 4.1 Linux 账号
 
-管理员为每个成员创建独立账号，例如 `udc-<name>`：
+管理员为每个成员创建独立账号，例如 `citespec-<name>`：
 
-- 主组：`udc-members`
-- 附加组：`udc-cli`（访问 Broker Unix socket）
-- 不加入：`sudo`、`docker`、`udc-gpu`、`video`/`render`（若这些组能访问 GPU）
-- 家目录只放配置；训练数据放 `/data1/udc-users/<username>`
+- 主组：`citespec-members`
+- 附加组：`citespec-cli`（访问 Broker Unix socket）
+- 不加入：`sudo`、`docker`、`citespec-gpu`、`video`/`render`（若这些组能访问 GPU）
+- 家目录只放配置；训练数据放 `/data1/citespec-users/<username>`
 - SSH public key 由管理员加入
 
-管理员组：`udc-admins`。管理员可用普通 shell 进行维护；成员不行。
+管理员组：`citespec-admins`。管理员可用普通 shell 进行维护；成员不行。
 
 ### 4.2 GPU 设备权限
 
-创建系统组 `udc-gpu`，但不把普通成员加入。安装 udev 规则，例如：
+创建系统组 `citespec-gpu`，但不把普通成员加入。安装 udev 规则，例如：
 
 ```udev
-SUBSYSTEM=="nvidia", KERNEL=="nvidia*", GROUP="udc-gpu", MODE="0660"
+SUBSYSTEM=="nvidia", KERNEL=="nvidia*", GROUP="citespec-gpu", MODE="0660"
 ```
 
 要求：
@@ -136,26 +136,26 @@ SUBSYSTEM=="nvidia", KERNEL=="nvidia*", GROUP="udc-gpu", MODE="0660"
 
 ### 4.3 SSH 受限 shell
 
-`/etc/ssh/sshd_config.d/60-udc-resource.conf`：
+`/etc/ssh/sshd_config.d/60-citespec-resource.conf`：
 
 ```sshconfig
-Match Group udc-members
-    ForceCommand /usr/local/bin/udc-resource-login
+Match Group citespec-members
+    ForceCommand /usr/local/bin/citespec-resource-login
     AllowTcpForwarding no
     PermitTunnel no
     X11Forwarding no
     PermitTTY yes
 ```
 
-`udc-resource-login` 规则：
+`citespec-resource-login` 规则：
 
-- 无 `SSH_ORIGINAL_COMMAND`：启动交互式 `udc-resource menu`。
-- 有命令：`shlex.split`，要求第一个 token 严格等于 `udc-resource`；只执行白名单子命令。
+- 无 `SSH_ORIGINAL_COMMAND`：启动交互式 `citespec-resource menu`。
+- 有命令：`shlex.split`，要求第一个 token 严格等于 `citespec-resource`；只执行白名单子命令。
 - 不通过 `shell=True`，不做字符串拼接。
 - 拒绝 `scp`、`sftp`、`bash`、`sh`、`python`、`systemctl`、`docker` 等。
 - `sftp`/`scp` 在 v1 明确不可用；代码用容器内 `git`，数据已在服务器。
 
-管理员账号不匹配 `Match Group udc-members`，保留普通 shell。
+管理员账号不匹配 `Match Group citespec-members`，保留普通 shell。
 
 ---
 
@@ -163,14 +163,14 @@ Match Group udc-members
 
 ### 5.1 进程与权限
 
-- systemd unit：`udc-resource-broker.service`
+- systemd unit：`citespec-resource-broker.service`
 - 以 root 运行；`Restart=always`
-- 只监听 `/run/udc-resource/broker.sock`
-- socket：`root:udc-cli 0660`
+- 只监听 `/run/citespec-resource/broker.sock`
+- socket：`root:citespec-cli 0660`
 - 不在公网/LAN 监听
 - 日志：journald + 可选 JSON 文件
-- 配置：`/etc/udc-resource/config.toml`
-- 数据：`/var/lib/udc-resource/state.db`
+- 配置：`/etc/citespec-resource/config.toml`
+- 数据：`/var/lib/citespec-resource/state.db`
 
 ### 5.2 身份
 
@@ -179,7 +179,7 @@ Broker 对每个 Unix socket 连接读取 `SO_PEERCRED`：
 - 使用 peer UID 映射 `pwd.getpwuid`；
 - 不信任客户端自报用户名；
 - 成员身份由 UID 决定；
-- 管理员权限由 `udc-admins` 组成员决定；
+- 管理员权限由 `citespec-admins` 组成员决定；
 - 操作审计记录 actor UID/username。
 
 ### 5.3 JSON 协议
@@ -187,7 +187,7 @@ Broker 对每个 Unix socket 连接读取 `SO_PEERCRED`：
 换行分隔 JSON；请求：
 
 ```json
-{"cmd":"apply","args":{"gpus":[3],"cpus":8,"memory_gb":32,"hours":12,"image":"udc-base:2026.10","note":"..."}}
+{"cmd":"apply","args":{"gpus":[3],"cpus":8,"memory_gb":32,"hours":12,"image":"citespec-base:2026.10","note":"..."}}
 ```
 
 响应：
@@ -273,7 +273,7 @@ events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor_uid INTEGER,
   - container 存在且未到期：保持。
   - 已到期：停止，标记 expired。
   - container 丢失：标记 failed/lost，释放 claim。
-- 未知容器（无 `udc.managed=true`）：只显示为 unmanaged，不停止、不删除。
+- 未知容器（无 `citespec.managed=true`）：只显示为 unmanaged，不停止、不删除。
 
 ---
 
@@ -283,13 +283,13 @@ Broker 创建的容器必须：
 
 - `--gpus device=<uuid-or-index>`，只暴露分配的整卡；
 - `--cpus <n>`、`--memory <n>g`、`--memory-swap` 与 memory 相同（禁止 swap 扩张）；
-- `--name udc-<user>-<allocation-short>`
+- `--name citespec-<user>-<allocation-short>`
 - 标签：
-  - `udc.managed=true`
-  - `udc.owner=<username>`
-  - `udc.allocation=<id>`
-  - `udc.gpus=<comma-separated>`
-- 工作目录 `/workspace`，挂载 `/data1/udc-users/<username>:/workspace`
+  - `citespec.managed=true`
+  - `citespec.owner=<username>`
+  - `citespec.allocation=<id>`
+  - `citespec.gpus=<comma-separated>`
+- 工作目录 `/workspace`，挂载 `/data1/citespec-users/<username>:/workspace`
 - 不加 `--privileged`
 - 不挂 `/var/run/docker.sock`
 - 不使用 host PID/IPC/network
@@ -297,34 +297,34 @@ Broker 创建的容器必须：
 - 默认 root 用户；允许容器内 `apt/pip`
 - 可加 `--security-opt no-new-privileges`，但不要 drop 到无法安装软件的程度
 
-基础镜像由管理员构建并固定 tag，例如 `udc-base:2026.10`；用户在容器内安装的环境不持久化，代码/数据放 `/workspace`。
+基础镜像由管理员构建并固定 tag，例如 `citespec-base:2026.10`；用户在容器内安装的环境不持久化，代码/数据放 `/workspace`。
 
 ---
 
 ## 9. CLI 规格
 
-包名建议：`udc-resource`；入口点：`udc-resource`。
+包名建议：`citespec-resource`；入口点：`citespec-resource`。
 
 ```text
-udc-resource list [--json]
-udc-resource status [<id>] [--json]
-udc-resource apply --gpus 3,5 --cpus 16 --memory 64 --hours 12 [--image ...] [--note ...] [--json]
-udc-resource release <id> [--json]
-udc-resource shell <id>
-udc-resource logs <id> [--follow]
-udc-resource menu
-udc-resource gui [--server amax] [--port 0]
+citespec-resource list [--json]
+citespec-resource status [<id>] [--json]
+citespec-resource apply --gpus 3,5 --cpus 16 --memory 64 --hours 12 [--image ...] [--note ...] [--json]
+citespec-resource release <id> [--json]
+citespec-resource shell <id>
+citespec-resource logs <id> [--follow]
+citespec-resource menu
+citespec-resource gui [--server amax] [--port 0]
 ```
 
 管理员：
 
 ```text
-udc-resource admin users
-udc-resource admin resources
-udc-resource admin release <id> --reason ...
-udc-resource admin audit [--limit 100]
-udc-resource admin reconcile
-udc-resource admin mode monitor|active
+citespec-resource admin users
+citespec-resource admin resources
+citespec-resource admin release <id> --reason ...
+citespec-resource admin audit [--limit 100]
+citespec-resource admin reconcile
+citespec-resource admin mode monitor|active
 ```
 
 退出码：
@@ -343,12 +343,12 @@ udc-resource admin mode monitor|active
 
 ## 10. GUI 规格
 
-`udc-resource gui`：
+`citespec-resource gui`：
 
 - 启动本地 `127.0.0.1` Web server（随机端口）；
 - 自动打开浏览器；
 - 配置中读取 SSH alias（默认 `amax`）；
-- 所有数据通过 `ssh <alias> udc-resource ... --json` 获取；
+- 所有数据通过 `ssh <alias> citespec-resource ... --json` 获取；
 - 不直接访问 Broker，不新增 API client。
 
 页面：
@@ -382,10 +382,10 @@ GUI 轮询间隔 5 秒；失败时显示离线状态，不缓存过期占用为�
 
 ### 11.1 仓库
 
-独立仓库，建议名 `udc-resource`，不要作为研究 repo 的 submodule。
+独立仓库，建议名 `citespec-resource`，不要作为研究 repo 的 submodule。
 
 ```text
-udc-resource/
+citespec-resource/
   pyproject.toml
   README.md
   broker/
@@ -406,9 +406,9 @@ udc-resource/
     static/app.css
     server.py
   deploy/
-    systemd/udc-resource-broker.service
-    udev/99-udc-gpu.rules
-    sshd/60-udc-resource.conf
+    systemd/citespec-resource-broker.service
+    udev/99-citespec-gpu.rules
+    sshd/60-citespec-resource.conf
     install_server.sh
     create_user.sh
     docker/Dockerfile.base
@@ -421,7 +421,7 @@ udc-resource/
 `install_server.sh` 必须幂等、可 dry-run，并且：
 
 1. 只读预检 Docker/systemd/NVIDIA/udev/sshd/组/端口；
-2. 创建 `udc-members`、`udc-cli`、`udc-admins`、`udc-gpu`；
+2. 创建 `citespec-members`、`citespec-cli`、`citespec-admins`、`citespec-gpu`；
 3. 安装 udev 规则并 `udevadm control --reload && udevadm trigger`；
 4. 安装 systemd unit；
 5. 安装 sshd drop-in，先 `sshd -t` 再 reload；
@@ -463,7 +463,7 @@ udc-resource/
 - 两个并发 apply 的竞态；
 - 过期自动停止；
 - Broker 重启后列表正确；
-- Socket 权限：非 `udc-cli` 连接失败；
+- Socket 权限：非 `citespec-cli` 连接失败；
 - Peer UID 不能伪造。
 
 ### 安全验收
@@ -474,7 +474,7 @@ udc-resource/
 - 容器内不能访问 `/var/run/docker.sock`；
 - 容器内不能看到 host PID；
 - 非 owner 不能 release；
-- 普通成员不能 `systemctl stop udc-resource-broker`；
+- 普通成员不能 `systemctl stop citespec-resource-broker`；
 - GUI 只通过 CLI，且不显示 kill 未知进程。
 
 ### 实机验收（训练结束后）
@@ -524,7 +524,7 @@ udc-resource/
 
 ### P4 — GUI
 
-- `udc-resource gui`；
+- `citespec-resource gui`；
 - 本地静态 UI；
 - 调用 CLI `--json`；
 - 不新增 API；

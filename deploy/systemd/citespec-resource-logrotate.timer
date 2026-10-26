@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Citespec job-log rotation
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=10m
+Persistent=true
+Unit=citespec-resource-logrotate.service
+
+[Install]
+WantedBy=timers.target

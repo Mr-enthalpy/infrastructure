@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from udc_resource.config import LabConfig, load_config
+from citespec_resource.config import LabConfig, load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 

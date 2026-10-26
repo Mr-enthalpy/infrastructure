@@ -1,9 +1,9 @@
-# UDC infrastructure deployment guide
+# Citespec infrastructure deployment guide
 
 ## 1. Scope and safety requirements
 
 This directory contains the deployment and verification tooling for the
-`udc-resource` broker, CLI, SSH policy, udev rule, systemd units, development
+`citespec-resource` broker, CLI, SSH policy, udev rule, systemd units, development
 container image, and host-side verification scripts.
 
 Deployment is prohibited while the host is serving training workloads or when
@@ -11,6 +11,12 @@ explicit administrator approval has not been recorded. The current project
 status, target-host unknowns, and approved next steps are maintained in
 [`docs/handoff.md`](../docs/handoff.md). The acceptance procedure is defined in
 [`docs/acceptance.md`](../docs/acceptance.md).
+
+This round implements the intake, approval, executor, central-key SSH policy,
+and setup/client-profile paths in code and automated tests. The intake and
+provision units, real `sshd` central-key behavior, `useradd`, quotas, and the
+browser flow have **not** been executed on a disposable Linux host; D2 remains
+pending. Do not cite local unit tests as proof that these host integrations work.
 
 All verification scripts marked as read-only must be executed before any
 state-changing step. A read-only script must be reviewed before execution; it
@@ -58,60 +64,87 @@ these tools is unavailable.
    bash deploy/install_server.sh --dry-run --skip-preflight
    ```
 
-2. Install the broker, CLI, login wrapper, member shell, verification scripts,
-   systemd units, udev rule, and SSH drop-in:
+2. Install the broker, CLI, login wrapper, member shell, provisioning executor,
+   intake service, verification scripts, systemd units, udev rule, and SSH
+   drop-in:
 
    ```bash
    bash deploy/install_server.sh --yes
    ```
 
+   If Python 3.11+ is only available through a root-owned uv environment, pass an
+   accessible interpreter explicitly, for example
+   `--python /opt/python3.12/bin/python3.12`; otherwise uv may make the service
+   venv point at a path that the low-privilege services cannot traverse.
+
    The installer is idempotent. It does not modify the host without `--yes`, does
    not overwrite an existing configuration unless `--force-config` is supplied,
-   and does not start the broker unless `--start` is supplied. A fresh database
-   starts in `monitor` mode. A reinstall with active/pending leases preserves
-   `active` or `maintenance` so lease expiry is not silently paused.
+   and does not start the broker unless `--start` is supplied. It installs the
+   Python package with the `gui` extra (needed by the intake service), creates
+   the root-managed key directory `/etc/citespec-resource/authorized-keys.d`, the
+   provisioning spool `/var/lib/citespec-resource/provision`, and the isolated intake
+   state directory. A fresh database starts in `monitor` mode. A reinstall with
+   active/pending leases preserves `active` or `maintenance` so lease expiry is
+   not silently paused.
 
    Before changing the configuration, systemd units, udev rules, sshd
    configuration, or managed symlinks, the installer creates a timestamped
-   backup under `/var/backups/udc-resource/`. Validation failures trigger an EXIT
+   backup under `/var/backups/citespec-resource/`. Validation failures trigger an EXIT
    trap that restores the backed-up files and, when the broker was stopped, the
    SQLite state snapshot. Group creation and a live broker database are retained;
    rollback warns rather than replacing state under a running daemon.
 
-3. Create member accounts with an explicit SSH key:
+3. Install and validate the SSH policy **before** creating members. The installer
+   installs the sshd drop-in, runs `sshd -t`, and reloads sshd. The member match
+   block is key-only (`AuthenticationMethods publickey`), disables password and
+   keyboard-interactive authentication, sets `PermitUserRC no`, disables
+   forwarding/tunnels, and points sshd at the root-managed per-member file:
 
    ```bash
-   bash deploy/create_user.sh --yes --ssh-key /path/to/key.pub udc-alice
+   sshd -T -C user=<member>,host=<host>,addr=<addr> | grep -i '^authorizedkeysfile'
+   # expected: /etc/citespec-resource/authorized-keys.d/%u
    ```
 
-   Members receive `udc-members` and `udc-cli` membership, the SSH
-   `ForceCommand`, and the root-owned
-   `/usr/local/libexec/udc-resource/member-shell` login shell. The installer does
-   not change existing account shells; run `create_user.sh` for every existing
-   member before active mode. Administrators use `--admin`, retain a normal
-   shell, and must not be members of `udc-members`.
+   There is deliberately no `~/.ssh/authorized_keys` fallback. Keep the verified
+   administrator session open while changing sshd.
 
-   Each account also runs a workspace provisioning transaction: the member
-   directory is created, the project ID (= UID) and the hard quota
-   (`--limit-gb`, default 200) are assigned, and the result is verified by
-   querying the filesystem back. Use `--no-workspace` to skip it. The Broker
-   re-verifies — and if needed reprovisions — this quota before every
-   allocation, so a missing quota fails the allocation instead of leaving the
-   workspace unbounded.
+4. Create the first administrator (break-glass only; administrators keep a
+   normal shell and must not be in `citespec-members`):
 
-4. Install and validate the SSH policy. The installer installs the sshd drop-in,
-   runs `sshd -t`, and reloads sshd. The member match block is key-only
-   (`AuthenticationMethods publickey`), disables password and keyboard-interactive
-   authentication, sets `PermitUserRC no`, disables forwarding and tunnels, and
-   applies the login wrapper. Keep the verified administrator session open.
+   ```bash
+   bash deploy/create_user.sh --admin --yes --ssh-key /path/to/admin.pub admin
+   ```
+
+   Members are **not** created by hand in the normal flow. Start the low-power
+   intake service and generate an invitation now; the applicant can apply while
+   the remaining read-only gates are checked:
+
+   ```bash
+   systemctl start citespec-resource-intake.service citespec-resource-provision.path
+   citespec-resource admin invitations --create --validity-hours 168
+   ```
+
+   The intake process binds `127.0.0.1:8765` only. Publish it through the lab's
+   existing TLS reverse proxy (with request-size limits and a non-public network
+   policy); this repository does not install or configure that proxy. The
+   `onboarding.apply_url` must be the externally reachable HTTPS URL.
+
+   Approval happens after the broker starts in step 7. The Broker records the
+   frozen decision, writes a fixed-action spool request, and the root executor
+   creates the account, central keys, workspace, and quota. The executor reuses
+   `create_user.sh` as a privileged helper; `create_user.sh` itself writes member
+   keys to the central directory and is reserved for audited break-glass use.
+   Do not run `create_user.sh` on an existing member solely to migrate the shell:
+   that would leave the central key file absent and lock the member out under the
+   new sshd policy.
 
 5. Verify that the installed udev rule denies host GPU access to a test member:
 
    ```bash
-   bash deploy/verify_gpu_permissions.sh --member udc-alice --expected-gpus 8
+   bash deploy/verify_gpu_permissions.sh --member citespec-alice --expected-gpus 8
    ```
 
-   Omit `--member` to check every effective `udc-members` account. Use `--json`
+   Omit `--member` to check every effective `citespec-members` account. Use `--json`
    for the Broker gate format. Re-run the check after a reboot and after the
    NVIDIA driver recreates device nodes.
 
@@ -121,7 +154,7 @@ these tools is unavailable.
 
    ```bash
    bash deploy/configure_quotas.sh \
-     --workspace-root /data1/udc-users \
+     --workspace-root /data1/citespec-users \
      --limit-gb 200 \
      --yes
    ```
@@ -137,14 +170,39 @@ these tools is unavailable.
    acceptance:
 
    ```bash
-   systemctl start udc-resource-broker
-   bash deploy/verify_monitor_only.sh --member udc-alice
+   systemctl enable --now citespec-resource-broker
+   systemctl enable --now citespec-resource-intake.service citespec-resource-provision.path
+   bash deploy/verify_monitor_only.sh --member <approved-member>
    ```
 
-   The verifier checks `ForceCommand`, socket permissions, Docker/GPU denials,
-   monitor mode, and the absence of Docker/GPU state changes during the snapshot
-   window (default: 10 minutes). It also invokes
-   `verify_gpu_permissions.sh` for every visible NVIDIA device.
+   The verifier checks `ForceCommand`, central `AuthorizedKeysFile`, socket
+   permissions, Docker/GPU denials, monitor mode, and the absence of Docker/GPU
+   state changes during the snapshot window (default: 10 minutes). It also invokes
+   `verify_gpu_permissions.sh` for every visible NVIDIA device. Intake runs as
+   the unprivileged `citespec-intake` account with no broker socket or GPU access; the
+   provisioning path unit is the only root action triggered by an approval.
+
+   Now review and approve the application, or explicitly import an existing
+   Linux account:
+
+   ```bash
+   citespec-resource admin requests list
+   citespec-resource admin requests show --request-id <id>
+   citespec-resource admin requests approve --request-id <id> \
+     --expected-version <reviewed-version> --review-note "identity checked"
+   citespec-resource admin operations show --operation-id <id>
+
+   # Existing account: manifest-driven; dry-run by default.
+   citespec-resource admin members import-legacy --file legacy-members.json
+   citespec-resource admin members import-legacy --file legacy-members.json --apply
+   ```
+
+   Approval is refused if the intake content changed after preview. Every account
+   operation is persisted with stages and is retryable after a crash; a failed
+   host projection does not leave the database claiming access. The legacy
+   manifest names the exact username, keys, validity, and quota; apply is
+   refused while hard conflicts remain, and nothing is adopted because a name
+   happens to exist.
 
    `monitor` is read-only and never expires leases. When active or pending leases
    exist, use `maintenance`: it blocks new applications while continuing expiry
@@ -176,7 +234,7 @@ GPU devices and bind mounts first.
 Build the base image only on the target host after the storage checks pass:
 
 ```bash
-docker build -f deploy/docker/Dockerfile.base -t udc-base:2026.10 deploy/docker
+docker build -f deploy/docker/Dockerfile.base -t citespec-base:2026.10 deploy/docker
 ```
 
 Record the immutable image digest and use that digest for acceptance. A floating
@@ -197,14 +255,14 @@ must remain disabled.
 
 ## 7. systemd timers and operational controls
 
-The installer installs and enables `udc-resource-logrotate.timer` and
-`udc-resource-disk-check.timer` by default. Use `--no-timers` to leave them
+The installer installs and enables `citespec-resource-logrotate.timer` and
+`citespec-resource-disk-check.timer` by default. Use `--no-timers` to leave them
 disabled. The log timer invokes the descriptor-relative
 `rotate_job_logs.py` helper instead of a logrotate `copytruncate` rule. The disk
 timer runs `check_disk.sh` and exits non-zero for warning and critical
 thresholds so failures are visible in `systemctl --failed` and the journal.
 
-The broker socket must be owned by `root:udc-cli` with mode `0660`. Members must
+The broker socket must be owned by `root:citespec-cli` with mode `0660`. Members must
 not receive Docker, sudo, GPU device group, `video`, or `render` access. The
 container must not mount the host Docker socket.
 
@@ -214,7 +272,11 @@ container must not mount the host Docker socket.
 - `audit_legacy.sh`: read-only legacy root/sudo/SSH/privileged-container audit.
 - `install_server.sh`: idempotent installer; supports `--dry-run`, `--yes`,
   `--start`, and `--no-timers`.
-- `create_user.sh`: member/admin account and optional SSH key setup.
+- `create_user.sh`: break-glass member/admin account helper; member keys go to
+  the root-managed central directory and admin keys stay in the admin home.
+- `membership/provision_executor.py`: root, fixed-action spool executor used by
+  approved provisioning, key projection, disable/revoke, and inspect-only
+  legacy checks.
 - `member-shell.sh`: root-owned member login shell installed by the installer.
 - `verify_gpu_permissions.sh`: read-only GPU/NVIDIA device permission
   verification; supports `--json` and no-member mode.
@@ -224,11 +286,16 @@ container must not mount the host Docker socket.
 - `rotate_job_logs.py`: symlink-safe job-log rotation.
 - `acceptance_active.py`: destructive active-mode acceptance harness; see
   `docs/acceptance.md`.
-- `systemd/udc-resource-broker.service`: hardened broker unit.
-- `systemd/udc-resource-logrotate.service` and `.timer`: log rotation timer.
-- `systemd/udc-resource-disk-check.service` and `.timer`: disk alert timer.
-- `udev/99-udc-gpu.rules`: NVIDIA device-node ownership rule.
-- `sshd/60-udc-resource.conf`: member SSH match block.
+- `systemd/citespec-resource-broker.service`: hardened broker unit.
+- `systemd/citespec-resource-logrotate.service` and `.timer`: log rotation timer.
+- `systemd/citespec-resource-disk-check.service` and `.timer`: disk alert timer.
+- `systemd/citespec-resource-intake.service`: unprivileged public application entry;
+  owns only its own SQLite store.
+- `systemd/citespec-resource-provision.service` and `.path`: root executor triggered
+  by fixed JSON requests in the provisioning spool.
+- `udev/99-citespec-gpu.rules`: NVIDIA device-node ownership rule.
+- `sshd/60-citespec-resource.conf`: member SSH match block with the central
+  `AuthorizedKeysFile`; no home authorized_keys fallback.
 - `docker/Dockerfile.base`, `docker/sshd_config`, `docker/bootstrap.sh`:
   development container definitions.
 - `../lab/members.example.toml`: public member-directory example.

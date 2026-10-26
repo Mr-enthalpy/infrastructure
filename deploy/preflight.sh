@@ -28,7 +28,7 @@ effective_members() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -h|--help)
-            printf 'usage: %s [--config PATH]\n\nRead-only preflight for the udc-resource host.\n' "$0"
+            printf 'usage: %s [--config PATH]\n\nRead-only preflight for the citespec-resource host.\n' "$0"
             exit 0
             ;;
         --config)
@@ -121,7 +121,7 @@ server = data.get("server", {})
 print(f"container_profile={policy.get('container_profile', 'restricted')}")
 print(f"writable_layer_gb={policy.get('writable_layer_gb', 0)}")
 print(f"mode={policy.get('mode', 'monitor')}")
-print(f"workspace_root={server.get('workspace_root', '/data1/udc-users')}")
+print(f"workspace_root={server.get('workspace_root', '/data1/citespec-users')}")
 print(f"max_workspace_gb={policy.get('max_workspace_gb', 0)}")
 print(
     "workspace_quota_required="
@@ -170,11 +170,11 @@ if have docker; then
     else
         warn "docker.service is not active or systemd is unavailable"
     fi
-    MANAGED=$(docker ps --format '{{.ID}} {{.Names}} {{.Label "udc.managed"}}' 2>/dev/null | grep -c 'true' || true)
+    MANAGED=$(docker ps --format '{{.ID}} {{.Names}} {{.Label "citespec.managed"}}' 2>/dev/null | grep -c 'true' || true)
     if [ "${MANAGED:-0}" -gt 0 ]; then
-        warn "$MANAGED running container(s) already have udc.managed=true"
+        warn "$MANAGED running container(s) already have citespec.managed=true"
     else
-        ok "no running containers have udc.managed=true"
+        ok "no running containers have citespec.managed=true"
     fi
     if [ "$CONTAINER_PROFILE" = "development" ]; then
         if [ "${WRITABLE_LAYER_GB:-0}" -le 0 ]; then
@@ -275,18 +275,18 @@ else
 fi
 
 section "groups and users"
-for group in udc-members udc-cli udc-admins udc-gpu; do
+for group in citespec-members citespec-cli citespec-admins citespec-gpu; do
     if getent group "$group" >/dev/null 2>&1; then
         ok "group exists: $group"
     else
         warn "group does not exist yet: $group"
     fi
 done
-GPU_MEMBERS=$(effective_members udc-gpu | tr '\n' ' ')
+GPU_MEMBERS=$(effective_members citespec-gpu | tr '\n' ' ')
 if [ -n "$GPU_MEMBERS" ]; then
-    fail "udc-gpu has effective members ($GPU_MEMBERS); ordinary members must not be in this group"
+    fail "citespec-gpu has effective members ($GPU_MEMBERS); ordinary members must not be in this group"
 else
-    ok "udc-gpu has no effective members"
+    ok "citespec-gpu has no effective members"
 fi
 
 section "gpu device permissions"
@@ -295,8 +295,8 @@ if compgen -G '/dev/nvidia*' >/dev/null; then
         [ -e "$device" ] || continue
         MODE=$(stat -c '%a' "$device" 2>/dev/null || true)
         GROUP=$(stat -c '%G' "$device" 2>/dev/null || true)
-        if [ "$MODE" = "660" ] && [ "$GROUP" = "udc-gpu" ]; then
-            ok "$device is 0660 and owned by group udc-gpu"
+        if [ "$MODE" = "660" ] && [ "$GROUP" = "citespec-gpu" ]; then
+            ok "$device is 0660 and owned by group citespec-gpu"
         else
             warn "$device mode/group is ${MODE:-unknown}/${GROUP:-unknown}; udev rule may not be installed"
         fi
@@ -304,8 +304,8 @@ if compgen -G '/dev/nvidia*' >/dev/null; then
 else
     warn "no /dev/nvidia* devices found"
 fi
-if [ -r /etc/udev/rules.d/99-udc-gpu.rules ]; then
-    if grep -Fq 'KERNEL=="nvidia*"' /etc/udev/rules.d/99-udc-gpu.rules; then
+if [ -r /etc/udev/rules.d/99-citespec-gpu.rules ]; then
+    if grep -Fq 'KERNEL=="nvidia*"' /etc/udev/rules.d/99-citespec-gpu.rules; then
         ok "udev rule matches all nvidia* device names"
     else
         warn "udev rule exists but does not use the KERNEL-based nvidia* match"
@@ -321,19 +321,19 @@ if have sshd; then
     else
         warn "sshd -t failed (root may be required, or the config is invalid)"
     fi
-    if [ -r /etc/ssh/sshd_config.d/60-udc-resource.conf ]; then
-        ok "udc-resource sshd drop-in is installed"
+    if [ -r /etc/ssh/sshd_config.d/60-citespec-resource.conf ]; then
+        ok "citespec-resource sshd drop-in is installed"
     else
-        warn "udc-resource sshd drop-in is not installed yet"
+        warn "citespec-resource sshd drop-in is not installed yet"
     fi
 else
     warn "sshd is not installed or not in PATH"
 fi
 if have ss; then
-    if ss -ltn 2>/dev/null | grep -q 'udc-resource'; then
-        warn "a TCP listener matching udc-resource was found; the broker must use a Unix socket only"
+    if ss -ltn 2>/dev/null | grep -q 'citespec-resource'; then
+        warn "a TCP listener matching citespec-resource was found; the broker must use a Unix socket only"
     else
-        ok "no obvious TCP listener for udc-resource"
+        ok "no obvious TCP listener for citespec-resource"
     fi
 fi
 
@@ -349,7 +349,7 @@ if have df; then
     df -h /data1 /var/lib 2>/dev/null || warn "could not read disk usage"
 fi
 if [ "${MAX_WORKSPACE_GB:-0}" -gt 0 ] || [ "$WORKSPACE_QUOTA_REQUIRED" = "true" ]; then
-    QUOTA_TARGET=${WORKSPACE_ROOT:-/data1/udc-users}
+    QUOTA_TARGET=${WORKSPACE_ROOT:-/data1/citespec-users}
     while [ ! -e "$QUOTA_TARGET" ] && [ "$QUOTA_TARGET" != "/" ]; do
         QUOTA_TARGET=$(dirname "$QUOTA_TARGET")
     done
@@ -385,10 +385,10 @@ if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
 else
     warn "cgroup v2 was not detected"
 fi
-if [ -e /run/udc-resource/broker.sock ]; then
+if [ -e /run/citespec-resource/broker.sock ]; then
     warn "broker socket already exists; an implementation may already be running"
 fi
-if [ -e /var/lib/udc-resource/state.db ]; then
+if [ -e /var/lib/citespec-resource/state.db ]; then
     warn "broker state database already exists"
 fi
 

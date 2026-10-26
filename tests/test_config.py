@@ -1,8 +1,17 @@
+import os
 from pathlib import Path
 
 import pytest
 
-from udc_resource.config import ImageConfig, load_config
+from citespec_resource.config import (
+    HardwareConfig,
+    ImageConfig,
+    LabConfig,
+    ServerConfig,
+    load_client_config,
+    load_config,
+    write_client_config,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,7 +28,7 @@ def _variant(tmp_path: Path, *replacements: tuple[str, str]) -> Path:
 
 def test_example_config_is_valid():
     cfg = load_config(ROOT / "lab/resources.example.toml")
-    assert cfg.server.name == "amax"
+    assert cfg.server.name == "example"
     assert cfg.hardware.gpu_count == 8
     assert cfg.policy.default_hours == 12
     assert cfg.policy.max_hours == 36
@@ -55,7 +64,7 @@ def test_example_config_is_valid():
 def test_workspace_root_must_be_absolute(tmp_path):
     path = _variant(
         tmp_path,
-        ('workspace_root = "/data1/udc-users"', 'workspace_root = "udc-users"'),
+        ('workspace_root = "/data1/citespec-users"', 'workspace_root = "citespec-users"'),
     )
     with pytest.raises(ValueError, match="workspace_root"):
         load_config(path)
@@ -64,7 +73,7 @@ def test_workspace_root_must_be_absolute(tmp_path):
 def test_workspace_root_must_not_be_filesystem_root(tmp_path):
     path = _variant(
         tmp_path,
-        ('workspace_root = "/data1/udc-users"', 'workspace_root = "/"'),
+        ('workspace_root = "/data1/citespec-users"', 'workspace_root = "/"'),
     )
     with pytest.raises(ValueError, match="workspace_root"):
         load_config(path)
@@ -225,7 +234,7 @@ def test_vscode_requires_development_profile(tmp_path):
 def test_workspace_root_rejects_normalized_root(tmp_path, value):
     path = _variant(
         tmp_path,
-        ('workspace_root = "/data1/udc-users"', f'workspace_root = "{value}"'),
+        ('workspace_root = "/data1/citespec-users"', f'workspace_root = "{value}"'),
     )
     with pytest.raises(ValueError, match="workspace_root"):
         load_config(path)
@@ -306,6 +315,36 @@ def test_monitor_mode_may_disable_gates_until_activation(tmp_path):
     cfg = load_config(path)
     assert cfg.policy.mode == "monitor"
     assert cfg.policy.gpu_audit_required is False
+
+
+def test_member_client_profile_round_trip(tmp_path):
+    config = LabConfig(
+        server=ServerConfig(
+            name="lab",
+            ssh_alias="lab",
+            address="lab.example.invalid",
+            ssh_port=2222,
+            ssh_user="alice",
+        ),
+        hardware=HardwareConfig(1, "client", 0, 1, 1),
+    )
+    path = write_client_config(tmp_path / "client.toml", config)
+    loaded = load_client_config(path)
+    assert loaded.server.ssh_alias == "lab"
+    assert loaded.server.ssh_user == "alice"
+    assert loaded.server.ssh_port == 2222
+    assert loaded.hardware.gpu_model == "client-profile"
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_client_profile_does_not_accept_a_partial_server_file(tmp_path):
+    # A file with [hardware] is treated as a server file and must satisfy the
+    # strict server schema; it must not silently become a client profile.
+    path = tmp_path / "partial.toml"
+    path.write_text("[server]\nname='x'\nssh_alias='x'\n[hardware]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing \\[hardware\\]"):
+        load_client_config(path)
 
 
 def test_active_development_profile_requires_storage_protection(tmp_path):

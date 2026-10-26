@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from udc_resource import workspace_quota
+from citespec_resource import workspace_quota
 
 
 def _which(name: str) -> str:
@@ -131,7 +131,7 @@ def test_verify_member_quota_passes_on_xfs(monkeypatch, tmp_path):
         lsattr_rows={
             str(workspace): "1000 -P--------------e------",
             # The probe file is created during verification.
-            str(workspace / ".udc-quota-probe"): "1000 --------------e------",
+            str(workspace / ".citespec-quota-probe"): "1000 --------------e------",
         },
     )
     result = workspace_quota.verify_member_quota(workspace, 1000, 200)
@@ -163,7 +163,7 @@ def test_verify_member_quota_fails_on_wrong_hard_limit(monkeypatch, tmp_path):
         report=("1000            4         0         1024      00 [--------]\n"),
         lsattr_rows={
             str(workspace): "1000 -P--------------e------",
-            str(workspace / ".udc-quota-probe"): "1000 --------------e------",
+            str(workspace / ".citespec-quota-probe"): "1000 --------------e------",
         },
     )
     result = workspace_quota.verify_member_quota(workspace, 1000, 200)
@@ -182,13 +182,13 @@ def test_verify_member_quota_fails_when_new_files_do_not_inherit(monkeypatch, tm
         report=f"1000            4         0         {limit_kib}      00 [--------]\n",
         lsattr_rows={
             str(workspace): "1000 -P--------------e------",
-            str(workspace / ".udc-quota-probe"): "0 --------------e------",
+            str(workspace / ".citespec-quota-probe"): "0 --------------e------",
         },
     )
     result = workspace_quota.verify_member_quota(workspace, 1000, 200)
     assert result.passed is False
     assert "inherit" in result.detail
-    assert not (workspace / ".udc-quota-probe").exists()
+    assert not (workspace / ".citespec-quota-probe").exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="symlink creation needs privileges on Windows")
@@ -226,7 +226,7 @@ def test_verify_member_quota_ext4_via_repquota(monkeypatch, tmp_path):
             target = command[-1]
             if target == str(workspace):
                 return subprocess.CompletedProcess(command, 0, f"1000 -P- {target}\n", "")
-            if target == str(workspace / ".udc-quota-probe"):
+            if target == str(workspace / ".citespec-quota-probe"):
                 return subprocess.CompletedProcess(command, 0, f"1000 -- {target}\n", "")
             return subprocess.CompletedProcess(command, 1, "", "no such file")
         if command[0].endswith("repquota"):

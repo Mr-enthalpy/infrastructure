@@ -1,0 +1,14 @@
+[Unit]
+Description=Rotate Citespec per-allocation job logs safely
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/citespec-rotate-job-logs --workspace-root /home/data1/citespec-users --max-bytes 104857600 --keep 3
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/data1/citespec-users

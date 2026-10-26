@@ -1,12 +1,12 @@
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+from citespec_resource import store
+from citespec_resource.broker.docker_driver import ContainerInfo
+from citespec_resource.broker.expiry import expire_once
+from citespec_resource.db import init_db
+from citespec_resource.models import GPU
 from tests.fakes import FakeDocker
-from udc_resource import store
-from udc_resource.broker.docker_driver import ContainerInfo
-from udc_resource.broker.expiry import expire_once
-from udc_resource.db import init_db
-from udc_resource.models import GPU
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 
@@ -36,8 +36,8 @@ def _active_allocation(
         gpu_uuids=("GPU-0",),
         cpus=8.0,
         memory_gb=32,
-        image="udc-base:2026.10",
-        workspace="/data1/udc-users/alice",
+        image="citespec-base:2026.10",
+        workspace="/data1/citespec-users/alice",
         note="",
         starts_at=NOW - timedelta(hours=12),
         expires_at=expires_at,
@@ -49,7 +49,7 @@ def _active_allocation(
         connection,
         allocation_id,
         container_id=container_id,
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=NOW - timedelta(hours=12),
     )
     return allocation_id
@@ -59,13 +59,13 @@ def _add_managed_container(fake: FakeDocker, allocation_id: str) -> None:
     fake.add_container(
         ContainerInfo(
             id="container-1",
-            name="udc-alice-test",
-            image="udc-base:2026.10",
+            name="citespec-alice-test",
+            image="citespec-base:2026.10",
             status="running",
             labels={
-                "udc.managed": "true",
-                "udc.owner": "alice",
-                "udc.allocation": allocation_id,
+                "citespec.managed": "true",
+                "citespec.owner": "alice",
+                "citespec.allocation": allocation_id,
             },
         )
     )
@@ -121,7 +121,7 @@ def test_expire_once_skips_mismatched_container_identity(tmp_path):
             name="not-ours",
             image="old:latest",
             status="running",
-            labels={"udc.allocation": allocation_id},
+            labels={"citespec.allocation": allocation_id},
         )
     )
     assert expire_once(connection, fake, now=NOW) == []

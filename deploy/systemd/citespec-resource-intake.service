@@ -1,0 +1,40 @@
+[Unit]
+Description=Citespec membership intake (low-privilege application entry)
+After=network.target
+
+[Service]
+Type=simple
+User=citespec-intake
+Group=citespec-intake
+ExecStart=/opt/citespec-resource/.venv/bin/python -m citespec_resource.enrollment.server
+Environment=CITESPEC_RESOURCE_CONFIG=/etc/citespec-resource/config.toml
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Intake owns ONLY its own store; it never sees the broker socket, member
+# database, Docker, or GPUs (goal member-onboarding-and-ux.md §9.2).
+StateDirectory=citespec-resource-intake
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/citespec-resource-intake
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

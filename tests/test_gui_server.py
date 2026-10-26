@@ -9,8 +9,8 @@ from typing import Any
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from udc_resource.gui import server as gui_server
-from udc_resource.login_wrapper import parse_command
+from citespec_resource.gui import server as gui_server
+from citespec_resource.login_wrapper import parse_command
 
 
 class FakeRunner:
@@ -64,7 +64,7 @@ class FakeRunner:
                 "status": "active",
                 "gpus": [3],
                 "expires_at": "2026-10-23T00:00:00+00:00",
-                "workspace": "/data1/udc-users/alice",
+                "workspace": "/data1/citespec-users/alice",
             }
         elif args[:1] == ["logs"]:
             data = {"id": args[1], "logs": "hello logs\n"}
@@ -84,12 +84,12 @@ class FakeRunner:
         elif args[:2] == ["queue", "cancel"]:
             data = {"queue_id": args[2], "status": "cancelled"}
         elif args[:2] == ["job", "list"]:
-            data = {"jobs": [{"name": "train", "session": "udc-train", "log": "/tmp/x"}]}
+            data = {"jobs": [{"name": "train", "session": "citespec-train", "log": "/tmp/x"}]}
         elif args[:2] == ["job", "start"]:
             data = {
                 "name": args[4],
-                "session": "udc-train",
-                "log": "/workspace/.udc-logs/train.log",
+                "session": "citespec-train",
+                "log": "/workspace/.citespec-logs/train.log",
             }
         elif args[:2] == ["job", "files"]:
             data = {"id": args[2], "files": [{"name": "train.log", "bytes": 42}]}
@@ -131,7 +131,7 @@ def _app(monitor_config, runner: FakeRunner, admin_alias: str | None = None):
 
 
 def _headers() -> dict[str, str]:
-    return {"X-UDC-Token": "test-token"}
+    return {"X-CITESPEC-Token": "test-token"}
 
 
 async def test_index_contains_token_and_server(monitor_config):
@@ -175,7 +175,7 @@ async def test_apply_builds_cli_arguments(monitor_config):
                     "cpus": 8,
                     "memory_gb": 32,
                     "hours": 12,
-                    "image": "udc-base:2026.10",
+                    "image": "citespec-base:2026.10",
                     "note": "test",
                 }
             ),
@@ -194,7 +194,7 @@ async def test_apply_builds_cli_arguments(monitor_config):
             "--hours",
             "12",
             "--image",
-            "udc-base:2026.10",
+            "citespec-base:2026.10",
             "--note",
             "test",
         ]
@@ -221,6 +221,32 @@ async def test_apply_no_queue_flag(monitor_config):
         )
         assert response.status == 200
         assert runner.calls[0][1][-1] == "--no-queue"
+    finally:
+        await client.close()
+
+
+async def test_apply_forwards_gpu_count_and_idempotency(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.post(
+            "/api/apply",
+            headers=_headers(),
+            data=json.dumps(
+                {
+                    "gpus": [],
+                    "gpu_count": 2,
+                    "cpus": 4,
+                    "memory_gb": 8,
+                    "hours": 2,
+                    "idempotency_key": "gui-1",
+                }
+            ),
+        )
+        assert response.status == 200
+        args = runner.calls[0][1]
+        assert args[args.index("--gpu-count") + 1] == "2"
+        assert args[args.index("--idempotency-key") + 1] == "gui-1"
     finally:
         await client.close()
 
@@ -345,7 +371,7 @@ def test_ssh_runner_builds_json_cli_command(monitor_config, monkeypatch):
     argv = runner._argv("member-alias", ["list"])
     assert argv is not None
     assert argv[-2] == "member-alias"
-    assert argv[-1] == "udc-resource list --json"
+    assert argv[-1] == "citespec-resource list --json"
     assert "BatchMode=yes" in argv
 
 
@@ -385,7 +411,7 @@ def test_ssh_runner_preserves_note_through_forcecommand(monitor_config, monkeypa
     remote = argv[-1]
     assert isinstance(remote, str)
     assert parse_command(remote) == [
-        "udc-resource",
+        "citespec-resource",
         "apply",
         "--gpus",
         "3",
@@ -407,7 +433,7 @@ async def test_job_start_and_persistent_log_endpoints(monitor_config):
         assert started.status == 200
         payload = await started.json()
         assert payload["ok"] is True
-        assert payload["data"]["log"] == "/workspace/.udc-logs/train.log"
+        assert payload["data"]["log"] == "/workspace/.citespec-logs/train.log"
         # The command travels verbatim as --shell; the GUI must not split it.
         assert runner.calls[-1][1] == [
             "job",
@@ -448,8 +474,8 @@ def test_ssh_runner_puts_json_before_separator(monitor_config):
         ["job", "start", "alloc-1", "--name", "train", "--", "python", "train.py", "-e", "10"],
     )
     remote = shlex.split(argv[-1])
-    assert remote[0] == "udc-resource"
-    # --json must be consumed by udc-resource itself; everything after the
+    assert remote[0] == "citespec-resource"
+    # --json must be consumed by citespec-resource itself; everything after the
     # `--` separator belongs to the training command.
     assert remote.index("--json") < remote.index("--")
     assert remote[remote.index("--") + 1 :] == ["python", "train.py", "-e", "10"]
@@ -470,7 +496,7 @@ class FakeVscodeProcess:
             payload = {
                 "stage": stage,
                 "port": 39111,
-                "uri": "vscode-remote://ssh-remote+udc-alloc-1/workspace",
+                "uri": "vscode-remote://ssh-remote+citespec-alloc-1/workspace",
             }
         readiness_path.write_text(json.dumps(payload), encoding="utf-8")
         FakeVscodeProcess.last = self
@@ -516,7 +542,7 @@ async def test_vscode_endpoint_waits_for_real_readiness(monitor_config, monkeypa
         member_alias=runner.member_alias,
         runner=runner,
         token="test-token",
-        config_path="/etc/udc-resource/config.toml",
+        config_path="/etc/citespec-resource/config.toml",
     )
     client = await _client(app)
     try:
@@ -529,7 +555,7 @@ async def test_vscode_endpoint_waits_for_real_readiness(monitor_config, monkeypa
         assert payload["data"]["pid"] == 4242
         argv = FakeVscodeProcess.last.argv
         assert "--config" in argv
-        assert argv[argv.index("--config") + 1] == "/etc/udc-resource/config.toml"
+        assert argv[argv.index("--config") + 1] == "/etc/citespec-resource/config.toml"
         assert "--readiness-file" in argv
     finally:
         await client.close()
@@ -757,5 +783,26 @@ async def test_membership_admin_endpoints(monitor_config):
             data=json.dumps({"operation_id": "op-1"}),
         )
         assert retry.status == 200
+        key_add = await client.post(
+            "/api/admin/membership/keys/add",
+            headers=_headers(),
+            data=json.dumps({"member_id": "m1", "public_key": "ssh-ed25519 AAAA test"}),
+        )
+        assert key_add.status == 200
+        assert runner.calls[-1][1][:3] == ["admin", "members", "key-add"]
+        assert runner.calls[-1][1][-1] == "ssh-ed25519 AAAA test"
+        key_revoke = await client.post(
+            "/api/admin/membership/keys/revoke",
+            headers=_headers(),
+            data=json.dumps({"member_id": "m1", "key_id": "k1"}),
+        )
+        assert key_revoke.status == 200
+        assert runner.calls[-1][1][:3] == ["admin", "members", "key-revoke"]
+        key_missing = await client.post(
+            "/api/admin/membership/keys/add",
+            headers=_headers(),
+            data=json.dumps({"member_id": "m1"}),
+        )
+        assert key_missing.status == 400
     finally:
         await client.close()

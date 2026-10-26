@@ -11,7 +11,7 @@ FAIL=0
 WARN=0
 FAILURES=()
 WARNINGS=()
-MEMBER_SHELL=/usr/local/libexec/udc-resource/member-shell
+MEMBER_SHELL=/usr/local/libexec/citespec-resource/member-shell
 
 usage() {
     cat <<'EOF'
@@ -53,7 +53,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-RESULTS=$(mktemp "${TMPDIR:-/tmp}/udc-legacy-audit.XXXXXX") || exit 1
+RESULTS=$(mktemp "${TMPDIR:-/tmp}/citespec-legacy-audit.XXXXXX") || exit 1
 trap 'rm -f "$RESULTS"' EXIT
 
 PYTHON_BIN=$(command -v python3 2>/dev/null || command -v python3.12 2>/dev/null || true)
@@ -154,7 +154,7 @@ else
         warn "root-owned member shell is not installed yet: $MEMBER_SHELL"
     fi
 fi
-for user in $(effective_members udc-members); do
+for user in $(effective_members citespec-members); do
     shell=$(getent passwd "$user" | cut -d: -f7)
     if [ "$shell" = "$MEMBER_SHELL" ]; then
         ok "member $user uses the restricted login shell"
@@ -166,18 +166,18 @@ for user in $(effective_members udc-members); do
 done
 
 section "privileged groups"
-for group in sudo docker udc-gpu video render wheel; do
+for group in sudo docker citespec-gpu video render wheel; do
     members=$(effective_members "$group")
     [ -n "$members" ] || continue
     [ "$JSON" -eq 1 ] || printf '%s effective members: %s\n' "$group" "$members"
     for user in $members; do
         approved=0
-        if user_in_group "$user" udc-admins; then
+        if user_in_group "$user" citespec-admins; then
             approved=1
         fi
-        if [ "$group" = "udc-gpu" ]; then
-            fail "$user is in udc-gpu; ordinary members must not receive GPU device access"
-        elif user_in_group "$user" udc-members; then
+        if [ "$group" = "citespec-gpu" ]; then
+            fail "$user is in citespec-gpu; ordinary members must not receive GPU device access"
+        elif user_in_group "$user" citespec-members; then
             fail "member $user is in privileged group $group"
         elif [ "$approved" -eq 1 ]; then
             warn "approved admin $user is in privileged group $group; verify this is intentional"
@@ -187,9 +187,9 @@ for group in sudo docker udc-gpu video render wheel; do
     done
 done
 
-for user in $(effective_members udc-members); do
-    if user_in_group "$user" udc-admins; then
-        fail "member $user is also in udc-admins; remove one role"
+for user in $(effective_members citespec-members); do
+    if user_in_group "$user" citespec-admins; then
+        fail "member $user is also in citespec-admins; remove one role"
     fi
 done
 
@@ -221,7 +221,7 @@ if command -v sudo >/dev/null 2>&1; then
         [ "$uid" -ge 1000 ] || continue
         sudo_output=$(sudo -l -U "$user" 2>&1 || true)
         if printf '%s\n' "$sudo_output" | grep -qE 'may run the following|NOPASSWD|ALL[[:space:]]*='; then
-            if user_in_group "$user" udc-admins; then
+            if user_in_group "$user" citespec-admins; then
                 warn "approved admin $user has sudo rights; verify this is intentional"
             else
                 fail "non-approved account $user has sudo rights"
@@ -247,7 +247,7 @@ if [ -x "$SSHD_BIN" ]; then
             warn "effective sshd policy permits password authentication"
         fi
     fi
-    for user in $(effective_members udc-members); do
+    for user in $(effective_members citespec-members); do
         member_policy=$("$SSHD_BIN" -T -C "user=$user,host=localhost,addr=127.0.0.1" 2>/dev/null || true)
         if [ -z "$member_policy" ]; then
             fail "cannot verify effective SSH policy for member $user"
@@ -260,7 +260,7 @@ if [ -x "$SSHD_BIN" ]; then
                 fail "member $user effective sshd is missing '$key $expected'"
             fi
         done <<'POLICY'
-forcecommand|/usr/local/bin/udc-resource-login
+forcecommand|/usr/local/bin/citespec-resource-login
 passwordauthentication|no
 kbdinteractiveauthentication|no
 pubkeyauthentication|yes
@@ -277,10 +277,10 @@ POLICY
     done
 fi
 
-DROPIN=/etc/ssh/sshd_config.d/60-udc-resource.conf
+DROPIN=/etc/ssh/sshd_config.d/60-citespec-resource.conf
 if [ -r "$DROPIN" ] \
-    && grep -q '^[[:space:]]*Match[[:space:]]\+Group[[:space:]]\+udc-members' "$DROPIN" \
-    && grep -q '^[[:space:]]*ForceCommand[[:space:]]\+/usr/local/bin/udc-resource-login' "$DROPIN"; then
+    && grep -q '^[[:space:]]*Match[[:space:]]\+Group[[:space:]]\+citespec-members' "$DROPIN" \
+    && grep -q '^[[:space:]]*ForceCommand[[:space:]]\+/usr/local/bin/citespec-resource-login' "$DROPIN"; then
     ok "member ForceCommand drop-in is present"
 else
     fail "member ForceCommand drop-in is missing or invalid: $DROPIN"
@@ -294,7 +294,7 @@ if [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ]; then
     [ "$JSON" -eq 1 ] || printf 'docker socket: %s %s\n' "$socket" "$sock_meta"
     sock_group=$(printf '%s\n' "$sock_meta" | awk '{print $3}')
     if [ -n "$sock_group" ] && [ "$sock_group" != "root" ]; then
-        for user in $(effective_members udc-members); do
+        for user in $(effective_members citespec-members); do
             if user_in_group "$user" "$sock_group"; then
                 fail "member $user can access the Docker socket via group $sock_group"
             fi
@@ -323,7 +323,7 @@ if [ -n "$docker_bin" ]; then
     else
         for container_id in $container_ids; do
             name=$(docker inspect -f '{{.Name}}' "$container_id" 2>/dev/null || printf '%s' "$container_id")
-            managed=$(docker inspect -f '{{index .Config.Labels "udc.managed"}}' "$container_id" 2>/dev/null || true)
+            managed=$(docker inspect -f '{{index .Config.Labels "citespec.managed"}}' "$container_id" 2>/dev/null || true)
             container_status=$(docker inspect -f '{{.State.Status}}' "$container_id" 2>/dev/null || true)
             privileged=$(docker inspect -f '{{.HostConfig.Privileged}}' "$container_id" 2>/dev/null || true)
             pid_mode=$(docker inspect -f '{{.HostConfig.PidMode}}' "$container_id" 2>/dev/null || true)

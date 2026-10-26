@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from udc_resource.db import (
+from citespec_resource.db import (
     SCHEMA_VERSION,
     connect,
     get_setting,
@@ -30,12 +30,12 @@ def _add_allocation(connection, allocation_id, status="pending"):
         (
             allocation_id,
             1000,
-            "udc-test",
+            "citespec-test",
             status,
-            "udc-base:2026.10",
+            "citespec-base:2026.10",
             8.0,
             32,
-            "/data1/udc-users/udc-test",
+            "/data1/citespec-users/citespec-test",
             "2026-10-22T00:00:00+00:00",
             "2026-10-22T00:00:00+00:00",
             "2026-10-22T12:00:00+00:00",
@@ -143,3 +143,79 @@ def test_settings_roundtrip(tmp_path):
     set_setting(connection, "mode", "active")
     assert get_setting(connection, "mode") == "active"
     connection.close()
+
+
+def test_migrations_upgrade_v2_database_to_current(tmp_path):
+    """Migration 3/4 are ordered, retryable, and preserve legacy queue rows."""
+    from citespec_resource.db import BASE_SCHEMA_VERSION, SCHEMA
+
+    path = tmp_path / "legacy.db"
+    connection = connect(path)
+    connection.executescript(SCHEMA)
+    connection.execute(f"PRAGMA user_version={BASE_SCHEMA_VERSION}")
+    connection.execute(
+        "INSERT INTO queue_requests("
+        "id, owner_uid, owner_name, cpus, memory_gb, hours, image, workspace, "
+        "requested_gpus, created_at, expires_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "legacy-queue",
+            1000,
+            "alice",
+            4,
+            8,
+            2,
+            "citespec-base:2026.10",
+            "/data1/citespec-users/alice",
+            "[0, 3]",
+            "2026-10-22T00:00:00+00:00",
+            "2026-10-22T02:00:00+00:00",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    upgraded = init_db(path)
+    version = upgraded.execute("PRAGMA user_version").fetchone()[0]
+    assert version == SCHEMA_VERSION
+    queue_columns = {row[1] for row in upgraded.execute("PRAGMA table_info(queue_requests)")}
+    assert {"requested_gpu_count", "idempotency_key"} <= queue_columns
+    row = upgraded.execute(
+        "SELECT requested_gpu_count, idempotency_key FROM queue_requests WHERE id = ?",
+        ("legacy-queue",),
+    ).fetchone()
+    assert row[0] == 2 and row[1] == ""
+    actions = upgraded.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='member_operations'"
+    ).fetchone()[0]
+    assert "enable_member" in actions
+    applied = {int(row[0]) for row in upgraded.execute("SELECT version FROM schema_migrations")}
+    assert {3, 4} <= applied
+    indexes = {
+        row[0]
+        for row in upgraded.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name IN ('idx_queue_owner_idempotency', 'idx_members_username_ci')"
+        )
+    }
+    assert "idx_queue_owner_idempotency" in indexes
+    upgraded.close()
+
+    # Re-running the migration path is a no-op, not a failure.
+    again = init_db(path)
+    assert again.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert (
+        again.execute("SELECT COUNT(*) FROM queue_requests WHERE id = 'legacy-queue'").fetchone()[0]
+        == 1
+    )
+    again.close()
+
+
+def test_refuses_newer_schema(tmp_path):
+    path = tmp_path / "future.db"
+    connection = connect(path)
+    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    connection.commit()
+    connection.close()
+    with pytest.raises(RuntimeError, match="newer"):
+        init_db(path)

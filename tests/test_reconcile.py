@@ -3,12 +3,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from citespec_resource import store
+from citespec_resource.broker.docker_driver import ContainerInfo
+from citespec_resource.broker.reconcile import reconcile
+from citespec_resource.db import init_db
+from citespec_resource.models import GPU
 from tests.fakes import FakeDocker
-from udc_resource import store
-from udc_resource.broker.docker_driver import ContainerInfo
-from udc_resource.broker.reconcile import reconcile
-from udc_resource.db import init_db
-from udc_resource.models import GPU
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 
@@ -38,8 +38,8 @@ def _allocation(
         gpu_uuids=("GPU-0",),
         cpus=8.0,
         memory_gb=32,
-        image="udc-base:2026.10",
-        workspace="/data1/udc-users/alice",
+        image="citespec-base:2026.10",
+        workspace="/data1/citespec-users/alice",
         note="",
         starts_at=created_at,
         expires_at=expires_at,
@@ -55,18 +55,18 @@ def _container(
     status: str = "running",
     managed: bool = True,
 ) -> ContainerInfo:
-    labels = {"udc.owner": "alice"}
+    labels = {"citespec.owner": "alice"}
     if managed:
         labels.update(
             {
-                "udc.managed": "true",
-                "udc.allocation": allocation_id,
+                "citespec.managed": "true",
+                "citespec.allocation": allocation_id,
             }
         )
     return ContainerInfo(
         id="container-1",
-        name="udc-alice-test",
-        image="udc-base:2026.10",
+        name="citespec-alice-test",
+        image="citespec-base:2026.10",
         status=status,
         labels=labels,
     )
@@ -111,7 +111,7 @@ def test_running_active_allocation_is_kept(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker()
@@ -131,7 +131,7 @@ def test_missing_active_container_releases_claim(tmp_path):
         connection,
         allocation_id,
         container_id="missing-container",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker()
@@ -150,7 +150,7 @@ def test_expired_active_container_is_removed(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker()
@@ -171,7 +171,7 @@ def test_stopped_active_container_is_failed(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker()
@@ -208,10 +208,10 @@ def test_orphaned_managed_container_is_reported_not_removed(tmp_path):
     fake.add_container(
         ContainerInfo(
             id="orphan",
-            name="udc-old",
-            image="udc-base:2026.10",
+            name="citespec-old",
+            image="citespec-base:2026.10",
             status="running",
-            labels={"udc.managed": "true", "udc.allocation": "missing-id"},
+            labels={"citespec.managed": "true", "citespec.allocation": "missing-id"},
         )
     )
     summary = reconcile(connection, fake, now=NOW)
@@ -261,7 +261,7 @@ def test_pending_mismatched_container_label_is_not_removed(tmp_path):
             name="not-ours",
             image="old:latest",
             status="running",
-            labels={"udc.allocation": allocation_id},
+            labels={"citespec.allocation": allocation_id},
         )
     )
     summary = reconcile(connection, fake, now=NOW)
@@ -282,7 +282,7 @@ def test_active_expired_identity_mismatch_is_not_removed(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker()
@@ -292,7 +292,7 @@ def test_active_expired_identity_mismatch_is_not_removed(tmp_path):
             name="not-ours",
             image="old:latest",
             status="running",
-            labels={"udc.allocation": allocation_id},
+            labels={"citespec.allocation": allocation_id},
         )
     )
     summary = reconcile(connection, fake, now=NOW)
@@ -314,7 +314,7 @@ def test_restarting_active_container_is_kept(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker()
@@ -336,7 +336,7 @@ def test_stopped_container_removal_failure_keeps_claims(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker(fail_remove=True)
@@ -353,8 +353,8 @@ def test_stopped_container_removal_failure_keeps_claims(tmp_path):
             gpu_uuids=("GPU-0",),
             cpus=8.0,
             memory_gb=32,
-            image="udc-base:2026.10",
-            workspace="/data1/udc-users/bob",
+            image="citespec-base:2026.10",
+            workspace="/data1/citespec-users/bob",
             note="",
             starts_at=NOW,
             expires_at=NOW + timedelta(hours=1),
@@ -373,7 +373,7 @@ def test_cleanup_pending_is_finalized_once_removal_succeeds(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-test",
+        container_name="citespec-alice-test",
         now=old,
     )
     fake = FakeDocker(fail_remove=True)

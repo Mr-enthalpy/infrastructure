@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>申请使用共享 GPU 资源</title>
+  <style>
+    :root { color-scheme: light dark; --line: #8884; --muted: #777; --accent: #2563eb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width: 880px; margin: 0 auto; padding: 32px 20px 80px; }
+    h1 { font-size: 1.9rem; margin: 0 0 6px; }
+    h2 { font-size: 1.25rem; margin-top: 34px; }
+    p.lead, .muted { color: var(--muted); }
+    .card { border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-top: 18px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+    label { display: block; font-weight: 600; margin-bottom: 5px; }
+    input, textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--line);
+      border-radius: 8px; font: inherit; background: transparent; color: inherit; }
+    textarea { min-height: 90px; resize: vertical; font-family: ui-monospace, Consolas, monospace; }
+    .check { display: flex; gap: 9px; align-items: flex-start; font-weight: 400; }
+    .check input { width: auto; margin-top: 5px; }
+    button { border: 0; border-radius: 8px; padding: 10px 18px; font: inherit; font-weight: 650;
+      cursor: pointer; background: var(--accent); color: #fff; }
+    button.secondary { background: transparent; color: inherit; border: 1px solid var(--line); }
+    button:disabled { opacity: .55; cursor: wait; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+    .notice { border-left: 4px solid #d97706; padding: 10px 14px; background: #d9770618; border-radius: 6px; }
+    .secret { font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere;
+      background: #8881; padding: 10px; border-radius: 7px; }
+    .ok { border-left-color: #16a34a; background: #16a34a18; }
+    .err { border-left-color: #dc2626; background: #dc262618; }
+    [hidden] { display: none !important; }
+    a { color: var(--accent); }
+    code { font-family: ui-monospace, Consolas, monospace; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>申请使用共享 GPU 资源</h1>
+  <p class="lead">填写申请后由管理员审核。审核通过后你会获得受限的 Linux 账号、个人 workspace 和 SSH 登录说明。</p>
+  <p class="muted" id="guide">正在加载使用指南…</p>
+
+  <div class="notice">
+    <strong>只提交公钥。</strong> 私钥永远不要粘贴、上传或发送给任何人。这里的公钥通常来自
+    <code>~/.ssh/id_ed25519.pub</code>，以 <code>ssh-ed25519</code> 或 <code>ssh-rsa</code> 开头。
+  </div>
+
+  <section class="card" aria-labelledby="apply-title">
+    <h2 id="apply-title">提交申请</h2>
+    <form id="apply-form">
+      <div class="grid">
+        <div><label for="invite_id">邀请编号</label><input id="invite_id" name="invite_id" autocomplete="off" required></div>
+        <div><label for="invite_secret">邀请密钥</label><input id="invite_secret" name="invite_secret" type="password" autocomplete="off" required></div>
+        <div><label for="display_name">姓名 / 显示名</label><input id="display_name" name="display_name" maxlength="80" required></div>
+        <div><label for="username">期望 Linux 用户名</label><input id="username" name="username" maxlength="32"
+          pattern="[a-z_][a-z0-9_-]{0,31}" placeholder="例如 zhangsan" required></div>
+        <div><label for="affiliation">所属单位 / 课题组</label><input id="affiliation" name="affiliation" maxlength="160" required></div>
+        <div><label for="contact">联系邮箱</label><input id="contact" name="contact" type="email" maxlength="160" required></div>
+        <div><label for="nickname">昵称（公开，可选）</label><input id="nickname" name="nickname" maxlength="60"></div>
+        <div><label for="public_contact">公开联系方式（可选）</label><input id="public_contact" name="public_contact" maxlength="160"></div>
+      </div>
+      <p><label for="purpose">用途说明</label><textarea id="purpose" name="purpose" maxlength="600"
+        placeholder="训练/推理任务、预计使用的框架和数据规模等" required></textarea></p>
+      <p><label for="public_keys">公钥（每行一个，最多 3 个）</label><textarea id="public_keys" name="public_keys"
+        placeholder="ssh-ed25519 AAAA... you@laptop" required></textarea></p>
+      <label class="check"><input id="agree_terms" name="agree_terms" type="checkbox" required>
+        <span>我已阅读使用指南，理解账号仅限本人使用，不共享凭据、不绕过资源限制，并遵守实验室数据与 GPU 使用规定。</span></label>
+      <div class="row"><button id="submit-button" type="submit">提交申请</button></div>
+    </form>
+    <div id="submit-result" hidden></div>
+  </section>
+
+  <section class="card" aria-labelledby="status-title">
+    <h2 id="status-title">查询或撤回申请</h2>
+    <p class="muted">回执密钥只显示一次。查询和撤回都通过加密请求体提交，不会放进网址。</p>
+    <form id="status-form">
+      <div class="grid">
+        <div><label for="status_request_id">申请编号</label><input id="status_request_id" name="request_id" autocomplete="off" required></div>
+        <div><label for="status_receipt">回执密钥</label><input id="status_receipt" name="receipt" type="password" autocomplete="off" required></div>
+      </div>
+      <div class="row">
+        <button type="submit">查询状态</button>
+        <button id="cancel-button" class="secondary" type="button">撤回申请</button>
+      </div>
+    </form>
+    <div id="status-result" hidden></div>
+  </section>
+
+  <section class="card" aria-labelledby="status-help">
+    <h2 id="status-help">接下来会发生什么</h2>
+    <ol>
+      <li>管理员核对申请和公钥；如信息不足，状态会变为“需要补充材料”。</li>
+      <li>批准后系统自动创建受限账号、workspace 和 root 管理的登录公钥。</li>
+      <li>状态变为“已批准/已开通”后，使用邮件或指南中的地址完成 SSH 配置。</li>
+      <li>GPU 使用仍然由你自助申请和排队，普通使用不需要每次人工审批。</li>
+    </ol>
+    <p class="muted">支持：<span id="support">见使用指南</span></p>
+  </section>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const show = (el) => { el.hidden = false; };
+  const hide = (el) => { el.hidden = true; };
+  const text = (value) => String(value == null ? "" : value);
+
+  function notice(target, message, kind) {
+    target.className = "notice " + (kind || "err");
+    target.textContent = message;
+    show(target);
+  }
+
+  async function api(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify(body)
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { /* non-JSON proxy error */ }
+    if (!payload) {
+      throw new Error("服务返回了无法解析的响应（HTTP " + response.status + "）");
+    }
+    if (!response.ok || !payload.ok) {
+      const error = payload.error || {};
+      throw new Error(text(error.message) || ("请求失败（HTTP " + response.status + "）"));
+    }
+    return payload.data || {};
+  }
+
+  async function loadGuide() {
+    try {
+      const response = await fetch("/api/guide", {headers: {"Accept": "application/json"}});
+      const payload = await response.json();
+      const data = payload.data || {};
+      const guide = $("guide");
+      guide.textContent = "";
+      if (data.guide_url) {
+        const link = document.createElement("a");
+        link.href = data.guide_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "阅读使用指南";
+        guide.appendChild(link);
+        guide.appendChild(document.createTextNode("。"));
+      } else {
+        guide.textContent = "使用指南暂未配置，请直接填写申请。";
+      }
+      const supportLabel = text(data.support_label) || "资源管理员";
+      const supportContact = text(data.support_contact);
+      $("support").textContent = supportContact ? supportLabel + "（" + supportContact + "）" : supportLabel;
+    } catch (_) {
+      $("guide").textContent = "无法加载指南；仍可提交申请或联系管理员。";
+    }
+  }
+
+  $("apply-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = $("submit-result");
+    const button = $("submit-button");
+    button.disabled = true;
+    try {
+      const keys = $("public_keys").value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (!keys.length) throw new Error("请至少提交一个公钥");
+      if (keys.length > 3) throw new Error("最多提交 3 个公钥");
+      const application = {
+        display_name: $("display_name").value.trim(),
+        username: $("username").value.trim().toLowerCase(),
+        affiliation: $("affiliation").value.trim(),
+        purpose: $("purpose").value.trim(),
+        contact: $("contact").value.trim(),
+        nickname: $("nickname").value.trim(),
+        public_contact: $("public_contact").value.trim(),
+        agree_terms: $("agree_terms").checked ? "1" : "",
+        public_keys: keys
+      };
+      const data = await api("/api/requests", {
+        invite_id: $("invite_id").value.trim(),
+        invite_secret: $("invite_secret").value,
+        application
+      });
+      result.className = "notice ok";
+      result.textContent = "";
+      const title = document.createElement("strong");
+      title.textContent = "申请已提交。请立即保存下面两项信息：";
+      const idLine = document.createElement("p");
+      idLine.textContent = "申请编号：";
+      const idValue = document.createElement("span");
+      idValue.className = "secret";
+      idValue.textContent = text(data.request_id);
+      idLine.appendChild(idValue);
+      const receiptLine = document.createElement("p");
+      receiptLine.textContent = "回执密钥（只显示这一次）：";
+      const receiptValue = document.createElement("span");
+      receiptValue.className = "secret";
+      receiptValue.textContent = text(data.receipt_secret);
+      receiptLine.appendChild(receiptValue);
+      const warning = document.createElement("p");
+      warning.className = "muted";
+      warning.textContent = "刷新页面后回执密钥无法再次查看；丢失后无法查询或撤回，但可联系管理员。";
+      result.append(title, idLine, receiptLine, warning);
+      show(result);
+      $("apply-form").reset();
+      $("status_request_id").value = text(data.request_id);
+    } catch (error) {
+      notice(result, error.message || "提交失败", "err");
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  function renderStatus(target, data) {
+    target.className = "notice ok";
+    target.textContent = "";
+    const status = document.createElement("p");
+    status.textContent = "当前状态：" + (text(data.status_label) || text(data.status) || "未知");
+    target.appendChild(status);
+    if (data.public_note) {
+      const note = document.createElement("p");
+      note.textContent = "管理员说明：" + data.public_note;
+      target.appendChild(note);
+    }
+    if (data.decision_at) {
+      const when = document.createElement("p");
+      when.className = "muted";
+      when.textContent = "处理时间：" + data.decision_at;
+      target.appendChild(when);
+    }
+    show(target);
+  }
+
+  $("status-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = $("status-result");
+    try {
+      const data = await api("/api/requests/status", {
+        request_id: $("status_request_id").value.trim(),
+        receipt: $("status_receipt").value
+      });
+      renderStatus(result, data);
+    } catch (error) {
+      notice(result, error.message || "查询失败", "err");
+    }
+  });
+
+  $("cancel-button").addEventListener("click", async () => {
+    const result = $("status-result");
+    const requestId = $("status_request_id").value.trim();
+    if (!requestId) { notice(result, "请先填写申请编号", "err"); return; }
+    if (!window.confirm("确定撤回该申请？撤回后不能恢复，需要重新提交。")) return;
+    try {
+      const data = await api("/api/requests/" + encodeURIComponent(requestId) + "/cancel", {
+        receipt: $("status_receipt").value
+      });
+      renderStatus(result, data);
+    } catch (error) {
+      notice(result, error.message || "撤回失败", "err");
+    }
+  });
+
+  loadGuide();
+})();
+</script>
+</body>
+</html>

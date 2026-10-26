@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from udc_resource import cli
-from udc_resource.errors import BrokerUnavailable
+from citespec_resource import cli
+from citespec_resource.errors import BrokerUnavailable
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "lab/resources.example.toml"
@@ -70,7 +70,7 @@ def test_apply_parses_gpu_indices(monkeypatch):
                 "status": "active",
                 "gpus": [3, 5],
                 "expires_at": "2026-10-23T00:00:00+00:00",
-                "workspace": "/data1/udc-users/alice",
+                "workspace": "/data1/citespec-users/alice",
             },
         }
     )
@@ -98,7 +98,7 @@ def test_apply_no_queue_flag_is_forwarded(monkeypatch):
                 "status": "active",
                 "gpus": [3],
                 "expires_at": "2026-10-23T00:00:00+00:00",
-                "workspace": "/data1/udc-users/alice",
+                "workspace": "/data1/citespec-users/alice",
             },
         }
     )
@@ -126,7 +126,7 @@ def test_apply_wait_json_prints_one_envelope(monkeypatch):
                     "cpus": 8.0,
                     "memory_gb": 32,
                     "hours": 1,
-                    "workspace": "/data1/udc-users/alice",
+                    "workspace": "/data1/citespec-users/alice",
                     "created_at": "2026-10-22T12:00:00+00:00",
                     "expires_at": "2026-10-23T12:00:00+00:00",
                     "position": 1,
@@ -253,7 +253,7 @@ def test_status_passes_optional_allocation_id(monkeypatch):
                     "gpus": [3],
                     "cpus": 8.0,
                     "memory_gb": 32,
-                    "workspace": "/data1/udc-users/alice",
+                    "workspace": "/data1/citespec-users/alice",
                     "starts_at": "2026-10-22T00:00:00+00:00",
                     "expires_at": "2026-10-22T12:00:00+00:00",
                     "remaining_seconds": 3600,
@@ -313,7 +313,7 @@ def test_apply_allows_cpu_only(monkeypatch):
                 "status": "active",
                 "gpus": [],
                 "expires_at": "2026-10-22T13:00:00+00:00",
-                "workspace": "/data1/udc-users/alice",
+                "workspace": "/data1/citespec-users/alice",
             },
         }
     )
@@ -332,7 +332,7 @@ def test_apply_allows_cpu_only(monkeypatch):
 
 def test_config_path_uses_environment(monkeypatch, tmp_path):
     path = tmp_path / "config.toml"
-    monkeypatch.setenv("UDC_RESOURCE_CONFIG", str(path))
+    monkeypatch.setenv("CITESPEC_RESOURCE_CONFIG", str(path))
     assert cli._config_path(None) == path
 
 
@@ -345,7 +345,7 @@ def test_logs_command(monkeypatch):
 
 
 def test_gui_command_uses_ssh_aliases(monkeypatch):
-    from udc_resource.gui import server as gui_server
+    from citespec_resource.gui import server as gui_server
 
     captured: dict = {}
 
@@ -372,8 +372,8 @@ def test_job_start_passes_command_argv(monkeypatch):
             "data": {
                 "id": "alloc-1",
                 "name": "train",
-                "session": "udc-train",
-                "log": "/data1/udc-users/alice/.udc-logs/train.log",
+                "session": "citespec-train",
+                "log": "/data1/citespec-users/alice/.citespec-logs/train.log",
             },
         }
     )
@@ -398,8 +398,8 @@ def test_gui_job_start_argv_parses_as_cli(monkeypatch):
     """
     import shlex
 
-    from udc_resource.config import load_config
-    from udc_resource.gui import server as gui_server
+    from citespec_resource.config import load_config
+    from citespec_resource.gui import server as gui_server
 
     config = load_config(CONFIG)
     ssh_runner = gui_server.SSHRunner(config, "member-alias", None)
@@ -408,9 +408,16 @@ def test_gui_job_start_argv_parses_as_cli(monkeypatch):
         ["job", "start", "alloc-1", "--name", "train", "--", "python", "train.py", "-e", "10"],
     )
     remote_tokens = shlex.split(argv[-1])
-    assert remote_tokens[0] == "udc-resource"
+    assert remote_tokens[0] == "citespec-resource"
     fake = FakeClient(
-        {"ok": True, "data": {"name": "train", "session": "udc-train", "log": "/workspace/log"}}
+        {
+            "ok": True,
+            "data": {
+                "name": "train",
+                "session": "citespec-train",
+                "log": "/workspace/log",
+            },
+        }
     )
     monkeypatch.setattr(cli, "_make_client", lambda cfg: fake)
     result = runner.invoke(cli.app, ["--config", str(CONFIG), *remote_tokens[1:]])
@@ -429,7 +436,14 @@ def test_gui_job_start_argv_parses_as_cli(monkeypatch):
 
 def test_job_start_shell_flag(monkeypatch):
     fake = FakeClient(
-        {"ok": True, "data": {"name": "train", "session": "udc-train", "log": "/workspace/log"}}
+        {
+            "ok": True,
+            "data": {
+                "name": "train",
+                "session": "citespec-train",
+                "log": "/workspace/log",
+            },
+        }
     )
     result = _invoke(
         monkeypatch,
@@ -494,12 +508,12 @@ def test_remote_mode_relays_command(monkeypatch):
     monkeypatch.setattr(
         sys_module,
         "argv",
-        ["udc-resource", "--config", str(CONFIG), "--remote", "amax", "queue", "list"],
+        ["citespec-resource", "--config", str(CONFIG), "--remote", "amax", "queue", "list"],
     )
     result = runner.invoke(cli.app, ["--config", str(CONFIG), "--remote", "amax", "queue", "list"])
     assert result.exit_code == 0
     assert recorded["argv"][-2] == "amax"
-    assert recorded["argv"][-1] == "udc-resource queue list"
+    assert recorded["argv"][-1] == "citespec-resource queue list"
     assert "--config" not in recorded["argv"][-1]
 
 
@@ -522,7 +536,7 @@ def test_connect_command_builds_ssh_relay(monkeypatch):
     result = _invoke(monkeypatch, FakeClient(), ["connect", "alloc-1", "--job", "train"])
     assert result.exit_code == 0
     assert "-t" in recorded["argv"] and recorded["argv"].count("-t") == 2
-    assert recorded["argv"][-1] == "udc-resource shell alloc-1 --job train"
+    assert recorded["argv"][-1] == "citespec-resource shell alloc-1 --job train"
 
 
 def test_connect_command_rejects_bad_job_name(monkeypatch):
@@ -539,7 +553,7 @@ def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
     """A failed probe must still remove the managed SSH block."""
     import asyncio as asyncio_module
 
-    from udc_resource.config import load_config
+    from citespec_resource.config import load_config
 
     async def failing_probe(host, ssh_config, timeout):
         raise RuntimeError("probe boom")
@@ -554,7 +568,7 @@ def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
                 allocation_id="abc123",
                 username="alice",
                 ssh_alias="amax",
-                host="udc-abc123",
+                host="citespec-abc123",
                 requested_port=0,
                 ssh_config=ssh_config_path,
                 identity=None,
@@ -562,12 +576,12 @@ def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
             )
         )
     text = ssh_config_path.read_text(encoding="utf-8") if ssh_config_path.exists() else ""
-    assert "udc-abc123" not in text
+    assert "citespec-abc123" not in text
     # The block lives in the managed include file, which must be gone too,
     # and the Include directive we added must be removed again.
-    managed = ssh_config_path.parent / "udc-vscode-config"
-    assert not managed.exists() or "udc-abc123" not in managed.read_text(encoding="utf-8")
-    assert "udc-vscode-config" not in text
+    managed = ssh_config_path.parent / "citespec-vscode-config"
+    assert not managed.exists() or "citespec-abc123" not in managed.read_text(encoding="utf-8")
+    assert "citespec-vscode-config" not in text
 
 
 def test_sweep_stale_managed_blocks(tmp_path):
@@ -580,24 +594,24 @@ def test_sweep_stale_managed_blocks(tmp_path):
     try:
         config = tmp_path / "config"
         config.write_text(
-            "# BEGIN UDC VSCODE dead1\n"
-            "Host udc-dead1\n"
+            "# BEGIN CITESPEC VSCODE dead1\n"
+            "Host citespec-dead1\n"
             "  HostName 127.0.0.1\n"
             "  Port 1\n"
-            "# END UDC VSCODE dead1\n"
+            "# END CITESPEC VSCODE dead1\n"
             "\n"
-            f"# BEGIN UDC VSCODE live1\n"
-            "Host udc-live1\n"
+            f"# BEGIN CITESPEC VSCODE live1\n"
+            "Host citespec-live1\n"
             "  HostName 127.0.0.1\n"
             f"  Port {live_port}\n"
-            "# END UDC VSCODE live1\n",
+            "# END CITESPEC VSCODE live1\n",
             encoding="utf-8",
         )
         removed = cli._sweep_stale_managed_blocks(config)
         assert removed == 1
         text = config.read_text(encoding="utf-8")
         assert "dead1" not in text
-        assert "udc-live1" in text
+        assert "citespec-live1" in text
     finally:
         live.close()
 
@@ -619,12 +633,12 @@ def test_managed_include_wins_over_host_wildcard(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(home))
     user_config = home / ".ssh" / "config"
     user_config.write_text("Host *\n  User otheruser\n", encoding="utf-8")
-    block = cli._managed_block("abc123", "udc-abc123", 22222, "alice", None)
+    block = cli._managed_block("abc123", "citespec-abc123", 22222, "alice", None)
     added = cli._install_managed_block(user_config, "abc123", block)
     assert added is True
     try:
         result = subprocess_module.run(
-            [ssh, "-G", "-F", str(user_config), "udc-abc123"],
+            [ssh, "-G", "-F", str(user_config), "citespec-abc123"],
             capture_output=True,
             text=True,
             check=False,
@@ -640,7 +654,7 @@ def test_managed_include_wins_over_host_wildcard(tmp_path, monkeypatch):
     finally:
         cli._remove_managed_block(user_config, "abc123", own_port=22222)
     text = user_config.read_text(encoding="utf-8")
-    assert "udc-vscode-config" not in text
+    assert "citespec-vscode-config" not in text
 
 
 def test_vscode_config_removal_respects_live_block(tmp_path):
@@ -655,21 +669,21 @@ def test_vscode_config_removal_respects_live_block(tmp_path):
     live_port = live.getsockname()[1]
     try:
         config = tmp_path / "config"
-        block = cli._managed_block("abc123", "udc-abc123", live_port, "alice", None)
+        block = cli._managed_block("abc123", "citespec-abc123", live_port, "alice", None)
         assert cli._install_managed_block(config, "abc123", block) is True
 
         # A newer process overwrote the port and is still running: the older
         # process (own_port is dead) must leave the block alone.
         cli._remove_managed_block(config, "abc123", own_port=1)
-        managed = config.parent / "udc-vscode-config"
-        assert "udc-abc123" in managed.read_text(encoding="utf-8")
-        assert "udc-vscode-config" in config.read_text(encoding="utf-8")
+        managed = config.parent / "citespec-vscode-config"
+        assert "citespec-abc123" in managed.read_text(encoding="utf-8")
+        assert "citespec-vscode-config" in config.read_text(encoding="utf-8")
 
         # Once the port is dead the block is stale and gets removed along
         # with the Include directive we added.
         cli._remove_managed_block(config, "abc123", own_port=live_port)
-        assert not managed.exists() or "udc-abc123" not in managed.read_text(encoding="utf-8")
-        assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
+        assert not managed.exists() or "citespec-abc123" not in managed.read_text(encoding="utf-8")
+        assert "citespec-vscode-config" not in config.read_text(encoding="utf-8")
     finally:
         live.close()
 
@@ -741,13 +755,13 @@ def test_workstation_defaults_to_relay_without_socket(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys_module,
         "argv",
-        ["udc-resource", "--config", str(CONFIG), "list"],
+        ["citespec-resource", "--config", str(CONFIG), "list"],
     )
     result = runner.invoke(cli.app, ["--config", str(CONFIG), "list"])
     assert result.exit_code == 0
     config = _no_socket_config(tmp_path)
     assert recorded["argv"][-2] == config.server.ssh_alias
-    assert recorded["argv"][-1] == "udc-resource list"
+    assert recorded["argv"][-1] == "citespec-resource list"
 
 
 def test_local_flag_forces_socket_mode(tmp_path, monkeypatch):
@@ -765,7 +779,7 @@ def test_local_flag_forces_socket_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys_module,
         "argv",
-        ["udc-resource", "--config", str(CONFIG), "--local", "list"],
+        ["citespec-resource", "--config", str(CONFIG), "--local", "list"],
     )
     # --local means the CLI must not relay: no ssh call happens (the local
     # socket connection itself fails with the usual broker-unavailable error).
@@ -790,10 +804,183 @@ def test_no_relay_when_socket_exists(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys_module,
         "argv",
-        ["udc-resource", "--config", str(CONFIG), "list"],
+        ["citespec-resource", "--config", str(CONFIG), "list"],
     )
     runner.invoke(cli.app, ["--config", str(CONFIG), "list"])
     assert calls == []
+
+
+def test_help_is_not_relayed(tmp_path, monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", lambda path: _no_socket_config(tmp_path))
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["citespec-resource", "--config", str(CONFIG), "admin", "members", "--help"],
+    )
+    result = runner.invoke(cli.app, ["--config", str(CONFIG), "admin", "members", "--help"])
+    assert result.exit_code == 0
+    assert calls == []
+
+
+def test_me_without_subcommand_queries_status(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "username": "alice",
+                "uid": 1000,
+                "membership": {"status": "active", "valid_until": ""},
+                "keys": [],
+            },
+        }
+    )
+    result = _invoke(monkeypatch, fake, ["me", "--json"])
+    assert result.exit_code == 0
+    assert fake.calls[0][0] == "me"
+
+
+def test_setup_works_with_minimal_connection_args(monkeypatch, tmp_path):
+    from citespec_resource import onboarding
+
+    captured = {}
+
+    def fake_setup(config, *, host, yes, expected_fingerprint=""):
+        captured["config"] = config
+        captured["host"] = host
+        captured["yes"] = yes
+        captured["fingerprint"] = expected_fingerprint
+        return 0
+
+    monkeypatch.setattr(onboarding, "run_setup", fake_setup)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--config",
+            str(tmp_path / "missing.toml"),
+            "setup",
+            "--server",
+            "lab.example.invalid",
+            "--user",
+            "alice",
+            "--port",
+            "2222",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "lab.example.invalid"
+    assert captured["config"].server.ssh_alias == "lab.example.invalid"
+    assert captured["config"].server.ssh_user == "alice"
+    assert captured["config"].server.ssh_port == 2222
+
+
+def test_client_profile_without_hardware_is_loaded(tmp_path, monkeypatch):
+    profile = tmp_path / "client.toml"
+    profile.write_text(
+        "\n".join(
+            [
+                "[server]",
+                'name = "lab"',
+                'ssh_alias = "lab"',
+                'ssh_user = "alice"',
+                "ssh_port = 22",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "username": "alice",
+                "uid": 1000,
+                "membership": {"status": "active", "valid_until": ""},
+                "keys": [],
+            },
+        }
+    )
+    monkeypatch.setattr(cli, "_make_client", lambda config: fake)
+    result = runner.invoke(cli.app, ["--config", str(profile), "me", "--json"])
+    assert result.exit_code == 0, result.output
+    assert fake.calls[0][0] == "me"
+
+
+def test_me_keys_accepts_positional_file_and_key_id(monkeypatch, tmp_path):
+    key = tmp_path / "id_ed25519.pub"
+    key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test\n", encoding="utf-8")
+    fake = FakeClient({"ok": True, "data": {"fingerprint": "SHA256:test", "key_id": "k1"}})
+    result = _invoke(monkeypatch, fake, ["me", "keys", "add", str(key)])
+    assert result.exit_code == 0
+    assert fake.calls[0][0] == "me_keys_add"
+    assert fake.calls[0][1]["public_key"].startswith("ssh-ed25519 ")
+
+    result = _invoke(monkeypatch, fake, ["me", "keys", "revoke", "k1", "--json"])
+    assert result.exit_code == 0
+    assert fake.calls[1][0] == "me_keys_revoke"
+    assert fake.calls[1][1]["key_id"] == "k1"
+
+
+def test_join_portal_does_not_require_local_config(monkeypatch, tmp_path):
+    import sys as sys_module
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            payload = {"ok": True, "data": {"request_id": "r1", "receipt_secret": "s"}}
+            return json.dumps(payload).encode()
+
+    def fake_urlopen(request, timeout=0):
+        assert request.full_url.endswith("/api/requests")
+        return Response()
+
+    monkeypatch.setattr(sys_module, "argv", ["citespec-resource", "join"])
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "secret")
+    # A missing local config must not block joining through --portal.
+    result = runner.invoke(
+        cli.app,
+        [
+            "--config",
+            str(tmp_path / "missing.toml"),
+            "join",
+            "--portal",
+            "https://lab.example.invalid/compute",
+            "--invite-id",
+            "invite-1",
+        ],
+        input="\n".join(
+            [
+                "Alice",
+                "alice",
+                "Lab",
+                "research",
+                "alice@example.invalid",
+                "",
+                "n",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test",
+                "secret",
+            ]
+        )
+        + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "申请已提交" in result.output
 
 
 def test_attach_is_never_relayed(tmp_path, monkeypatch):
@@ -811,7 +998,7 @@ def test_attach_is_never_relayed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys_module,
         "argv",
-        ["udc-resource", "--config", str(CONFIG), "job", "attach", "alloc-1"],
+        ["citespec-resource", "--config", str(CONFIG), "job", "attach", "alloc-1"],
     )
     runner.invoke(cli.app, ["--config", str(CONFIG), "job", "attach", "alloc-1"])
     assert calls == []
@@ -820,35 +1007,35 @@ def test_attach_is_never_relayed(tmp_path, monkeypatch):
 def test_vscode_config_include_survives_other_allocation(tmp_path):
     """Closing allocation A must not strand allocation B's tunnel alias."""
     config = tmp_path / "config"
-    block_a = cli._managed_block("aaaa", "udc-aaaa", 22001, "alice", None)
-    block_b = cli._managed_block("bbbb", "udc-bbbb", 22002, "alice", None)
+    block_a = cli._managed_block("aaaa", "citespec-aaaa", 22001, "alice", None)
+    block_b = cli._managed_block("bbbb", "citespec-bbbb", 22002, "alice", None)
     assert cli._install_managed_block(config, "aaaa", block_a) is True
     assert cli._install_managed_block(config, "bbbb", block_b) is False
 
     # A exits: its block goes, but B's block keeps the file non-empty, so the
     # Include directive must survive.
     cli._remove_managed_block(config, "aaaa", own_port=22001)
-    managed = config.parent / "udc-vscode-config"
+    managed = config.parent / "citespec-vscode-config"
     text = config.read_text(encoding="utf-8")
-    assert "udc-vscode-config" in text
-    assert "udc-bbbb" in managed.read_text(encoding="utf-8")
+    assert "citespec-vscode-config" in text
+    assert "citespec-bbbb" in managed.read_text(encoding="utf-8")
 
     # B exits last: the file empties and the Include goes with it.
     cli._remove_managed_block(config, "bbbb", own_port=22002)
-    assert not managed.exists() or "udc-bbbb" not in managed.read_text(encoding="utf-8")
-    assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
+    assert not managed.exists() or "citespec-bbbb" not in managed.read_text(encoding="utf-8")
+    assert "citespec-vscode-config" not in config.read_text(encoding="utf-8")
 
 
 def test_sweep_clears_include_when_all_blocks_stale(tmp_path):
     config = tmp_path / "config"
-    block = cli._managed_block("cccc", "udc-cccc", 1, "alice", None)
+    block = cli._managed_block("cccc", "citespec-cccc", 1, "alice", None)
     cli._install_managed_block(config, "cccc", block)
     removed = cli._sweep_stale_managed_blocks(
-        config.parent / "udc-vscode-config",
+        config.parent / "citespec-vscode-config",
         config,
     )
     assert removed == 1
-    assert "udc-vscode-config" not in config.read_text(encoding="utf-8")
+    assert "citespec-vscode-config" not in config.read_text(encoding="utf-8")
 
 
 def test_probe_timeout_kills_ssh_child(tmp_path, monkeypatch):
@@ -883,5 +1070,5 @@ def test_probe_timeout_kills_ssh_child(tmp_path, monkeypatch):
     import asyncio as asyncio_module
 
     with pytest.raises(RuntimeError, match="timed out"):
-        asyncio_module.run(cli._probe_container_ssh("udc-x", tmp_path / "config", 1))
+        asyncio_module.run(cli._probe_container_ssh("citespec-x", tmp_path / "config", 1))
     assert fake.killed and fake.reaped

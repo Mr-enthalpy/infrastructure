@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from udc_resource.broker.docker_driver import (
+from citespec_resource.broker.docker_driver import (
     ContainerInfo,
     ContainerRef,
     GPUProcess,
 )
-from udc_resource.identity import Identity
-from udc_resource.models import GPU, Allocation
+from citespec_resource.identity import Identity
+from citespec_resource.models import GPU, Allocation
 
 
 class FakeShellSession:
@@ -95,7 +95,7 @@ class FakeDocker:
         if self.fail_create:
             raise RuntimeError("simulated docker failure")
         container_id = f"container-{self._next_id}"
-        name = f"udc-{allocation.owner_name}-{self._next_id}"
+        name = f"citespec-{allocation.owner_name}-{self._next_id}"
         self._next_id += 1
         self.created.append(allocation)
         self.containers[container_id] = ContainerInfo(
@@ -104,11 +104,11 @@ class FakeDocker:
             image=allocation.image,
             status="running",
             labels={
-                "udc.managed": "true",
-                "udc.owner": allocation.owner_name,
-                "udc.allocation": allocation.id,
-                "udc.gpus": ",".join(allocation.gpus),
-                "udc.profile": "restricted",
+                "citespec.managed": "true",
+                "citespec.owner": allocation.owner_name,
+                "citespec.allocation": allocation.id,
+                "citespec.gpus": ",".join(allocation.gpus),
+                "citespec.profile": "restricted",
             },
         )
         return ContainerRef(id=container_id, name=name)
@@ -198,7 +198,7 @@ class FakeDocker:
         return [
             {
                 "name": name,
-                "session": f"udc-{name}",
+                "session": f"citespec-{name}",
                 "created": info["created"],
                 "attached": info["attached"],
             }

@@ -107,7 +107,7 @@ def rotate_workspace(workspace_root: Path, *, max_bytes: int, keep: int) -> int:
             if user_fd is None:
                 continue
             try:
-                logs_fd = _open_dir(user_fd, ".udc-logs")
+                logs_fd = _open_dir(user_fd, ".citespec-logs")
                 if logs_fd is None:
                     continue
                 try:
@@ -152,7 +152,7 @@ def rotate_workspace(workspace_root: Path, *, max_bytes: int, keep: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workspace-root", default="/data1/udc-users")
+    parser.add_argument("--workspace-root", default="/home/data1/citespec-users")
     parser.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
     parser.add_argument("--keep", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")

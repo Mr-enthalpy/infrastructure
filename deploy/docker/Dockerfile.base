@@ -18,9 +18,9 @@ COPY sshd_config /etc/ssh/sshd_config
 COPY bootstrap.sh /usr/local/bin/bootstrap.sh
 RUN chmod 0755 /usr/local/bin/bootstrap.sh \
     && mkdir -p /run/sshd /etc/sudoers.d \
-    && printf 'ALL ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/udc-member \
-    && chmod 0440 /etc/sudoers.d/udc-member \
-    && visudo -cf /etc/sudoers.d/udc-member \
+    && printf 'ALL ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/citespec-member \
+    && chmod 0440 /etc/sudoers.d/citespec-member \
+    && visudo -cf /etc/sudoers.d/citespec-member \
     && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
 WORKDIR /workspace

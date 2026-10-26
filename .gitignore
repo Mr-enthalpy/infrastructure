@@ -5,6 +5,9 @@ lab/members.local.toml
 !lab/resources.example.toml
 !lab/members.example.toml
 
+# Full live deployment handoff; keep only sanitized content in the public tree.
+docs/handoff.local.md
+
 # Local tool configuration may contain API keys
 opencode.json
 

@@ -1,7 +1,7 @@
 import pytest
 
-from udc_resource.errors import ProtocolError
-from udc_resource.stream import (
+from citespec_resource.errors import ProtocolError
+from citespec_resource.stream import (
     FRAME_DATA,
     FRAME_EXIT,
     FRAME_RESIZE,

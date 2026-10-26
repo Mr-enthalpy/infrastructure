@@ -7,7 +7,7 @@
 set -u
 set -o pipefail
 
-ROOT=/data1/udc-users
+ROOT=/home/data1/citespec-users
 LIMIT_GB=200
 SOFT_PERCENT=90
 ASSUME_YES=0
@@ -18,7 +18,7 @@ usage() {
 usage: configure_quotas.sh [options]
 
 Options:
-  --workspace-root PATH  Workspace root (default: /data1/udc-users).
+  --workspace-root PATH  Workspace root (default: /home/data1/citespec-users).
   --limit-gb N           Hard quota per member directory (default: 200).
   --soft-percent N       Soft quota percentage (default: 90).
   --yes                  Actually apply quotas (default: dry-run).

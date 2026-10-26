@@ -2,7 +2,7 @@
 # Read-only GPU device permission verification.
 #
 # With --member it checks one account. Without --member it checks every
-# effective udc-members account, which is what the Broker uses for its
+# effective citespec-members account, which is what the Broker uses for its
 # continuous gate.
 set -u
 set -o pipefail
@@ -23,14 +23,14 @@ usage() {
 usage: verify_gpu_permissions.sh [--member USER] [options]
 
 Options:
-  --member USER        Check one Linux account instead of every udc-members account.
+  --member USER        Check one Linux account instead of every citespec-members account.
   --expected-gpus N    Expected GPU count (default: 8).
   --production         Treat missing tools and unreadable state as failures.
   --json               Print one machine-readable JSON object and no human text.
   -h, --help           Show this help.
 
 Checks every /dev/nvidia* node (nvidia0..N, nvidiactl, nvidia-uvm and any
-additional NVIDIA nodes), expected 0660 root:udc-gpu ownership, and verifies
+additional NVIDIA nodes), expected 0660 root:citespec-gpu ownership, and verifies
 that members cannot read or write any node and cannot run nvidia-smi.
 Run again after reboot and after reloading the NVIDIA driver.
 EOF
@@ -101,7 +101,7 @@ if [ "$JSON" -eq 1 ] && [ -z "$PYTHON_BIN" ]; then
     exit 1
 fi
 
-RESULTS=$(mktemp "${TMPDIR:-/tmp}/udc-gpu-audit.XXXXXX") || exit 1
+RESULTS=$(mktemp "${TMPDIR:-/tmp}/citespec-gpu-audit.XXXXXX") || exit 1
 trap 'rm -f "$RESULTS"' EXIT
 
 for tool in nvidia-smi stat su getent id awk find; do
@@ -122,12 +122,12 @@ done
 if [ "$MEMBER_SET" -eq 1 ]; then
     MEMBERS="$MEMBER"
 else
-    MEMBERS=$(effective_members udc-members)
+    MEMBERS=$(effective_members citespec-members)
 fi
 
 section "members"
 if [ -z "$MEMBERS" ]; then
-    ok "no udc-members accounts to test"
+    ok "no citespec-members accounts to test"
 else
     for current in $MEMBERS; do
         if ! getent passwd "$current" >/dev/null 2>&1; then
@@ -135,7 +135,7 @@ else
             continue
         fi
         MEMBER_GROUPS=$(id -nG "$current")
-        for forbidden in udc-gpu docker sudo video render udc-admins; do
+        for forbidden in citespec-gpu docker sudo video render citespec-admins; do
             if printf '%s\n' "$MEMBER_GROUPS" | tr ' ' '\n' | grep -qx "$forbidden"; then
                 fail "$current is in forbidden group $forbidden"
             else
@@ -167,15 +167,15 @@ else
 fi
 
 section "GPU group membership"
-GPU_MEMBERS=$(effective_members udc-gpu | tr '\n' ' ')
+GPU_MEMBERS=$(effective_members citespec-gpu | tr '\n' ' ')
 if [ -n "$GPU_MEMBERS" ]; then
-    fail "udc-gpu still contains effective members: $GPU_MEMBERS"
+    fail "citespec-gpu still contains effective members: $GPU_MEMBERS"
 else
-    ok "udc-gpu has no effective members"
+    ok "citespec-gpu has no effective members"
 fi
 
 section "udev rule"
-UDEV_RULE=/etc/udev/rules.d/99-udc-gpu.rules
+UDEV_RULE=/etc/udev/rules.d/99-citespec-gpu.rules
 if [ -r "$UDEV_RULE" ] && grep -Fq 'KERNEL=="nvidia*"' "$UDEV_RULE"; then
     ok "$UDEV_RULE matches every nvidia* kernel name"
 else
@@ -220,10 +220,10 @@ checked=0
 for device in "${DEVICES[@]}"; do
     [ -e "$device" ] || continue
     meta=$(stat -c '%a %U %G' "$device" 2>/dev/null || true)
-    if [ "$meta" = "660 root udc-gpu" ]; then
+    if [ "$meta" = "660 root citespec-gpu" ]; then
         ok "$device permissions: $meta"
     else
-        fail "$device permissions are $meta (expected 660 root:udc-gpu)"
+        fail "$device permissions are $meta (expected 660 root:citespec-gpu)"
     fi
     if have udevadm; then
         subsystem=$(udevadm info --query=property --name="$device" 2>/dev/null | sed -n 's/^SUBSYSTEM=//p')

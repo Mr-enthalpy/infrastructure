@@ -1,39 +1,39 @@
 import pytest
 
-from udc_resource import login_wrapper
-from udc_resource import login_wrapper as wrapper
-from udc_resource.login_wrapper import parse_command
+from citespec_resource import login_wrapper
+from citespec_resource import login_wrapper as wrapper
+from citespec_resource.login_wrapper import parse_command
 
 
 def test_allowed_cli_command():
-    assert parse_command("udc-resource list --json") == ["udc-resource", "list", "--json"]
+    assert parse_command("citespec-resource list --json") == ["citespec-resource", "list", "--json"]
 
 
 def test_empty_command_opens_menu():
-    assert parse_command("") == ["udc-resource", "menu"]
+    assert parse_command("") == ["citespec-resource", "menu"]
 
 
 def test_job_and_file_commands_are_allowed():
-    assert parse_command("udc-resource job list abc") == [
-        "udc-resource",
+    assert parse_command("citespec-resource job list abc") == [
+        "citespec-resource",
         "job",
         "list",
         "abc",
     ]
-    assert parse_command("udc-resource file put abc data.bin") == [
-        "udc-resource",
+    assert parse_command("citespec-resource file put abc data.bin") == [
+        "citespec-resource",
         "file",
         "put",
         "abc",
         "data.bin",
     ]
-    assert parse_command("udc-resource queue list") == [
-        "udc-resource",
+    assert parse_command("citespec-resource queue list") == [
+        "citespec-resource",
         "queue",
         "list",
     ]
-    assert parse_command("udc-resource tunnel abc") == [
-        "udc-resource",
+    assert parse_command("citespec-resource tunnel abc") == [
+        "citespec-resource",
         "tunnel",
         "abc",
     ]
@@ -43,11 +43,11 @@ def test_job_and_file_commands_are_allowed():
     "raw",
     [
         "bash",
-        "udc-resource; bash",
-        "udc-resource list && bash",
-        "udc-resource shell 1 | cat",
-        "udc-resource admin release 1",
-        "udc-resource config show",
+        "citespec-resource; bash",
+        "citespec-resource list && bash",
+        "citespec-resource shell 1 | cat",
+        "citespec-resource admin release 1",
+        "citespec-resource config show",
         "scp local host:file",
     ],
 )
@@ -58,9 +58,9 @@ def test_shell_and_unknown_commands_are_rejected(raw):
 
 def test_main_forces_installed_policy_config(monkeypatch):
     captured = {}
-    monkeypatch.setenv("SSH_ORIGINAL_COMMAND", "udc-resource list --json")
-    monkeypatch.setenv("UDC_RESOURCE_CONFIG", "/tmp/member-controlled.toml")
-    monkeypatch.setattr(login_wrapper, "cli_path", lambda: "/usr/local/bin/udc-resource")
+    monkeypatch.setenv("SSH_ORIGINAL_COMMAND", "citespec-resource list --json")
+    monkeypatch.setenv("CITESPEC_RESOURCE_CONFIG", "/tmp/member-controlled.toml")
+    monkeypatch.setattr(login_wrapper, "cli_path", lambda: "/usr/local/bin/citespec-resource")
     monkeypatch.setattr(
         login_wrapper.os,
         "execv",
@@ -69,14 +69,16 @@ def test_main_forces_installed_policy_config(monkeypatch):
 
     login_wrapper.main()
 
-    assert captured["argv"][:2] == ["udc-resource", "list"]
-    assert login_wrapper.os.environ["UDC_RESOURCE_CONFIG"] == ("/etc/udc-resource/config.toml")
+    assert captured["argv"][:2] == ["citespec-resource", "list"]
+    assert login_wrapper.os.environ["CITESPEC_RESOURCE_CONFIG"] == (
+        "/etc/citespec-resource/config.toml"
+    )
 
 
 def test_cli_path_prefers_interpreter_sibling(tmp_path, monkeypatch):
     interpreter = tmp_path / "python"
     interpreter.write_text("", encoding="utf-8")
-    cli = tmp_path / "udc-resource"
+    cli = tmp_path / "citespec-resource"
     cli.write_text("", encoding="utf-8")
     monkeypatch.setattr(login_wrapper.sys, "executable", str(interpreter))
     assert login_wrapper.cli_path() == str(cli)
@@ -85,7 +87,7 @@ def test_cli_path_prefers_interpreter_sibling(tmp_path, monkeypatch):
 def test_cli_path_falls_back_to_path(tmp_path, monkeypatch):
     interpreter = tmp_path / "python"
     interpreter.write_text("", encoding="utf-8")
-    fallback = tmp_path / "bin" / "udc-resource"
+    fallback = tmp_path / "bin" / "citespec-resource"
     fallback.parent.mkdir()
     fallback.write_text("", encoding="utf-8")
     monkeypatch.setattr(login_wrapper.sys, "executable", str(interpreter))
@@ -109,8 +111,8 @@ def test_classifies_host_commands():
     assert wrapper.classify("scp file somewhere")[0] == "file_transfer"
     assert wrapper.classify("code .")[0] == "vscode"
     assert wrapper.classify("rm -rf /")[0] == "other"
-    assert wrapper.classify("udc-resource list --json")[0] == "udc"
-    assert wrapper.classify("udc-resource bash")[0] == "unknown_subcommand"
+    assert wrapper.classify("citespec-resource list --json")[0] == "citespec"
+    assert wrapper.classify("citespec-resource bash")[0] == "unknown_subcommand"
     assert wrapper.classify("")[0] == "menu"
 
 

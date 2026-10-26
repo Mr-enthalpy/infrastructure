@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from udc_resource.broker.docker_driver import DockerDriver
-from udc_resource.models import Allocation
+from citespec_resource.broker.docker_driver import DockerDriver
+from citespec_resource.models import Allocation
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("UDC_RUN_DOCKER_TESTS") != "1",
-    reason="set UDC_RUN_DOCKER_TESTS=1 to run real Docker integration tests",
+    os.environ.get("CITESPEC_RESOURCE_RUN_DOCKER_TESTS") != "1",
+    reason="set CITESPEC_RESOURCE_RUN_DOCKER_TESTS=1 to run real Docker integration tests",
 )
 
 
@@ -38,7 +38,7 @@ def test_cpu_only_container_lifecycle(active_config):
         container = driver.get_container(ref.id)
         assert container is not None
         assert container.status == "running"
-        assert container.labels["udc.allocation"] == allocation.id
+        assert container.labels["citespec.allocation"] == allocation.id
     finally:
         driver.remove_container(ref.id)
     assert driver.get_container(ref.id) is None

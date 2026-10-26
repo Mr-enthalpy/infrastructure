@@ -7,10 +7,10 @@ from datetime import timedelta
 
 import pytest
 
+from citespec_resource import store
+from citespec_resource.membership import store as member_store
+from citespec_resource.membership.models import parse_public_key
 from tests.test_broker import ADMIN, ALICE, FIXED, _broker, _call
-from udc_resource import store
-from udc_resource.membership import store as member_store
-from udc_resource.membership.models import parse_public_key
 
 
 @pytest.fixture
@@ -137,7 +137,7 @@ async def test_suspended_member_queue_requests_fail_at_admission(tmp_path, membe
     # GPU 0 busy so alice's apply queues.
     fake.add_process(
         __import__(
-            "udc_resource.broker.docker_driver",
+            "citespec_resource.broker.docker_driver",
             fromlist=["GPUProcess"],
         ).GPUProcess(gpu_uuid="GPU-0", pid=4242, used_mib=1024, process_name="python")
     )
@@ -197,3 +197,157 @@ def test_public_key_parsing_rejects_private_keys():
     normalized, fingerprint = parse_public_key("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@lab")
     assert normalized.startswith("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI")
     assert fingerprint.startswith("SHA256:")
+
+
+class _FakeProvisioning:
+    def __init__(self, *, fail: bool = False, inspect: dict | None = None) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.fail = fail
+        self.inspect = inspect or {}
+
+    def execute(self, action: str, frozen_input: dict) -> dict:
+        from citespec_resource.membership.provisioning import (
+            ProvisioningError,
+            validate_request,
+        )
+
+        validate_request({"action": action, "frozen_input": frozen_input})
+        self.calls.append((action, frozen_input))
+        if action == "inspect_member":
+            return {
+                "status": "succeeded",
+                "stages": ["inspected"],
+                "username": frozen_input.get("username"),
+                **self.inspect,
+            }
+        if self.fail:
+            raise ProvisioningError("stage=set_keys: simulated host failure")
+        return {"status": "succeeded", "stages": [action], "uid": ALICE.uid}
+
+
+KEY_ONE = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOneKeyForBrokerTests00000000000000000001 one"
+KEY_TWO = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITwoKeyForBrokerTests00000000000000000002 two"
+
+
+def _seed_active_member(broker) -> str:
+    with broker._connection() as connection:
+        member_id = _provision_alice(connection)
+        member_store.add_key(
+            connection,
+            member_id,
+            public_key=KEY_ONE,
+            fingerprint=parse_public_key(KEY_ONE)[1],
+        )
+    return member_id
+
+
+async def test_member_self_service_key_add_and_revoke(tmp_path, member_config):
+    executor = _FakeProvisioning()
+    broker, _ = _broker(tmp_path, member_config, provisioning=executor)
+    _seed_active_member(broker)
+    added = await _call(broker, "me_keys_add", {"public_key": KEY_TWO}, ALICE)
+    assert added["ok"] is True
+    assert executor.calls[-1][0] == "set_keys"
+    assert len(executor.calls[-1][1]["public_keys"]) == 2
+    key_id = added["data"]["key_id"]
+    revoked = await _call(broker, "me_keys_revoke", {"key_id": key_id}, ALICE)
+    assert revoked["ok"] is True
+    assert executor.calls[-1][0] == "set_keys"
+    assert len(executor.calls[-1][1]["public_keys"]) == 1
+
+
+async def test_admin_key_add_rolls_back_when_host_sync_fails(tmp_path, member_config):
+    executor = _FakeProvisioning(fail=True)
+    broker, _ = _broker(tmp_path, member_config, provisioning=executor)
+    member_id = _seed_active_member(broker)
+    response = await _call(
+        broker,
+        "admin_members_keys_add",
+        {"member_id": member_id, "public_key": KEY_TWO},
+        ADMIN,
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    with broker._connection() as connection:
+        keys = member_store.get_member(connection, member_id)["keys"]
+    assert len(keys) == 1
+
+
+async def test_auto_gpu_count_selects_requested_number(tmp_path, member_config):
+    broker, docker = _broker(tmp_path, member_config)
+    with broker._connection() as connection:
+        _provision_alice(connection)
+    response = await _call(
+        broker,
+        "apply",
+        {"gpu_count": 2, "cpus": 8, "memory_gb": 32, "idempotency_key": "count-2"},
+        ALICE,
+    )
+    assert response["ok"] is True
+    assert len(response["data"]["gpus"]) == 2
+    assert len(docker.created[-1].gpus) == 2
+
+
+async def test_admin_legacy_import_dry_run_dispatch(tmp_path, member_config):
+    executor = _FakeProvisioning(
+        inspect={
+            "exists": True,
+            "uid": 42424,
+            "home": "/home/legacy",
+            "home_exists": True,
+            "home_is_symlink": False,
+            "groups": ["citespec-members"],
+            "managed": False,
+        }
+    )
+    broker, _ = _broker(tmp_path, member_config, provisioning=executor)
+    response = await _call(
+        broker,
+        "admin_members_import_legacy",
+        {
+            "username": "legacy",
+            "display_name": "Legacy",
+            "valid_until": "",
+            "quota_gb": 50,
+            "public_keys": [KEY_ONE],
+            "dry_run": True,
+        },
+        ADMIN,
+    )
+    assert response["ok"] is True
+    report = response["data"]
+    assert report["dry_run"] is True
+    assert report["conflicts"] == []
+    assert report["inspection"]["uid"] == 42424
+    assert executor.calls[0][0] == "inspect_member"
+
+
+async def test_queue_idempotency_and_requested_count(tmp_path, member_config):
+    broker, fake = _broker(tmp_path, member_config)
+    with broker._connection() as connection:
+        _provision_alice(connection)
+    for index in range(8):
+        fake.add_process(
+            __import__(
+                "citespec_resource.broker.docker_driver",
+                fromlist=["GPUProcess"],
+            ).GPUProcess(gpu_uuid=f"GPU-{index}", pid=5000 + index, used_mib=1024, process_name="x")
+        )
+    args = {
+        "gpu_count": 2,
+        "cpus": 8,
+        "memory_gb": 32,
+        "queue": True,
+        "idempotency_key": "queue-count-2",
+    }
+    first = await _call(broker, "apply", dict(args), ALICE)
+    assert first["ok"] is True
+    assert first["data"]["status"] == "queued"
+    second = await _call(broker, "apply", dict(args), ALICE)
+    assert second["ok"] is True
+    assert second["data"]["queue_id"] == first["data"]["queue_id"]
+    with broker._connection() as connection:
+        rows = store.list_queue_requests(connection, owner_uid=ALICE.uid, now=FIXED)
+    assert len(rows) == 1
+    assert rows[0]["requested_gpu_count"] == 2
+    assert rows[0]["gpus"] == []

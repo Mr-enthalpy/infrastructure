@@ -4,10 +4,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from udc_resource import store
-from udc_resource.db import connect, init_db
-from udc_resource.errors import GpuBusy, InsufficientResources, NotFound
-from udc_resource.models import GPU
+from citespec_resource import store
+from citespec_resource.db import connect, init_db
+from citespec_resource.errors import GpuBusy, InsufficientResources, NotFound
+from citespec_resource.models import GPU
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 
@@ -46,8 +46,8 @@ def _create(
         gpu_uuids=gpus,
         cpus=cpus,
         memory_gb=memory_gb,
-        image="udc-base:2026.10",
-        workspace=f"/data1/udc-users/{owner_name}",
+        image="citespec-base:2026.10",
+        workspace=f"/data1/citespec-users/{owner_name}",
         note="test",
         starts_at=NOW,
         expires_at=NOW + timedelta(hours=12),
@@ -107,7 +107,7 @@ def test_activate_and_fail_release_claims(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-1",
+        container_name="citespec-alice-1",
         now=NOW,
     )
     active = store.get_allocation(connection, allocation_id, now=NOW)
@@ -131,7 +131,7 @@ def test_events_are_recorded(tmp_path):
         connection,
         allocation_id,
         container_id="container-1",
-        container_name="udc-alice-1",
+        container_name="citespec-alice-1",
         now=NOW,
     )
     events = store.list_allocation_events(connection, allocation_id)
@@ -239,8 +239,8 @@ def _queue(
         cpus=8,
         memory_gb=32,
         hours=12,
-        image="udc-base:2026.10",
-        workspace=f"/data1/udc-users/{owner_name}",
+        image="citespec-base:2026.10",
+        workspace=f"/data1/citespec-users/{owner_name}",
         note="queued test",
         max_queue_length=10,
         max_queued_allocations_per_user=4,
@@ -400,8 +400,8 @@ def test_cpu_only_blocked_head_stops_backfill(tmp_path):
         cpus=32.0,
         memory_gb=32,
         hours=12,
-        image="udc-base:2026.10",
-        workspace="/data1/udc-users/bob",
+        image="citespec-base:2026.10",
+        workspace="/data1/citespec-users/bob",
         note="",
         max_queue_length=10,
         max_queued_allocations_per_user=4,
@@ -416,8 +416,8 @@ def test_cpu_only_blocked_head_stops_backfill(tmp_path):
         cpus=8.0,
         memory_gb=8,
         hours=12,
-        image="udc-base:2026.10",
-        workspace="/data1/udc-users/carol",
+        image="citespec-base:2026.10",
+        workspace="/data1/citespec-users/carol",
         note="",
         max_queue_length=10,
         max_queued_allocations_per_user=4,
@@ -474,8 +474,8 @@ def test_cpu_only_head_starvation_guard_blocks_later_requests(tmp_path):
         cpus=32.0,
         memory_gb=32,
         hours=12,
-        image="udc-base:2026.10",
-        workspace="/data1/udc-users/bob",
+        image="citespec-base:2026.10",
+        workspace="/data1/citespec-users/bob",
         note="",
         max_queue_length=10,
         max_queued_allocations_per_user=4,
@@ -490,8 +490,8 @@ def test_cpu_only_head_starvation_guard_blocks_later_requests(tmp_path):
         cpus=8.0,
         memory_gb=8,
         hours=12,
-        image="udc-base:2026.10",
-        workspace="/data1/udc-users/carol",
+        image="citespec-base:2026.10",
+        workspace="/data1/citespec-users/carol",
         note="",
         max_queue_length=10,
         max_queued_allocations_per_user=4,

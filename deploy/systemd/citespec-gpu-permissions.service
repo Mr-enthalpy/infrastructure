@@ -1,0 +1,13 @@
+[Unit]
+Description=Enforce Citespec GPU device permissions
+After=systemd-modules-load.service
+Before=citespec-resource-broker.service
+ConditionPathExists=/dev/nvidiactl
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/citespec-resource/fix_gpu_permissions.sh
+
+[Install]
+WantedBy=multi-user.target

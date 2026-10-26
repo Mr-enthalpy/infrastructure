@@ -12,7 +12,7 @@ HELPER = ROOT / "deploy" / "rotate_job_logs.py"
 @pytest.mark.skipif(os.name != "posix", reason="descriptor-relative rotation is Linux-only")
 def test_rotation_keeps_active_log_and_shifts_archives(tmp_path: Path):
     workspace = tmp_path / "workspace"
-    logs = workspace / "alice" / ".udc-logs"
+    logs = workspace / "alice" / ".citespec-logs"
     logs.mkdir(parents=True)
     log = logs / "train.log"
     log.write_bytes(b"abcdefgh")
@@ -54,7 +54,7 @@ def test_rotation_skips_symlinked_log_directory(tmp_path: Path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "train.log").write_bytes(b"secret" * 10)
-    (user / ".udc-logs").symlink_to(outside, target_is_directory=True)
+    (user / ".citespec-logs").symlink_to(outside, target_is_directory=True)
 
     result = subprocess.run(
         [

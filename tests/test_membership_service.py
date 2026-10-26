@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from udc_resource.enrollment import store as intake_store
-from udc_resource.membership import service as member_service
-from udc_resource.membership import store as member_store
-from udc_resource.membership.provisioning import (
+from citespec_resource.enrollment import store as intake_store
+from citespec_resource.membership import service as member_service
+from citespec_resource.membership import store as member_store
+from citespec_resource.membership.provisioning import (
     CommandExecutorClient,
     ProvisioningError,
     validate_request,
@@ -24,15 +24,23 @@ class FakeExecutor:
     """Records requests; optionally fails at a named stage (AC-14)."""
 
     fail_stage: str | None = None
+    inspect_result: dict | None = None
 
     def __post_init__(self) -> None:
         self.calls: list = []
 
     def execute(self, action: str, frozen_input: dict) -> dict:
-        from udc_resource.membership.provisioning import validate_request
+        from citespec_resource.membership.provisioning import validate_request
 
         validate_request({"action": action, "frozen_input": frozen_input})
         self.calls.append((action, frozen_input))
+        if action == "inspect_member":
+            return {
+                "status": "succeeded",
+                "stages": ["inspected"],
+                "username": frozen_input.get("username"),
+                **(self.inspect_result or {"exists": False}),
+            }
         if self.fail_stage:
             raise ProvisioningError(f"stage={self.fail_stage}: simulated failure")
         return {
@@ -46,7 +54,7 @@ class FakeExecutor:
 def dbs(tmp_path):
     broker_db = tmp_path / "state.db"
     intake_db = tmp_path / "intake.db"
-    from udc_resource.db import init_db
+    from citespec_resource.db import init_db
 
     connection = init_db(broker_db)
     intake = intake_store.init_intake_db(intake_db)
@@ -261,6 +269,7 @@ def test_intake_privacy_and_validation(dbs, tmp_path: Path):
 
 
 def test_executor_request_validation():
+    assert validate_request({"action": "inspect_member", "frozen_input": {"username": "legacy"}})
     with pytest.raises(ValueError):
         validate_request({"action": "run_shell", "frozen_input": {}})
     with pytest.raises(ValueError):
@@ -272,6 +281,10 @@ def test_executor_request_validation():
         )
     with pytest.raises(ValueError):
         validate_request({"action": "disable_member", "frozen_input": {"username": "root"}})
+    with pytest.raises(ValueError):
+        validate_request(
+            {"action": "inspect_member", "frozen_input": {"username": "x", "extra": "no"}}
+        )
 
 
 def test_command_executor_client(tmp_path):
@@ -298,3 +311,200 @@ def test_command_executor_client(tmp_path):
     client = CommandExecutorClient([sys_module.executable, str(failing)])
     with pytest.raises(ProvisioningError, match="boom"):
         client.execute("set_keys", {"username": "alice", "public_keys": []})
+
+
+def _approve(connection, intake_db, submit, executor) -> dict:
+    return member_service.approve_request(
+        connection,
+        intake_db=intake_db,
+        request_id=submit["request_id"],
+        reviewer_uid=0,
+        valid_until="",
+        quota_gb=200,
+        review_note="",
+        internal_note="",
+        provisioning=executor,
+    )
+
+
+INSPECTION = {
+    "exists": True,
+    "uid": 42424,
+    "gid": 42424,
+    "home": "/home/legacy",
+    "home_exists": True,
+    "home_is_symlink": False,
+    "shell": "/bin/bash",
+    "groups": ["citespec-members"],
+    "managed": False,
+    "home_authorized_keys": ["/home/legacy/.ssh/authorized_keys"],
+    "central_key_count": 0,
+}
+
+
+def test_legacy_import_dry_run_then_explicit_apply(dbs):
+    """M6: dry-run inspects and reports; apply adopts only the reviewed entry."""
+    connection, intake_db = dbs
+    executor = FakeExecutor(inspect_result=INSPECTION)
+    dry = member_service.import_legacy_member(
+        connection,
+        username="legacy",
+        display_name="Legacy Person",
+        valid_until="2099-01-01T00:00:00+00:00",
+        quota_gb=50,
+        public_keys=[KEY],
+        actor_uid=0,
+        provisioning=executor,
+        workspace_root="/data1/citespec-users",
+        dry_run=True,
+    )
+    assert dry["dry_run"] is True
+    assert dry["inspection"]["uid"] == 42424
+    assert dry["would_adopt_existing"] is True
+    assert "account_will_be_converted_to_managed_member" in dry["warnings"]
+    assert dry["conflicts"] == []
+    assert member_store.list_members(connection) == []
+
+    applied = member_service.import_legacy_member(
+        connection,
+        username="legacy",
+        display_name="Legacy Person",
+        valid_until="2099-01-01T00:00:00+00:00",
+        quota_gb=50,
+        public_keys=[KEY],
+        actor_uid=0,
+        provisioning=executor,
+        workspace_root="/data1/citespec-users",
+        dry_run=False,
+    )
+    assert applied["operation_status"] == "succeeded"
+    member = member_store.get_member(connection, applied["member_id"])
+    assert member["member"]["status"] == "active"
+    assert member["member"]["linux_uid"] == 42424
+    provision = [call for call in executor.calls if call[0] == "provision_member"]
+    assert provision and provision[0][1]["allow_existing"] is True
+
+
+def test_legacy_import_refuses_conflicts_and_unknown_accounts(dbs):
+    connection, intake_db = dbs
+    privileged = dict(INSPECTION, groups=["citespec-members", "sudo"])
+    report = member_service.import_legacy_member(
+        connection,
+        username="legacy",
+        display_name="Legacy",
+        valid_until="",
+        quota_gb=50,
+        public_keys=[KEY],
+        actor_uid=0,
+        provisioning=FakeExecutor(inspect_result=privileged),
+        workspace_root="/data1/citespec-users",
+        dry_run=True,
+    )
+    assert "privileged_group:sudo" in report["conflicts"]
+    with pytest.raises(Exception, match="conflicts"):
+        member_service.import_legacy_member(
+            connection,
+            username="legacy",
+            display_name="Legacy",
+            valid_until="",
+            quota_gb=50,
+            public_keys=[KEY],
+            actor_uid=0,
+            provisioning=FakeExecutor(inspect_result=privileged),
+            workspace_root="/data1/citespec-users",
+            dry_run=False,
+        )
+    assert member_store.list_members(connection) == []
+
+    absent = member_service.import_legacy_member(
+        connection,
+        username="ghost",
+        display_name="Ghost",
+        valid_until="",
+        quota_gb=50,
+        public_keys=[KEY],
+        actor_uid=0,
+        provisioning=FakeExecutor(inspect_result={"exists": False}),
+        workspace_root="/data1/citespec-users",
+        dry_run=True,
+    )
+    assert "account_absent" in absent["conflicts"]
+
+
+def test_admin_key_add_and_revoke_project_to_host(dbs):
+    connection, intake_db = dbs
+    submitted = _submit(connection, intake_db)
+    executor = FakeExecutor()
+    result = _approve(connection, intake_db, submitted, executor)
+    member_id = str(result["member_id"])
+    second_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILegacyKeyForTestsOnly0000000000000000000 b"
+    added = member_service.add_member_key(
+        connection,
+        member_id,
+        public_key=second_key,
+        actor_uid=0,
+        provisioning=executor,
+    )
+    assert added["key_id"]
+    assert executor.calls[-1][0] == "set_keys"
+    keys = member_store.get_member(connection, member_id)["keys"]
+    assert len([key for key in keys if key["status"] == "active"]) == 2
+
+    member_service.revoke_member_key(
+        connection,
+        member_id,
+        key_id=added["key_id"],
+        actor_uid=0,
+        provisioning=executor,
+    )
+    assert executor.calls[-1][0] == "set_keys"
+    active = member_store.get_member(connection, member_id)["keys"]
+    assert len([key for key in active if key["status"] == "active"]) == 1
+
+
+def test_admin_key_sync_failure_rolls_back(dbs):
+    connection, intake_db = dbs
+    result = _approve(connection, intake_db, _submit(connection, intake_db), FakeExecutor())
+    member_id = str(result["member_id"])
+    before = member_store.get_member(connection, member_id)
+    second_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFailureKeyForTestsOnly0000000000000000 c"
+    with pytest.raises(ProvisioningError):
+        member_service.add_member_key(
+            connection,
+            member_id,
+            public_key=second_key,
+            actor_uid=0,
+            provisioning=FakeExecutor(fail_stage="set_keys"),
+        )
+    after = member_store.get_member(connection, member_id)
+    assert len(after["keys"]) == len(before["keys"])
+
+
+def test_revoke_is_retryable_after_disable_failure(dbs):
+    connection, intake_db = dbs
+    result = _approve(connection, intake_db, _submit(connection, intake_db), FakeExecutor())
+    member_id = str(result["member_id"])
+    first = member_service.revoke_member(
+        connection,
+        member_id,
+        actor_uid=0,
+        reason="left lab",
+        provisioning=FakeExecutor(fail_stage="disable_member"),
+    )
+    assert first["credential_revocation"] == "pending_retry"
+    second = member_service.revoke_member(
+        connection,
+        member_id,
+        actor_uid=0,
+        reason="left lab",
+        provisioning=FakeExecutor(),
+    )
+    assert second["credential_revocation"] == "done"
+    assert member_store.get_member(connection, member_id)["member"]["status"] == "revoked"
+    operations = [
+        operation
+        for operation in member_store.get_member(connection, member_id)["operations"]
+        if operation["action"] == "disable_member"
+    ]
+    assert len(operations) == 1
+    assert operations[0]["status"] == "succeeded"

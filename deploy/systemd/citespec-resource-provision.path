@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the Citespec provisioning spool for new operations
+
+[Path]
+PathExistsGlob=/var/lib/citespec-resource/provision/requests/*.json
+Unit=citespec-resource-provision.service
+
+[Install]
+WantedBy=multi-user.target

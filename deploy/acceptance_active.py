@@ -62,7 +62,7 @@ def ssh_cli_raw(
     *,
     timeout: float = 60.0,
 ) -> dict[str, Any]:
-    command = shlex.join(["udc-resource", *args])
+    command = shlex.join(["citespec-resource", *args])
     result = ssh(alias, command, timeout=timeout)
     text = result.stdout.strip()
     try:
@@ -132,14 +132,14 @@ class Acceptance:
         self.member_a_user = args.member_a_user
         self.member_b_user = args.member_b_user
         self.gpu_index = args.gpu
-        self.image = args.image or str(config.get("image", {}).get("base", "udc-base:2026.10"))
+        self.image = args.image or str(config.get("image", {}).get("base", "citespec-base:2026.10"))
         self.db_path = Path(
-            str(config.get("server", {}).get("state_db", "/var/lib/udc-resource/state.db"))
+            str(config.get("server", {}).get("state_db", "/var/lib/citespec-resource/state.db"))
         )
         self.socket_path = Path(
-            str(config.get("server", {}).get("broker_socket", "/run/udc-resource/broker.sock"))
+            str(config.get("server", {}).get("broker_socket", "/run/citespec-resource/broker.sock"))
         )
-        self.holder_name = f"udc-accept-holder-{os.getpid()}"
+        self.holder_name = f"citespec-accept-holder-{os.getpid()}"
         self.allocations: list[tuple[str, str]] = []
         self.queue_requests: list[tuple[str, str]] = []
         self.holder_container = ""
@@ -583,7 +583,39 @@ class Acceptance:
 
     def test_file_transfer(self, allocation_id: str) -> None:
         remote = f"acceptance/transfer-{os.getpid()}.bin"
-        payload = b"udc-transfer\x00" + os.urandom(32)
+        payload = b"citespec-transfer\x00" + os.urandom(32)
+        capabilities = require_ok(
+            ssh_cli(self.member_a, ["list"]),
+            "file transfer capability",
+        ).get("capabilities", {})
+        if not capabilities.get("file_transfer"):
+            denied = subprocess.run(
+                [
+                    "ssh",
+                    *SSH_DEFAULT_OPTIONS,
+                    self.member_a,
+                    shlex.join(
+                        [
+                            "citespec-resource",
+                            "file",
+                            "put",
+                            allocation_id,
+                            f"/workspace/{remote}",
+                        ]
+                    ),
+                ],
+                input=payload,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            detail = (denied.stdout or denied.stderr).decode("utf-8", errors="replace")
+            if denied.returncode == 0 or "forbidden" not in detail.lower():
+                raise AcceptanceError(
+                    "file transfer is disabled by policy but file put was not rejected: " + detail
+                )
+            print("[pass] file transfer is disabled by policy")
+            return
         put = subprocess.run(
             [
                 "ssh",
@@ -591,7 +623,7 @@ class Acceptance:
                 self.member_a,
                 shlex.join(
                     [
-                        "udc-resource",
+                        "citespec-resource",
                         "file",
                         "put",
                         allocation_id,
@@ -620,7 +652,7 @@ class Acceptance:
                 "ssh",
                 *SSH_DEFAULT_OPTIONS,
                 self.member_a,
-                shlex.join(["udc-resource", "file", "get", allocation_id, remote]),
+                shlex.join(["citespec-resource", "file", "get", allocation_id, remote]),
             ],
             capture_output=True,
             timeout=60,
@@ -640,7 +672,7 @@ class Acceptance:
                 self.member_a,
                 shlex.join(
                     [
-                        "udc-resource",
+                        "citespec-resource",
                         "file",
                         "put",
                         allocation_id,
@@ -718,7 +750,7 @@ class Acceptance:
                     "-tt",
                     *SSH_DEFAULT_OPTIONS,
                     self.member_a,
-                    f"udc-resource shell {allocation_id}",
+                    f"citespec-resource shell {allocation_id}",
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
@@ -727,6 +759,11 @@ class Acceptance:
             )
             try:
                 assert shell.stdin is not None
+                # Docker exec allocates the PTY and starts bash asynchronously.
+                # Input sent before the first prompt can be consumed by the
+                # terminal setup and never reach bash, so wait for the shell to
+                # settle before typing the command.
+                time.sleep(2)
                 shell.stdin.write("echo acceptance-marker > /workspace/acceptance-marker\n")
                 shell.stdin.flush()
                 time.sleep(3)
@@ -788,7 +825,7 @@ class Acceptance:
                             self.member_a,
                             shlex.join(
                                 [
-                                    "udc-resource",
+                                    "citespec-resource",
                                     "job",
                                     "attach",
                                     allocation_id,
@@ -828,17 +865,37 @@ class Acceptance:
             except Exception:
                 raise
 
-            result = local(["systemctl", "restart", "udc-resource-broker"], timeout=60)
+            result = local(["systemctl", "restart", "citespec-resource-broker"], timeout=60)
             if result.returncode != 0:
                 raise AcceptanceError(f"broker restart failed: {result.stderr.strip()}")
             wait_until(
                 lambda: (
-                    local(["systemctl", "is-active", "--quiet", "udc-resource-broker"]).returncode
+                    local(
+                        ["systemctl", "is-active", "--quiet", "citespec-resource-broker"]
+                    ).returncode
                     == 0
                 ),
                 30,
                 1,
                 "broker restart",
+            )
+
+            def cli_ready_after_restart() -> bool:
+                try:
+                    payload = ssh_cli(self.member_a, ["status"])
+                except Exception:
+                    return False
+                return bool(payload.get("ok"))
+
+            # The unit is "active" before active-mode startup audits finish and
+            # before the Unix socket is accepting requests. Without this barrier
+            # the member CLI falls back to its workstation SSH alias, which is
+            # intentionally unresolvable from the server.
+            wait_until(
+                cli_ready_after_restart,
+                120,
+                2,
+                "broker CLI readiness after restart",
             )
             status = require_ok(
                 ssh_cli(self.member_a, ["status", allocation_id]),
@@ -872,7 +929,7 @@ class Acceptance:
                     self.member_a,
                     shlex.join(
                         [
-                            "udc-resource",
+                            "citespec-resource",
                             "job",
                             "attach",
                             allocation_id,
@@ -1022,7 +1079,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(os.environ.get("UDC_RESOURCE_CONFIG", "/etc/udc-resource/config.toml")),
+        default=Path(
+            os.environ.get("CITESPEC_RESOURCE_CONFIG", "/etc/citespec-resource/config.toml")
+        ),
     )
     parser.add_argument("--yes", action="store_true", help="required for destructive acceptance")
     parser.add_argument(

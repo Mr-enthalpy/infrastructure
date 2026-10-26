@@ -2,8 +2,8 @@ import socket
 
 import pytest
 
-from udc_resource.client import BrokerClient
-from udc_resource.errors import BrokerUnavailable
+from citespec_resource.client import BrokerClient
+from citespec_resource.errors import BrokerUnavailable
 
 
 def test_stream_read_does_not_consume_payload_bytes():

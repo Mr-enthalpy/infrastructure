@@ -1,0 +1,43 @@
+[Unit]
+Description=Citespec shared GPU resource broker
+After=docker.service citespec-gpu-permissions.service
+Wants=citespec-gpu-permissions.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Environment=CITESPEC_RESOURCE_CONFIG=/etc/citespec-resource/config.toml
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=citespec-resource
+RuntimeDirectoryMode=0711
+StateDirectory=citespec-resource
+StateDirectoryMode=0750
+UMask=0077
+# NVIDIA's nodes are not udev-managed here.  Re-apply the broker-only device
+# policy before every broker start; nvidia-smi's shim prevents later resets.
+ExecStartPre=-/usr/local/libexec/citespec-resource/fix_gpu_permissions.sh
+ExecStart=/opt/citespec-resource/.venv/bin/python -m citespec_resource.broker
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+# The broker reads member authorized_keys for container SSH and runs the GPU
+# audit as members. Home directories must stay readable, but never writable.
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/citespec-resource /run/citespec-resource
+ReadWritePaths=-/var/lib/citespec-resource-intake
+ReadWritePaths=-/home/data1/citespec-users
+ReadWritePaths=-/dev
+# Docker's Unix socket is a file path; keep it usable under ProtectSystem=strict.
+ReadWritePaths=-/run/docker.sock
+ReadWritePaths=-/var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

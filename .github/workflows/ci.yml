@@ -31,7 +31,7 @@ jobs:
       - name: Mypy
         run: python -m mypy src
       - name: GUI JavaScript syntax
-        run: node --check src/udc_resource/gui/static/app.js
+        run: node --check src/citespec_resource/gui/static/app.js
       - name: Shell syntax
         if: runner.os == 'Linux'
         run: bash -n deploy/*.sh

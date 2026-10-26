@@ -95,7 +95,7 @@ def test_install_server_dry_run_does_not_require_root():
 def test_installer_has_transactional_backup_and_rollback():
     source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "trap on_exit EXIT" in source
-    assert "BACKUP_DIR" in source and "/var/backups/udc-resource" in source
+    assert "BACKUP_DIR" in source and "/var/backups/citespec-resource" in source
     assert "cp -a --" in source
     assert "rollback" in source
     assert "systemd-analyze verify" in source
@@ -116,33 +116,33 @@ def test_gpu_verifier_checks_udev_acl_and_forbidden_groups():
     assert "udevadm info" in source
     assert "SUBSYSTEM=" in source
     assert "getfacl" in source
-    for group in ("udc-gpu", "video", "render", "docker", "sudo", "udc-admins"):
+    for group in ("citespec-gpu", "video", "render", "docker", "sudo", "citespec-admins"):
         assert group in source
     assert "nvidia*" in source
     assert "--json" in source
-    assert "effective_members udc-members" in source
+    assert "effective_members citespec-members" in source
 
 
 def test_member_ssh_policy_is_key_only_and_uses_root_owned_shell():
-    sshd = (ROOT / "deploy/sshd/60-udc-resource.conf").read_text(encoding="utf-8")
+    sshd = (ROOT / "deploy/sshd/60-citespec-resource.conf").read_text(encoding="utf-8")
     for line in (
         "PasswordAuthentication no",
         "KbdInteractiveAuthentication no",
         "PubkeyAuthentication yes",
         "AuthenticationMethods publickey",
         "PermitUserRC no",
-        "ForceCommand /usr/local/bin/udc-resource-login",
+        "ForceCommand /usr/local/bin/citespec-resource-login",
     ):
         assert line in sshd
     shell = (ROOT / "deploy/member-shell.sh").read_text(encoding="utf-8")
-    assert "exec /usr/local/bin/udc-resource-login" in shell
+    assert "exec /usr/local/bin/citespec-resource-login" in shell
     installer = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "MEMBER_SHELL_INSTALL" in installer
     assert "member-shell.sh" in installer
     assert "GPU_VERIFY_INSTALL" in installer
     create_user = (ROOT / "deploy/create_user.sh").read_text(encoding="utf-8")
-    assert "MEMBER_SHELL=/usr/local/libexec/udc-resource/member-shell" in create_user
-    assert "useradd --create-home --shell" in create_user
+    assert "MEMBER_SHELL=/usr/local/libexec/citespec-resource/member-shell" in create_user
+    assert "useradd --no-log-init --create-home --shell" in create_user
 
 
 def test_create_user_provisions_and_verifies_workspace_quota():
@@ -161,7 +161,7 @@ def test_create_user_provisions_and_verifies_workspace_quota():
 def test_audit_checks_effective_member_ssh_policy():
     source = (ROOT / "deploy/audit_legacy.sh").read_text(encoding="utf-8")
     assert "sshd -T -C" in source or '"-T" "-C"' in source or "-T -C" in source
-    assert "forcecommand|/usr/local/bin/udc-resource-login" in source
+    assert "forcecommand|/usr/local/bin/citespec-resource-login" in source
     assert "permituserrc|no" in source
     assert "authenticationmethods|publickey" in source
     assert "MEMBER_SHELL" in source
@@ -181,8 +181,8 @@ def test_installer_enables_timers_by_default_with_opt_out():
     source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "ENABLE_TIMERS=1" in source
     assert "--no-timers" in source
-    assert "systemctl enable --now udc-resource-logrotate.timer" in source
-    assert "systemctl enable --now udc-resource-disk-check.timer" in source
+    assert "systemctl enable --now citespec-resource-logrotate.timer" in source
+    assert "systemctl enable --now citespec-resource-disk-check.timer" in source
 
 
 def test_development_container_image_has_sshd_sudo_and_bootstrap():
@@ -202,10 +202,15 @@ def test_development_container_image_has_sshd_sudo_and_bootstrap():
 
 
 def test_broker_runtime_directory_allows_member_traversal():
-    unit = (ROOT / "deploy/systemd/udc-resource-broker.service").read_text(encoding="utf-8")
+    unit = (ROOT / "deploy/systemd/citespec-resource-broker.service").read_text(encoding="utf-8")
     assert "RuntimeDirectoryMode=0711" in unit
     assert "RuntimeDirectoryMode=0750" not in unit
     assert "ProtectHome=read-only" in unit
+
+
+def test_provisioning_service_allows_request_bursts():
+    unit = (ROOT / "deploy/systemd/citespec-resource-provision.service").read_text(encoding="utf-8")
+    assert "StartLimitIntervalSec=0" in unit
 
 
 def test_active_acceptance_python_syntax():

@@ -10,10 +10,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 MEMBER=""
 DURATION=600
 SKIP_SNAPSHOT=0
-CONFIG=${UDC_RESOURCE_CONFIG:-/etc/udc-resource/config.toml}
-VENV=${UDC_RESOURCE_VENV:-/opt/udc-resource/.venv}
-CLI=${UDC_RESOURCE_CLI:-/usr/local/bin/udc-resource}
-LOGIN_WRAPPER=${UDC_RESOURCE_LOGIN:-/usr/local/bin/udc-resource-login}
+CONFIG=${CITESPEC_RESOURCE_CONFIG:-/etc/citespec-resource/config.toml}
+VENV=${CITESPEC_RESOURCE_VENV:-/opt/citespec-resource/.venv}
+CLI=${CITESPEC_RESOURCE_CLI:-/usr/local/bin/citespec-resource}
+LOGIN_WRAPPER=${CITESPEC_RESOURCE_LOGIN:-/usr/local/bin/citespec-resource-login}
 GPU_COUNT=8
 
 FAIL=0
@@ -27,9 +27,9 @@ Options:
   --member USER       Member account used for CLI/socket security checks.
   --duration SECONDS  Docker/GPU snapshot window (default: 600; 0 for immediate).
   --skip-snapshot     Skip the Docker/GPU before/after comparison.
-  --config PATH       Broker config (default: /etc/udc-resource/config.toml).
-  --venv PATH         Broker venv (default: /opt/udc-resource/.venv).
-  --cli PATH          CLI executable (default: /usr/local/bin/udc-resource).
+  --config PATH       Broker config (default: /etc/citespec-resource/config.toml).
+  --venv PATH         Broker venv (default: /opt/citespec-resource/.venv).
+  --cli PATH          CLI executable (default: /usr/local/bin/citespec-resource).
   -h, --help          Show this help.
 
 This script is read-only. It does not stop containers, change modes, or modify
@@ -106,7 +106,7 @@ member_run() {
 }
 
 snapshot() {
-    docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Label "udc.managed"}}|{{.Label "udc.allocation"}}' 2>/dev/null | sort
+    docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Label "citespec.managed"}}|{{.Label "citespec.allocation"}}' 2>/dev/null | sort
     nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name --format=csv,noheader,nounits 2>/dev/null | sort
 }
 
@@ -116,7 +116,7 @@ ok "member exists: $MEMBER"
 for cmd in docker nvidia-smi systemctl ss su ps; do
     if have "$cmd"; then ok "command available: $cmd"; else fail "command missing: $cmd"; fi
 done
-for group in udc-members udc-cli udc-admins udc-gpu; do
+for group in citespec-members citespec-cli citespec-admins citespec-gpu; do
     if getent group "$group" >/dev/null 2>&1; then
         ok "group exists: $group"
     else
@@ -133,11 +133,11 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 section "legacy access audit"
-AUDIT_SCRIPT=/usr/local/libexec/udc-resource/audit_legacy.sh
+AUDIT_SCRIPT=/usr/local/libexec/citespec-resource/audit_legacy.sh
 [ -x "$AUDIT_SCRIPT" ] || AUDIT_SCRIPT="$SCRIPT_DIR/audit_legacy.sh"
 AUDIT_ARGS=(--production)
-CONFIG_ALLOW_ROOT_KEYS=$(UDC_RESOURCE_CONFIG="$CONFIG" "$VENV/bin/python" -c \
-    'import os; from udc_resource.config import load_config; print("true" if load_config(os.environ["UDC_RESOURCE_CONFIG"]).policy.allow_root_ssh_keys else "false")' \
+CONFIG_ALLOW_ROOT_KEYS=$(CITESPEC_RESOURCE_CONFIG="$CONFIG" "$VENV/bin/python" -c \
+    'import os; from citespec_resource.config import load_config; print("true" if load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).policy.allow_root_ssh_keys else "false")' \
     2>/dev/null || printf 'false')
 if [ "$CONFIG_ALLOW_ROOT_KEYS" = "true" ]; then
     AUDIT_ARGS+=(--allow-root-ssh-keys)
@@ -150,34 +150,34 @@ fi
 
 section "member groups"
 MEMBER_GROUPS=$(id -nG "$MEMBER")
-for required in udc-members udc-cli; do
+for required in citespec-members citespec-cli; do
     if printf '%s\n' "$MEMBER_GROUPS" | tr ' ' '\n' | grep -qx "$required"; then
         ok "member is in required group: $required"
     else
         fail "member is missing required group: $required"
     fi
 done
-for forbidden in sudo docker udc-gpu video render udc-admins; do
+for forbidden in sudo docker citespec-gpu video render citespec-admins; do
     if printf '%s\n' "$MEMBER_GROUPS" | tr ' ' '\n' | grep -qx "$forbidden"; then
         fail "member is in forbidden group: $forbidden"
     else
         ok "member is not in forbidden group: $forbidden"
     fi
 done
-GPU_MEMBERS=$(effective_members udc-gpu | tr '\n' ' ')
+GPU_MEMBERS=$(effective_members citespec-gpu | tr '\n' ' ')
 if [ -n "$GPU_MEMBERS" ]; then
-    fail "udc-gpu has effective members: $GPU_MEMBERS"
+    fail "citespec-gpu has effective members: $GPU_MEMBERS"
 else
-    ok "udc-gpu has no effective members"
+    ok "citespec-gpu has no effective members"
 fi
 
 section "broker and socket"
-if systemctl is-active --quiet udc-resource-broker.service; then
+if systemctl is-active --quiet citespec-resource-broker.service; then
     ok "broker service is active"
 else
     fail "broker service is not active"
 fi
-MAINPID=$(systemctl show -p MainPID --value udc-resource-broker.service 2>/dev/null || true)
+MAINPID=$(systemctl show -p MainPID --value citespec-resource-broker.service 2>/dev/null || true)
 if [ -n "$MAINPID" ] && [ "$MAINPID" -gt 0 ] 2>/dev/null; then
     ok "broker main pid: $MAINPID"
     if [ "$(ps -o user= -p "$MAINPID" 2>/dev/null | tr -d ' ')" = "root" ]; then
@@ -189,11 +189,11 @@ else
     fail "could not determine broker main pid"
 fi
 
-CONFIG_VALUES=$(UDC_RESOURCE_CONFIG="$CONFIG" "$VENV/bin/python" - <<'PY'
+CONFIG_VALUES=$(CITESPEC_RESOURCE_CONFIG="$CONFIG" "$VENV/bin/python" - <<'PY'
 import os
-from udc_resource.config import load_config
+from citespec_resource.config import load_config
 
-config = load_config(os.environ["UDC_RESOURCE_CONFIG"])
+config = load_config(os.environ["CITESPEC_RESOURCE_CONFIG"])
 print(config.server.broker_socket)
 print(config.server.state_db)
 print(config.hardware.gpu_count)
@@ -219,10 +219,10 @@ else
 fi
 if [ -e "$SOCKET" ]; then
     SOCKET_META=$(stat -c '%a %U %G' "$SOCKET" 2>/dev/null || true)
-    if [ "$SOCKET_META" = "660 root udc-cli" ]; then
+    if [ "$SOCKET_META" = "660 root citespec-cli" ]; then
         ok "socket permissions: $SOCKET_META"
     else
-        fail "socket permissions are $SOCKET_META (expected 660 root udc-cli)"
+        fail "socket permissions are $SOCKET_META (expected 660 root citespec-cli)"
     fi
 fi
 SOCKET_DIR=$(dirname "$SOCKET")
@@ -251,11 +251,11 @@ if [ -f "$DB_PATH" ]; then
 else
     fail "state database is missing: $DB_PATH"
 fi
-if ss -lxnp 2>/dev/null | grep -Fq "$SOCKET"; then
-    ok "Unix socket listener is present"
-else
-    fail "Unix socket listener was not found in ss output"
-fi
+SS_OUT=$(ss -lxnp 2>/dev/null || true)
+case "$SS_OUT" in
+    *"$SOCKET"*) ok "Unix socket listener is present" ;;
+    *) fail "Unix socket listener was not found in ss output" ;;
+esac
 if [ -n "$MAINPID" ] && ss -ltnp 2>/dev/null | grep -Fq "pid=$MAINPID,"; then
     fail "broker main pid has a TCP listener"
 else
@@ -267,7 +267,7 @@ SSHD_BIN=$(command -v sshd 2>/dev/null || true)
 [ -n "$SSHD_BIN" ] || SSHD_BIN=/usr/sbin/sshd
 if [ -x "$SSHD_BIN" ]; then
     SSHD_T=$("$SSHD_BIN" -T -C "user=$MEMBER,host=localhost,addr=127.0.0.1" 2>/dev/null || true)
-    if printf '%s\n' "$SSHD_T" | grep -qiE '^forcecommand[[:space:]]+/usr/local/bin/udc-resource-login$'; then
+    if printf '%s\n' "$SSHD_T" | grep -qiE '^forcecommand[[:space:]]+/usr/local/bin/citespec-resource-login$'; then
         ok "ForceCommand is active for $MEMBER"
     else
         fail "ForceCommand is not active for $MEMBER"
@@ -343,8 +343,14 @@ else
     ok "member has no passwordless sudo"
 fi
 if systemctl --help 2>&1 | grep -q -- '--dry-run'; then
-    if member_run 'systemctl --dry-run stop udc-resource-broker' >/dev/null 2>&1; then
-        fail "member can request broker stop"
+    # systemctl --dry-run only validates unit names; it does not perform the
+    # D-Bus/polkit authorization check and returns success for unprivileged
+    # users on Ubuntu.  Do not treat that as a real stop permission.  The
+    # member's actual SSH entry point is the ForceCommand wrapper, which
+    # rejects systemctl before execution (checked separately by the CLI
+    # denial tests).
+    if member_run 'systemctl --dry-run stop citespec-resource-broker' >/dev/null 2>&1; then
+        warn "systemctl --dry-run is not an authorization probe; relying on ForceCommand to deny systemctl"
     else
         ok "member cannot request broker stop"
     fi
@@ -353,7 +359,7 @@ else
 fi
 
 section "managed containers"
-MANAGED_COUNT=$(docker ps -a --filter label=udc.managed=true --format '{{.ID}}' 2>/dev/null | wc -l | tr -d ' ')
+MANAGED_COUNT=$(docker ps -a --filter label=citespec.managed=true --format '{{.ID}}' 2>/dev/null | wc -l | tr -d ' ')
 if [ "${MANAGED_COUNT:-0}" -eq 0 ]; then
     ok "no managed containers exist"
 else

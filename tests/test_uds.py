@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
+from citespec_resource.broker.server import Broker
+from citespec_resource.client import BrokerClient
+from citespec_resource.gpu_audit import GpuAuditResult
+from citespec_resource.identity import Identity
+from citespec_resource.legacy_audit import LegacyAuditResult
+from citespec_resource.stream import FRAME_DATA, FRAME_EXIT, read_frame, write_frame
+from citespec_resource.workspace_quota import MemberQuotaResult, QuotaCheckResult
 from tests.fakes import FakeDocker, FakeIdentityResolver
-from udc_resource.broker.server import Broker
-from udc_resource.client import BrokerClient
-from udc_resource.gpu_audit import GpuAuditResult
-from udc_resource.identity import Identity
-from udc_resource.legacy_audit import LegacyAuditResult
-from udc_resource.stream import FRAME_DATA, FRAME_EXIT, read_frame, write_frame
-from udc_resource.workspace_quota import MemberQuotaResult, QuotaCheckResult
 
 
 def _passing_member_quota(workspace: str, uid: int, limit: int) -> MemberQuotaResult:
@@ -46,9 +46,9 @@ pytestmark = [
 def _uds_broker(tmp_path, config, socket_path, docker, identity_resolver):
     """Active mode enforces the mandatory gates at startup; give the broker
     passing audit and quota runners so the UDS tests focus on transport."""
-    from udc_resource.gpu_audit import GpuAuditResult
-    from udc_resource.legacy_audit import LegacyAuditResult
-    from udc_resource.workspace_quota import MemberQuotaResult, QuotaCheckResult
+    from citespec_resource.gpu_audit import GpuAuditResult
+    from citespec_resource.legacy_audit import LegacyAuditResult
+    from citespec_resource.workspace_quota import MemberQuotaResult, QuotaCheckResult
 
     def passing_member_quota(workspace, uid, limit):
         return MemberQuotaResult(True, "ok", project_id=uid, hard_limit_bytes=limit * 1024**3)

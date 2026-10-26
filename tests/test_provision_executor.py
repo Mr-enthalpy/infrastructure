@@ -40,6 +40,20 @@ def test_executor_rejects_reserved_account():
     assert "reserved" in result["error"] or "refusing" in result["error"]
 
 
+def test_executor_inspect_is_read_only_and_accepts_known_username():
+    code, result = _run_stdin(
+        {
+            "operation_id": "op-inspect",
+            "action": "inspect_member",
+            "frozen_input": {"username": "definitely-absent"},
+        }
+    )
+    assert code == 0
+    assert result["status"] == "succeeded"
+    assert result["exists"] is False
+    assert result["username"] == "definitely-absent"
+
+
 def test_executor_invalid_json_answers_safely():
     result = subprocess.run(
         [sys.executable, str(EXECUTOR)],
