@@ -105,8 +105,8 @@
   任务待接入 CI。
 - 本轮实现与 sanitized handoff 已提交并推送：`8772763`（cutover）、`d0294be`
   （sanitized handoff + naming guard）；文档校准和 P0-2 实现见后续提交。
-- GitHub Actions 运行 `40308426242` 在 `d0294be` 上通过；当前分支 `main`，远程
-  `origin`。P0-2 提交由后续 CI 验证。
+- GitHub Actions 运行 `40308426242` 在 `d0294be`、`40315992883` 在 `7e9a4cc`
+  （P0-2）上通过；当前分支 `main`，远程 `origin`。P0-2 仍待实机部署和恢复演练。
 - amax 未改动，未执行 Docker/NVIDIA 重启、容器操作或验收测试。期间一次
   `admin ... --help` 被旧的自动中继逻辑误判并尝试解析 `amax`，连接未建立，
   未认证、未修改主机状态；该缺陷已修复（含 `--help` 的命令不再中继，且新增
@@ -486,7 +486,7 @@ xfs_quota -x -c 'report -p -b -h' /data1
 | 优先级 | 项目 | 当前状态 | 退出条件 |
 |---|---|---|---|
 | P0 | 文档状态基线 | 本次更新 | README/handoff/report/deploy README 使用同一状态口径 |
-| P0 | 备份、恢复与告警 | 代码实现完成；待实机部署/恢复演练 | 定期备份、恢复演练、失败告警均通过 |
+| P0 | 备份、恢复与告警 | 代码实现完成，CI `40315992883` 通过；待实机部署/恢复演练 | 定期备份、恢复演练、失败告警均通过 |
 | P0 | SSH/管理员/审计基线 | 27 条 warning 待分类 | 无 critical/high；warning 有分类和负责人 |
 | P0 | 容器 root/宿主 GPU 5.6 | 未验证 | 容器 root 不能修改宿主 `/dev/nvidia*` 并影响他人 |
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |

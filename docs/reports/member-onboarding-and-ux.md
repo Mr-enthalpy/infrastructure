@@ -3,7 +3,7 @@
 - 目标文档：`docs/goals/member-onboarding-and-ux.md`（v1.0）
 - 本轮起点：`01bc2bf`（工作区干净）
 - 本轮 cutover 结束：`d0294be`（功能/cutover 提交 `8772763`、`d0294be`；CI
-  `40308426242` 通过）；文档校准和 P0-2 备份/告警实现见后续提交
+  `40308426242` 通过）；P0-2 备份/告警实现 `7e9a4cc`（CI `40315992883` 通过）
 - 结论：**D1 完成；D2 核心实机验收完成；D3 对外生产开放未完成**
 
 ## 1. 实际基线与结束状态
@@ -17,7 +17,7 @@
 | `node --check` | 通过 | 通过 |
 | `bash -n`（部署脚本） | 通过 | 通过 |
 | 真实主机部署 | 未执行 | **active 核心验收完成** |
-| GitHub Actions | 未运行 | **运行 `40308426242` 通过** |
+| GitHub Actions | 未运行 | **`40308426242`、P0-2 `40315992883` 通过** |
 
 21 个 skip 是环境限制：Linux/Docker/descriptor-relative 项由 Ubuntu CI 覆盖，
 Playwright 浏览器任务待接入 CI。本轮新增的本地浏览器路径已在实机完成。
@@ -179,7 +179,7 @@ node --check src\citespec_resource\gui\static\app.js
 | 优先级 | 项目 | 下一步 |
 |---|---|---|
 | P0 | 容器 root/宿主 GPU 5.6 | 在目标机执行 acceptance 5.6，保留前后 stat/权限证据 |
-| P0 | 备份、恢复和告警 | 代码已实现；待实机部署、恢复演练和失败告警验证 |
+| P0 | 备份、恢复和告警 | 代码已实现，CI `40315992883` 通过；待实机部署、恢复演练和失败告警验证 |
 | P0 | SSH/管理员/审计 | 分类 27 条 warning，确认无 critical/high |
 | P1 | 安装器可复现性 | 固定镜像 digest，干净主机 dry-run/回滚 |
 | P1 | CI 覆盖 | Playwright 浏览器 job、必要 Linux 集成项 |
