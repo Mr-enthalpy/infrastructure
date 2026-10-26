@@ -9,16 +9,15 @@
 > `setup` 可在没有服务器 TOML 的工作站上使用，并生成仅连接信息的客户端配置。
 > 三份文档：docs/guides/member-quickstart.md、docs/guides/admin-membership.md、
 > docs/reports/member-onboarding-and-ux.md（含差距表、实际测试结果与
-> **D1=达成（本地实现/测试）/D2=已在<server-instance> active 模式执行（见 §0；外部
-> onboarding 与可选功能仍待）/D3=未授权** 结论）。
+> **D1=完成 / D2=核心实机验收完成 / D3=未开放** 结论）。
 
 ## 0. 2026-10-26 <server-instance> 实机部署与 active 验收
 
-> 本节记录实机结果；§1–§9 保留此前的实现/验收清单。本轮代码和文档改动见本次
-> cutover 提交。
+> 本节记录实机结果；本轮代码改动见 cutover 提交，文档校准见本次提交；§1–§9
+> 保留实现/验收清单与当前状态。
 
-- 目标机：`<server-address>`（SSH 端口 `<ssh-port>`），实际部署在<server-instance>；**未部署到
-  amax**。
+- 目标机：`<server-address>`（SSH 端口 `<ssh-port>`），实际部署在<server-instance>；
+  amax 未改动。
 - 管理员：`<admin-account>` 使用普通 shell，主组 `citespec-admins`（附加组 `sudo`、
   `citespec-cli`），**不属于 `citespec-members`**；root bootstrap 公钥已移除，
   `ROOT_KEYS_ABSENT`。
@@ -48,27 +47,24 @@
   `queue wait` 等到 allocation active、GPU 审计前自动修复设备权限、
   workspace 配额挂载解析；active 验收脚本修正为在交互 shell 提示符就绪后
   再写入命令。这些代码和文档改动见本次 cutover 提交。
-- **未完成/风险**：公共 443 尚未接到本地 intake，外部 onboarding 不可用；
-  见 §0.1。VS Code、文件传输、容器 root 对宿主 GPU 设备的 5.6 验证仍保持
-  关闭/待验。
-- 下一步：由网络/系统管理员解决 443/NAT 与证书；完成外部浏览器端到端
-  onboarding；完成 VS Code、文件传输和 5.6 的 target-host 验收；在此之前不
-  打开对应能力。
+- **当前待办**：外部 onboarding 阻塞——公共 443 尚未接到本地 intake，等待网络/
+  系统管理员；见 §0.1。VS Code、文件传输和容器 root/宿主 GPU 5.6 仍未开放。
+- 下一步：网络/系统管理员确认 443/NAT 与证书后，完成外部浏览器端到端
+  onboarding；随后按 P0–P2 计划处理 5.6、备份恢复、安装器、CI 和可选能力。
 
-### 0.1 外部 443 冲突（未解决）
+### 0.1 外部 443 入口（等待网络管理员）
 
 - 公共 `<public-url>` 由 **Apache** 前端终止，不是本机 nginx；
   当前 `curl -k -I` 返回 `403 Forbidden`（此前曾观察到
-  `302 Location: .../ng`），`/ng` 返回 404；公共 HTTP 80 超时。不能据此
-  认为本地 intake 已对外可用。
-- 本地 nginx 确实监听 80/443 并返回 301/200，但外部 NAT/端口转发没有把公共
-  443（或某个子路径/子域名）映射到这台主机；外部前端也不受本机 nginx 控制。
+  `302 Location: .../ng`），`/ng` 返回 404；公共 HTTP 80 超时。外部入口当前
+  不可用；本地 intake 正常监听 80/443。
+- 本地 nginx 监听 80/443 并返回 301/200，但外部 NAT/端口转发没有把公共
+  443（或某个子路径/子域名）映射到这台主机；外部前端不受本机 nginx 控制。
 - `apply_url` 仍为 `<public-url>`，与本地 intake 的地址不一致；
-  在外部路由和证书问题解决前，浏览器 onboarding 只能走本地/内网路径。
-- 本轮没有修改公共 443、未重启外部 Apache，也未改动现有外部配置。需要网络/
-  系统管理员确认 NAT/防火墙/证书方案；建议使用独立子域名 + CA 证书，或明确
-  由外部 Apache 反向代理到本地 nginx。解决后再更新 `apply_url`、证书和
-  外部端到端验收。
+  浏览器 onboarding 当前使用本地/内网路径。
+- 公共 443、外部 Apache 和现有外部配置本轮未改；待网络/系统管理员确认
+  NAT/防火墙/证书方案。建议使用独立子域名 + CA 证书，或由外部 Apache 反向
+  代理到本地 nginx。解决后更新 `apply_url`、证书和外部端到端验收。
 
 ### 0.2 2026-10-26 一次性切换收尾
 
@@ -105,12 +101,13 @@
   `node --check` 通过。
 - 本轮结束本地验证：`392 passed, 21 skipped`（新增 1 个 Playwright 浏览器
   测试在本机因缺依赖 SKIP；新增命名/部署回归测试 3 项），Ruff check/format、mypy
-  （34 文件）、`node --check`、`bash -n deploy/*.sh` 通过。21 个 skip 均不计为验收。
-- 本轮实现与文档改动**尚未提交**；最终测试结果见
-  `docs/reports/member-onboarding-and-ux.md`。开始新会话时以 `git log -1` 和
-  `git status` 为准；不要把本轮文档中的数字当作已提交 CI 结果。
-- 当前分支：`main`；远程：`origin`。本次提交推送后由 GitHub Actions 验证。
-- amax 未被部署，未执行 Docker/NVIDIA 重启、容器操作或验收测试。期间一次
+  （34 文件）、`node --check`、`bash -n deploy/*.sh` 通过。21 个 skip 为环境限制；
+  Ubuntu CI 执行 Linux-only 项，Playwright 浏览器任务待接入 CI。
+- 本轮实现与 sanitized handoff 已提交并推送：`8772763`（cutover）、`d0294be`
+  （sanitized handoff + naming guard）；本次文档校准随后提交并推送。
+- GitHub Actions 运行 `40308426242` 在 `d0294be` 上通过；当前分支 `main`，远程
+  `origin`。文档校准提交由后续 CI 验证。
+- amax 未改动，未执行 Docker/NVIDIA 重启、容器操作或验收测试。期间一次
   `admin ... --help` 被旧的自动中继逻辑误判并尝试解析 `amax`，连接未建立，
   未认证、未修改主机状态；该缺陷已修复（含 `--help` 的命令不再中继，且新增
   回归测试）。
@@ -122,19 +119,19 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 
 ## 2. 目标与当前阶段
 
-目标：为 Citespec 实验室共享 GPU 服务器建立受约束的资源管理器，完成可丢弃开发容器
-工作流，并在 Broker 中介下提供 VS Code 接入；在全部安全闸门通过前不进行 amax
-部署（本轮部署目标为<server-instance>，见 §0）。
+目标：为 Citespec 实验室共享 GPU 服务器建立受约束的资源管理器，完成可丢弃开发
+容器工作流，并在 Broker 中介下提供 VS Code 接入。当前实机部署在
+<server-instance>；amax 未改动。
 
 当前阶段：
 
 - 代码实现和安全加固已完成，包含 Broker、CLI、GUI、Docker driver、队列、
   开发容器 profile、容器 SSH、Broker 隧道和部署脚本。
 - 成员自助接入/审批/开户/中央公钥/撤权/legacy import 已实现；2026-10-26 已在
-  <server-instance>实机完成本地 intake 的浏览器申请/审批/开户和 active 验收（§0）。
-- P5 active 模式实机验收已在<server-instance>通过；VS Code、文件传输和公共 443 外部
-  onboarding 仍关闭/待验；D2 的剩余项见 §9。
-- 未在 amax 部署；amax 仍用于训练。
+  <server-instance> 实机完成本地 intake 的浏览器申请/审批/开户和 active 验收（§0）。
+- 实机核心验收已完成；VS Code、文件传输、外部 onboarding 和容器 root/宿主 GPU
+  5.6 未开放。D3 对外生产开放未完成，剩余项见 §9。
+- amax 未改动，继续保持原状。
 
 ## 3. 已完成的实现
 
@@ -304,63 +301,44 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 12. 首次 SSH 主机信任必须由用户核对 SHA256 指纹；不得使用
     `StrictHostKeyChecking=accept-new`，不得关闭主机密钥检查。
 
-## 5. 目标机待验证项
+## 5. 目标机验证状态
 
-以下项目无法在 Windows 本地完成，必须在获得批准后于目标机/隔离 Linux
-环境验证：
+2026-10-26 已在<server-instance>完成 active 核心验收，详细结果见 §0。下列清单按
+当前状态分为“已完成”和“未覆盖/未开放”。
 
-> 2026-10-26 已在<server-instance>完成 active 验收；本节保留完整清单，已覆盖项见 §0，
-> 未覆盖项仍是后续工作。
+### 5.1 已完成
 
-- **D2 成员闭环**：真实 sshd 的 `authorizedkeysfile` 是否指向
-  `/etc/citespec-resource/authorized-keys.d/%u`；home-only 公钥是否确实无法登录；
-  撤权后新连接/ControlMaster 是否失效。
-- 真实 `useradd`/`usermod`/组/中央密钥原子写入/回读、workspace 项目配额与
-  `inspect_member` 在目标发行版上的行为；开户失败和中断后的操作重试。
-- intake 服务、provision `.path`/`.service` 的 systemd 启动、权限隔离、
-  超时/崩溃恢复；真实浏览器提交、回执查询、限流和 CSP。
-- `join --portal` 无配置工作站、`setup` 指纹确认与托管 SSH 片段/客户端配置、
-  `me`/`start`/`gui` 在真实 Windows/Linux 工作站上的路径。
-- Docker 实际存储驱动是否为 `overlay2`，DockerRootDir 是否位于 XFS，以及
-  `prjquota`/`pquota` 是否可用。
-- workspace 文件系统是否以 `nosuid` 挂载；若未挂载，development profile 和运行时
-  存储闸门必须保持阻断。
-- 每个成员 workspace 的项目配额是否实际生效；执行器/`create_user.sh` 开通后
-  用 `lsattr -p`、探针文件继承和 `xfs_quota report`/`repquota` 回读确认。
-  `configure_quotas.sh` 仍用于历史 workspace 的 backfill 或调整限额。
-- `userns-remap` 与 GPU 设备、bind mount 的交互；当前默认不启用，且不得未经验证
-  启用。
-- 容器内 sshd 的 inetd framing、UID 1000 passwd 重写、成员密钥登录和隧道释放。
-- VS Code Remote-SSH 的本地监听、连接、并发槽位限制和 release/expiry 清理。
-- systemd `ProtectHome=read-only`、`ProtectSystem=strict`、Docker socket 访问以及
-  GPU 审计中的 `su` 在 unit hardening 下是否正常工作。
-- udev 规则应用后，现有 `/dev/nvidia*` 属主/权限是否立即变化，以及是否影响正在
-  运行的训练容器。
-- GPU 审计在 reboot 和 NVIDIA driver reload 后是否仍通过。
-- 容器可写层配额、临时 HOME（默认在可写层内；`container_home_tmpfs_gb > 0` 时为
-  tmpfs）、持久 `/workspace` 和 release/re-apply 行为。
-- 文件传输的 TOCTOU、路径逃逸、symlink、配额和中断恢复测试。
-- 成员配额闭环的解析在真实 XFS/ext4 上的行为：`lsattr -p` 的 project ID、
-  继承探针文件、`xfs_quota report` 的块单位（代码按 512B/1K/4K/1M 容错）、
-  `repquota -P` 的输出格式。
-- GUI VS Code readiness 文件协议（含 `tunnel_verified` 阶段的容器内 SSH 探测）、
-  job 启动/日志端点，以及 Docker 容量闸门（`min_free_docker_gb`、
-  `docker_storage_budget_gb`）在真实主机上的阈值行为。
-- 队列 backfill 与饥饿保护在真实多用户并发下的行为（逻辑已在 DB 层测试，但
-  实机 clock/GPU 状态变化更复杂）。
-- VS Code 会话内的 GPU 设备访问：`id -G` 含 citespec-gpu GID、`nvidia-smi -L`、
-  `torch.cuda.is_available()`；与 docker-exec 路径分别验收（见 acceptance 5.5）。
-- 容器内 sudo（容器 root == 宿主 UID 0）能否 chmod/chown 宿主 /dev/nvidia*
-  节点并影响其他成员的访问：必须在批准的测试机/测试 GPU 上按 acceptance 5.6
-  的流程验证，保留前后 stat 记录。这是对普通成员开放前的硬性前置条件：
-  周期性 GPU 审计只能检测漂移并阻止新分配，不能替代隔离——若证实容器 root 可
-  变更宿主设备节点，必须先落实更强的隔离或权限控制（并评估 userns-remap），
-  不得仅依赖审计告警。
+- 真实 SSH 白名单与拒绝路径、成员开户/撤权、中央公钥写入与回读。
+- 真实 `useradd`/`usermod`/组、workspace 项目配额、`inspect_member` 和开户失败
+  重试的核心路径。
+- intake 服务、provision `.path`/`.service` 的 systemd 启动与本地浏览器申请、
+  回执查询、审批、开户。
+- systemd `ProtectHome=read-only`、`ProtectSystem=strict`、Docker socket 访问和
+  GPU 审计在 unit hardening 下运行。
+- udev 规则、现有 `/dev/nvidia*` 权限、GPU 审计、active acceptance、队列并发、
+  到期/重启、restricted profile 下的分配/释放和 workspace 保留。
+- 每个成员 workspace 的项目配额实际生效；执行器开通后回读确认。
+- 文件传输策略拒绝路径已验证；真实文件传输能力仍未开放。
 
-## 6. 下一会话执行顺序
+### 5.2 未覆盖/未开放
 
-> 2026-10-26 的<server-instance> active 部署已完成（§0）；以下流程用于后续变更或复验，
-> 仍需明确批准。
+- 外部 443/DNS/TLS onboarding：等待网络/系统管理员；本地 intake 正常。
+- development profile：当前 Docker root 为 ext4，未满足 XFS + prjquota；
+  VS Code、容器内 sshd、tunnel release 和可写层配额均未开放。
+- 文件传输的 TOCTOU、路径逃逸、symlink、配额和中断恢复：门禁保持关闭。
+- 容器 root 对宿主 `/dev/nvidia*` 的 5.6 权限影响：P0 前置项；完成前不开放
+  development/成员 root。
+- `userns-remap` 与 GPU 设备、bind mount 的交互：未启用。
+- reboot 和 NVIDIA driver reload 后的 GPU 审计复验。
+- `join --portal`/`setup`/`me`/`start`/`gui` 在真实 Windows/Linux 工作站上的完整
+  路径；本地 CLI 和手动路径已验证，跨工作站验收待补。
+- VS Code 会话内 GPU 访问、GUI readiness、Docker 容量阈值和真实多用户并发下的
+  队列饥饿保护。
+
+## 6. 后续变更/复验流程
+
+> 2026-10-26 的<server-instance> active 部署已完成（§0）；以下流程用于后续变更或
+> 复验，执行前确认维护窗口和测试资源。
 
 ### 步骤 1：确认基线
 
@@ -391,17 +369,16 @@ bash -n deploy/install_server.sh
 bash -n deploy/verify_monitor_only.sh
 ```
 
-### 步骤 3：等待明确批准
+### 步骤 3：变更前确认
 
-在以下条件全部满足前停止：
+确认以下条件：
 
-- 训练已结束；
-- 管理员明确批准部署或目标机只读验收；
-- 已确认不会影响现有容器、GPU 分配和其他用户；
+- 训练已结束或不在目标维护范围内；
+- 管理员已批准部署或目标机只读验收；
+- 测试不会影响现有容器、GPU 分配和其他用户；
 - 已确定测试 GPU、测试成员账号和维护窗口。
 
-“继续”或其他泛化指令不构成部署批准。未获得明确批准时，只进行本地只读审查和
-测试。
+只读审查和本地测试可随时进行；修改主机状态前完成上述确认。
 
 ### 步骤 4：只读目标机检查
 
@@ -429,8 +406,8 @@ xfs_quota -x -c 'report -p -b -h' /data1
 
 ### 步骤 5：完整验收
 
-只有在训练结束并获得完整目标机验收批准后，才可执行
-[`docs/acceptance.md`](acceptance.md) 中的流程。验收期间：
+完整验收在维护窗口内执行 [`docs/acceptance.md`](acceptance.md) 中的流程。
+验收期间：
 
 - 使用专用测试 GPU 和测试账号；
 - 不触碰训练容器或其他用户的 allocation；
@@ -441,9 +418,9 @@ xfs_quota -x -c 'report -p -b -h' /data1
   `file_transfer_enabled`；
 - 保留所有命令输出、`docker inspect` 安全字段、审计输出和操作者信息。
 
-## 7. 明确禁止的操作
+## 7. 变更边界
 
-在未获得明确批准时，不得执行：
+以下操作需要单独批准：
 
 - `install_server.sh --yes` 或任何会修改主机的 `deploy/` 脚本；
 - 重启 Docker、NVIDIA 驱动或相关 systemd 服务；
@@ -494,44 +471,41 @@ xfs_quota -x -c 'report -p -b -h' /data1
   申请页/回执/限流、Broker 闸门/幂等、GUI 路由。
 - `tests/test_onboarding.py`、`tests/test_cli.py`：主机指纹、setup/join/me、
   自动中继与幂等键。
-- `docs/acceptance.md`：目标机验收清单，5.8 是 D2 成员闭环。
+- `docs/acceptance.md`：目标机验收清单，5.8 是成员闭环。
 - `docs/queue.md`：队列状态和公平性语义。
 - `docs/jobs-and-transfer.md`：job 和受限文件传输。
 - `docs/legacy-access-revocation.md`：legacy 管理员权限撤销。
 
-## 9. 已知限制与风险
+## 9. 剩余工作与优先级
 
-- 开发容器在没有 user namespace 时，容器 root 映射到宿主 root；当前安全性依赖
-  Docker 隔离和 `nosuid` workspace。不得添加 host 挂载或 Docker socket。
-  acceptance 5.6（容器 root 对宿主设备节点的影响）是对成员开放的硬性前置：
-  审计只是检测/阻断后续分配的补偿手段，不能替代底层权限隔离。
-- Docker 存储条件是 fail-closed 的：amax 的 Docker Root Dir 若不是
-  overlay2 + XFS + prjquota，development profile 会被闸门直接拒绝而不是自动
-  退化——这需要容量规划与维护窗口整改，不得绕过。存储预检证明的是"配额可
-  执行 + 当前容量充足 + 预算与磁盘相容"，不能保证运行中的容器、既有镜像或
-  非 Citespec 容器未来不耗尽磁盘；宿主机容量规划与实测仍是上线前提。
-- 生产启用清单（当前示例全部为关）：个人账号旧权限回收（audit_legacy 通过）、
-  文件系统条件满足、Docker GPU 隔离正常、容器内 sudo 不破坏宿主机（5.6）、
-  租期结束可靠清理容器与连接。全部有证据后按序打开
-  deployment_allowed → vscode_enabled → file_transfer_enabled。
-- `install_server.sh` 仅对非默认 `workspace_root` 或 `state_db` 发出警告；自定义
-  路径必须手工更新 systemd `ReadWritePaths`。开户执行器的写路径固定为
-  `/etc`、`/home`、`/data1/citespec-users` 和 spool。
-- **D2 已在<server-instance> active 模式执行（2026-10-26）**：真实 SSH 中央密钥/撤权、
-  intake/provision、浏览器本地路径、restricted profile、GPU 审计和 active
-  acceptance 已通过；仍未覆盖外部 443 onboarding、VS Code、文件传输、容器 root
-  对宿主设备 5.6、reboot/driver reload 后的复验。本地测试不能替代这些剩余项。
-- 旧 `create_user.sh`/home 公钥流程已不再适用于成员；已有账号必须显式 legacy
-  import。迁移前直接切换 sshd 可能锁定旧成员，部署步骤要求先 dry-run/导入。
-- 应用 udev 规则可能改变正在运行的训练容器的设备属主/权限；必须在训练结束后获得
-  批准再执行。
-- 本地 Windows 测试不能验证 Linux UDS、Docker、NVIDIA、quota、sshd-in-container
-  和 systemd hardening。
-- 容器内 UID 1000 passwd 重写已在代码中修复，但仍需 Linux 目标机验证。
-- `vscode_enabled` 和 `file_transfer_enabled` 在示例配置中保持 `false`；任何启用
-  都必须以目标机验收证据为依据。
-- 示例配置的 `ssh_user = "admin"` 是管理员示例，不是成员客户端配置；成员应运行
-  `setup --user <自己的Linux用户名>`，不要复制服务器 TOML。
-- `setup` 尚未提供图形化密钥选择/自动生成，未配置 GUI 首屏也还没有直接进入
-  setup 的入口；当前入口是 CLI。按目标 §5.4 这是非阻断 UX 缺口，D2 前可继续
-  使用已有默认 SSH 密钥完成主机验证。
+当前剩余工作按 P0–P2 排序；外部 443 单独标记为 Blocked。
+
+| 优先级 | 项目 | 当前状态 | 退出条件 |
+|---|---|---|---|
+| P0 | 文档状态基线 | 本次更新 | README/handoff/report/deploy README 使用同一状态口径 |
+| P0 | 备份、恢复与告警 | 待实现 | 定期备份、恢复演练、失败告警均通过 |
+| P0 | SSH/管理员/审计基线 | 27 条 warning 待分类 | 无 critical/high；warning 有分类和负责人 |
+| P0 | 容器 root/宿主 GPU 5.6 | 未验证 | 容器 root 不能修改宿主 `/dev/nvidia*` 并影响他人 |
+| P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |
+| P1 | CI 覆盖 | Ubuntu 单元测试已通过 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
+| P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
+| P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
+| P2 | VS Code / 文件传输 | 关闭 | 5.6、容器 sshd、隧道、配额和 TOCTOU 验收通过 |
+| P2 | `setup` 图形化密钥配置 | CLI only | GUI 首屏可选择/生成密钥 |
+| P2 | 历史容器、备份归档、扫描噪声 | 待清理 | 资源标注清楚，扫描输出可读 |
+| Blocked | 外部 443/DNS/TLS onboarding | 公共入口返回 403 | 网络/系统管理员确认 NAT、DNS、TLS 方案 |
+
+关键约束：
+
+- 当前 Docker root 为 ext4，development profile 被存储闸门拒绝；当前生产配置为
+  restricted profile。
+- development profile 需要 `overlay2` + XFS + `prjquota`/`pquota`、workspace
+  `nosuid`，并先通过 5.6。
+- `install_server.sh` 对非默认 `workspace_root`/`state_db` 只发出警告；自定义路径
+  需要同步 systemd `ReadWritePaths`。执行器写路径固定为 `/etc`、`/home`、
+  `/data1/citespec-users` 和 spool。
+- 旧 `create_user.sh`/home 公钥流程不再用于成员；已有账号通过显式 legacy import
+  迁移。
+- 示例配置的 `ssh_user = "admin"` 是管理员示例；成员使用
+  `setup --user <自己的Linux用户名>`。
+- `vscode_enabled` 和 `file_transfer_enabled` 当前为 `false`。

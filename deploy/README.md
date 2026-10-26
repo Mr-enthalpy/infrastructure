@@ -13,10 +13,11 @@ status, target-host unknowns, and approved next steps are maintained in
 [`docs/acceptance.md`](../docs/acceptance.md).
 
 This round implements the intake, approval, executor, central-key SSH policy,
-and setup/client-profile paths in code and automated tests. The intake and
-provision units, real `sshd` central-key behavior, `useradd`, quotas, and the
-browser flow have **not** been executed on a disposable Linux host; D2 remains
-pending. Do not cite local unit tests as proof that these host integrations work.
+and setup/client-profile paths in code and automated tests. Core active-mode
+acceptance has been run on the live instance, including one-time member
+provisioning and cleanup. External HTTPS onboarding and the optional VS Code,
+file-transfer, and container-root/host-GPU 5.6 gates remain pending; see
+[`docs/handoff.md`](../docs/handoff.md) for current status and evidence.
 
 All verification scripts marked as read-only must be executed before any
 state-changing step. A read-only script must be reviewed before execution; it

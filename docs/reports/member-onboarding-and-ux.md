@@ -2,56 +2,55 @@
 
 - 目标文档：`docs/goals/member-onboarding-and-ux.md`（v1.0）
 - 本轮起点：`01bc2bf`（工作区干净）
-- 本轮结束：改动**尚未提交**；以 `git status`/`git diff` 为准
-- 结论：**D1 实现完成（本地测试）；D2 待执行；D3 未授权**
+- 本轮 cutover 结束：`d0294be`（功能/cutover 提交 `8772763`、`d0294be`；CI
+  `40308426242` 通过）；文档校准见本次提交
+- 结论：**D1 完成；D2 核心实机验收完成；D3 对外生产开放未完成**
 
 ## 1. 实际基线与结束状态
 
-| 项目 | 本轮开始 | 本轮结束（未提交） |
+| 项目 | 本轮开始 | 本轮结束 |
 |---|---|---|
-| 提交 | `01bc2bf` | `01bc2bf` + 未提交改动 |
-| 测试 | 360 passed / 21 skipped | **388 passed / 22 skipped** |
+| 提交 | `01bc2bf` | `d0294be`（cutover）；文档校准见本次提交 |
+| 测试 | 360 passed / 21 skipped | **392 passed / 21 skipped** |
 | Ruff check/format | 通过 | 通过 |
 | mypy | 通过 | **34 个源文件通过** |
 | `node --check` | 通过 | 通过 |
 | `bash -n`（部署脚本） | 通过 | 通过 |
-| 真实主机部署 | 未执行 | 未执行 |
+| 真实主机部署 | 未执行 | **active 核心验收完成** |
+| GitHub Actions | 未运行 | **运行 `40308426242` 通过** |
 
-22 个 skip 中都**没有**把本轮新增功能当作通过：21 个是原有的
-Linux/Docker/descriptor-relative 限制，另 1 个是本轮新增的真实浏览器测试因
-本机未安装 Playwright 而跳过。skip 不计入 D1/D2 验收。
+21 个 skip 是环境限制：Linux/Docker/descriptor-relative 项由 Ubuntu CI 覆盖，
+Playwright 浏览器任务待接入 CI。本轮新增的本地浏览器路径已在实机完成。
 
-开发环境：Windows，Python 3.13.5（`.venv`；不得使用系统 Python 3.8），
-Git Bash `C:\Program Files\Git\bin\bash.exe`，Node.js。**没有**可用的
-disposable Linux VM/WSL/Docker daemon 或浏览器自动化环境，因此没有执行真实
-`sshd`、`useradd`、quota、systemd 或浏览器验收。
+开发环境：Windows，Python 3.13.5（`.venv`），Git Bash
+`C:\Program Files\Git\bin\bash.exe`，Node.js。本地没有 Docker/WSL；真实
+Linux/SSH/浏览器验收在实机完成。
 
-本轮没有访问或部署 amax，没有创建/修改真实 Linux 账号、SSH 密钥、容器或
-GPU 状态。期间一次旧的 CLI 自动中继逻辑把 `admin ... --help` 误判为远端命令并
-尝试解析 `amax`，连接未建立，未认证、未修改主机状态；`--help` 不再中继的修复
-和回归测试已加入。
+本轮没有改动 amax，没有重启其 Docker/NVIDIA 服务，也没有修改其容器或资源分配。
+期间一次旧 CLI 自动中继逻辑把 `admin ... --help` 误判为远端命令并尝试解析
+`amax`，连接未建立；该缺陷已修复并加入回归测试。
 
-## 2. 需求 → 实现模块 → 验收用例
+## 2. 需求 → 实现模块 → 验收状态
 
-| 目标条目 | 实现模块 | 本地证据 | D2 待证 |
+| 目标条目 | 实现模块 | 本地证据 | 实机状态 |
 |---|---|---|---|
-| AC-01/02/04 旧入口与友好拒绝 | `login_wrapper.py`、`banner` 模板、`member-shell.sh`、菜单 | 白名单/拒绝和菜单回归测试 | 真实 TTY/旧凭据 |
-| AC-03 JSON/协议 | `cli.py`、`broker/server.py` | JSON envelope、非交互路径测试 | 真实 SSH 流 |
-| AC-05 首次配置 | `onboarding.py`、`config.py` | 严格主机密钥、托管片段、客户端配置、私钥不覆盖测试 | 真实工作站 |
-| AC-06/07 快捷创建与多环境 | `cli.py`、`store.py`、`broker/server.py` | `--gpu-count`、预设按张数、幂等 apply、队列冲突测试 | 并发真实请求 |
-| AC-08..12 申请/隐私/审批 | `enrollment/`、`membership/`、`broker/server.py`、GUI | 邀请、回执 POST、限流、版本绑定、并发批准测试 | 真实浏览器/反代 |
-| AC-13/14 开户与失败恢复 | `membership/service.py`、`provisioning.py`、`deploy/membership/provision_executor.py`、systemd spool | 固定动作执行器、阶段状态、重试/恢复、失败回滚测试 | 真实 useradd/quota |
-| AC-15 拒绝 | `membership/service.py`、intake | 拒绝不建成员/账号链测试 | 真实主机 |
-| AC-16/17/21 权威状态 | `membership/{models,store}.py`、`broker/server.py` | 状态单调、即时有效期、队列准入复核测试 | 真实时间边界 |
-| AC-18/19/20 撤权/暂停/恢复 | `broker/server.py`、`provision_executor.py` | 按 UID 关闭流/隧道、pkill 受管会话、暂停/恢复测试 | 真实 SSH/ControlMaster |
-| AC-22 公钥轮换 | `membership/service.py`、中央密钥写入、GUI/CLI | 增删密钥、宿主同步失败回滚、撤销旧 key 测试 | 真实 sshd |
-| AC-23/24 管理员与执行器边界 | `broker/server.py`、`provision_executor.py` | 普通成员直调拒绝、执行器动作/字段白名单测试 | 真实 socket/root |
-| AC-25 迁移旧数据 | `db.py`、`membership/service.py`、legacy manifest | v2→v4、迁移幂等、manifest dry-run/冲突/显式 apply 测试 | 生产数据库副本 |
-| AC-26 真实浏览器 | `enrollment/static`、`gui/static`、`tests/test_intake_browser.py` | 真实浏览器测试代码已提供；本机因缺 Playwright **SKIP** | 必须执行并留截图 |
-| AC-27 兼容回归 | 全仓库 | 388 passed；原队列/到期/文件/GPU 预算测试未退化 | 目标机回归 |
-| AC-28 服务失败 | CLI/GUI/Broker | 重试幂等、连接失败不伪装成拒绝、操作恢复测试 | 真实 systemd/网络 |
-| AC-29 生命周期 | 既有 allocation/cleanup 逻辑 | 原有回归通过 | 真实容器/workspace |
-| AC-30 权限投影收敛 | service/executor/broker | DB 变更失败回滚、主机密钥读回、inspect 测试 | 真实主机 |
+| AC-01/02/04 旧入口与友好拒绝 | `login_wrapper.py`、`banner` 模板、`member-shell.sh`、菜单 | 白名单/拒绝和菜单回归测试 | 核心 SSH 路径完成 |
+| AC-03 JSON/协议 | `cli.py`、`broker/server.py` | JSON envelope、非交互路径测试 | 真实 SSH 流完成 |
+| AC-05 首次配置 | `onboarding.py`、`config.py` | 严格主机密钥、托管片段、客户端配置、私钥不覆盖测试 | 本地路径完成；跨工作站待补 |
+| AC-06/07 快捷创建与多环境 | `cli.py`、`store.py`、`broker/server.py` | `--gpu-count`、预设按张数、幂等 apply、队列冲突测试 | 真实并发请求完成 |
+| AC-08..12 申请/隐私/审批 | `enrollment/`、`membership/`、`broker/server.py`、GUI | 邀请、回执 POST、限流、版本绑定、并发批准测试 | 本地浏览器完成；外部 HTTPS 阻塞 |
+| AC-13/14 开户与失败恢复 | `membership/service.py`、`provisioning.py`、`deploy/membership/provision_executor.py`、systemd spool | 固定动作执行器、阶段状态、重试/恢复、失败回滚测试 | 真实 useradd/quota 核心路径完成 |
+| AC-15 拒绝 | `membership/service.py`、intake | 拒绝不建成员/账号链测试 | 完成 |
+| AC-16/17/21 权威状态 | `membership/{models,store}.py`、`broker/server.py` | 状态单调、即时有效期、队列准入复核测试 | 核心路径完成 |
+| AC-18/19/20 撤权/暂停/恢复 | `broker/server.py`、`provision_executor.py` | 按 UID 关闭流/隧道、pkill 受管会话、暂停/恢复测试 | 核心路径完成；ControlMaster 待补 |
+| AC-22 公钥轮换 | `membership/service.py`、中央密钥写入、GUI/CLI | 增删密钥、宿主同步失败回滚、撤销旧 key 测试 | 中央密钥路径完成 |
+| AC-23/24 管理员与执行器边界 | `broker/server.py`、`provision_executor.py` | 普通成员直调拒绝、执行器动作/字段白名单测试 | 核心路径完成 |
+| AC-25 迁移旧数据 | `db.py`、`membership/service.py`、legacy manifest | v2→v4、迁移幂等、manifest dry-run/冲突/显式 apply 测试 | 生产数据库副本待补 |
+| AC-26 真实浏览器 | `enrollment/static`、`gui/static`、`tests/test_intake_browser.py` | 浏览器测试代码；本地手动路径完成 | 外部入口阻塞；Playwright CI 待接入 |
+| AC-27 兼容回归 | 全仓库 | **392 passed**；队列/到期/文件/GPU 预算回归通过 | 核心回归完成 |
+| AC-28 服务失败 | CLI/GUI/Broker | 重试幂等、连接失败不伪装成拒绝、操作恢复测试 | 真实 systemd/网络故障待补 |
+| AC-29 生命周期 | 既有 allocation/cleanup 逻辑 | 原有回归通过 | active 验收完成 |
+| AC-30 权限投影收敛 | service/executor/broker | DB 变更失败回滚、主机密钥读回、inspect 测试 | 核心路径完成 |
 
 ## 3. 与目标文档不同的设计决策
 
@@ -88,7 +87,8 @@ GPU 状态。期间一次旧的 CLI 自动中继逻辑把 `admin ... --help` 误
    不安装/配置代理。申请页使用真实 HTML 表单、POST-only 回执、CSP、安全头和
    按 IP 限流，intake 账号没有 Broker socket、成员库、Docker 或 GPU 访问。
 10. **浏览器测试是可选依赖。** 提供 `tests/test_intake_browser.py` 和
-    `.[browser]` extra；本机未安装 Playwright 时 SKIP，不能当作 AC-26 通过。
+    `.[browser]` extra；Playwright 未安装时该测试 SKIP，AC-26 的实机/CI 证据
+    见 §5。
 
 ## 4. 测试命令、环境与结果
 
@@ -96,7 +96,7 @@ GPU 状态。期间一次旧的 CLI 自动中继逻辑把 `admin ... --help` 误
 
 ```bash
 .venv\Scripts\python -m pytest -q
-# 388 passed, 22 skipped
+# 392 passed, 21 skipped
 
 .venv\Scripts\python -m ruff check .
 # All checks passed!
@@ -115,11 +115,12 @@ node --check src\citespec_resource\gui\static\app.js
 
 | 结果 | 内容 |
 |---|---|
-| PASS | 388 个本地测试：成员状态机、审批版本/并发、操作重试、初始化/迁移、队列/apply 幂等、GPU 张数、Broker 闸门/流关闭、密钥同步回滚、legacy import、setup 主机信任/配置、CLI/JSON、intake HTTP、GUI 路由、执行器固定动作 |
-| SKIP | 21 个原有 Linux/Docker/descriptor-relative 测试；1 个新增 Playwright 浏览器测试（本机无 Playwright） |
+| PASS | 392 个本地测试：成员状态机、审批版本/并发、操作重试、初始化/迁移、队列/apply 幂等、GPU 张数、Broker 闸门/流关闭、密钥同步回滚、legacy import、setup 主机信任/配置、CLI/JSON、intake HTTP、GUI 路由、执行器固定动作 |
+| SKIP | 21 个环境限制项：Linux/Docker/descriptor-relative 和 Playwright 浏览器测试 |
 | FAIL | 无本地失败 |
-| BLOCKED | 所有真实 Linux/SSH/浏览器/systemd/quota 项（D2） |
-| 未执行 | amax 部署、Docker/NVIDIA 操作、真实账号/密钥、生产数据库迁移、反向代理/TLS、真实 VS Code |
+| 已完成 | 真实 SSH 核心路径、useradd/quota、intake/provision、active 验收、GPU 审计、restricted profile |
+| 未覆盖 | 外部 443 onboarding、VS Code、文件传输、5.6、reboot/driver reload 复验、Playwright CI |
+| amax | 未改动；未执行 Docker/NVIDIA 操作 |
 
 ### 4.1 本轮新增/加强的主要测试
 
@@ -139,9 +140,9 @@ node --check src\citespec_resource\gui\static\app.js
 - `tests/test_config.py`：客户端最小配置、部分服务器 TOML 不被误当客户端配置。
 - `tests/test_intake_browser.py`：真实 Chromium 提交/回执/查询路径（可选依赖）。
 
-## 5. 实际验证过的主路径
+## 5. 验证结果
 
-本地自动化已经验证：
+本地自动化已验证：
 
 1. **邀请 → 申请 → 审批**：API/CLI/GUI 路由层提交、回执私有查询、版本变化拒绝、
    并发批准唯一决定、拒绝不创建成员。
@@ -158,34 +159,44 @@ node --check src\citespec_resource\gui\static\app.js
 7. **GUI/申请页静态与 HTTP 路径**：HTML 表单字段、POST-only 回执、CSP/安全头、
    限流、详情/密钥/生命周期控件存在并通过路由测试。
 
-**没有**实际验证过、也没有截图：真实浏览器中的完整管理员审批/进入环境路径；
-真实 `sshd` 中央公钥认证；真实 `useradd`/quota；intake/provision systemd 单元；
-真实 ControlMaster 撤销；Windows/Linux 工作站真实 SSH。
+实机核心路径已验证：
 
-## 6. 未解决问题、影响与是否阻断试运行
+- 一次性成员 intake 申请、审批、开户、撤权和清理。
+- 真实 SSH 白名单/拒绝、中央公钥、restricted profile、workspace 配额。
+- intake/provision systemd 单元、GPU 审计、active acceptance、到期/重启和
+  workspace 保留。
 
-**阻断 D2/试运行的项：**
+未覆盖：
 
-- 没有 disposable Linux 环境，真实 sshd 的 `authorizedkeysfile`、home-only key
-  拒绝、中央密钥、`pkill`/ControlMaster 行为未验证。
-- 真实账号/组/workspace/quota、执行器中断恢复和 spool 原子性未在目标发行版验证。
-- intake/provision systemd 单元与权限隔离、TLS 反向代理、浏览器申请/审批/查询
-  未执行。
-- Playwright 浏览器测试本机 SKIP；AC-26 没有 PASS 证据。
-- `create_user.sh` 的中央密钥 helper 使用 `os.chown`/`os.chmod`，只在 Windows
-  上做过静态检查，未在 Linux 执行。
+- 外部 443/TLS onboarding、VS Code、文件传输、容器 root/宿主 GPU 5.6。
+- 真实 ControlMaster 撤销、跨 Windows/Linux 工作站完整路径。
+- Playwright 浏览器 CI、生产数据库迁移副本、reboot/driver reload 复验。
+- `create_user.sh` 中央密钥 helper 的独立 Linux 执行验证；成员开户主路径走
+  `provision_executor.py`。
 
-**不阻断 D1、但会影响运维的项：**
+## 6. 剩余工作与优先级
 
-- 旧成员必须显式 legacy import；直接切换 sshd 会锁定未导入成员。部署文档已
-  把 dry-run/apply 和“先迁移再切 active”写成前置条件。
-- 自定义 `workspace_root`/`state_db` 仍需手工同步 systemd 写路径；执行器固定写
+| 优先级 | 项目 | 下一步 |
+|---|---|---|
+| P0 | 容器 root/宿主 GPU 5.6 | 在目标机执行 acceptance 5.6，保留前后 stat/权限证据 |
+| P0 | 备份、恢复和告警 | 定期备份、恢复演练、失败告警 |
+| P0 | SSH/管理员/审计 | 分类 27 条 warning，确认无 critical/high |
+| P1 | 安装器可复现性 | 固定镜像 digest，干净主机 dry-run/回滚 |
+| P1 | CI 覆盖 | Playwright 浏览器 job、必要 Linux 集成项 |
+| P1 | GPU 验收脚本 | 自动发现实际 GPU 数，避免默认 8 卡假设 |
+| P1 | Docker 存储路线 | 保持 ext4 + restricted，或迁移到 XFS + prjquota |
+| P2 | VS Code / 文件传输 | 依赖 5.6、容器 sshd、隧道、配额和 TOCTOU 验收 |
+| P2 | `setup` 图形化密钥配置 | GUI 首屏入口和密钥选择/生成 |
+| P2 | 历史容器/备份/扫描噪声 | 资源标注、归档和扫描输出清理 |
+| Blocked | 外部 443/DNS/TLS | 等待网络/系统管理员确认 NAT、DNS、TLS |
+
+运维约束：
+
+- 当前 Docker root 为 ext4，development profile 被存储闸门拒绝。
+- 旧成员必须显式 legacy import；直接切换 sshd 会锁定未导入成员。
+- 自定义 `workspace_root`/`state_db` 需要手工同步 systemd 写路径；执行器写路径固定为
   `/etc`、`/home`、`/data1/citespec-users` 和 spool。
-- 反向代理请求体限制、TLS、网络 ACL 由实验室运维提供，不在本仓库内。
-- **非阻断 UX 缺口**：`setup` 使用本机已有的 OpenSSH 默认密钥/agent，不提供
-  图形化选择或自动生成新密钥；未配置 GUI 首屏的直接 setup 入口尚未实现（入口
-  仍是 CLI `setup`）。这不改变密钥/权限路径，但严格对照目标 §5.4 仍是未完成项，
-  广泛开放前应补齐。
+- 外部反向代理的请求体限制、TLS 和网络 ACL 由实验室运维提供。
 
 ## 7. 数据迁移、恢复和回滚
 
@@ -197,20 +208,21 @@ node --check src\citespec_resource\gui\static\app.js
 - 撤销/删除中央密钥是即时收敛路径；`disable_member` 先禁账号/清密钥/终止会话，
   再记录状态。恢复时重新投影当前有效 keyset，不重放旧队列。
 - `import-legacy` 默认 dry-run，只有显式 `--apply` 才修改主机；冲突时不执行。
-- 本轮没有执行生产数据库迁移或部署回滚。部署侧仍使用
-  `install_server.sh` 的时间戳备份、EXIT trap 和 SQLite 快照；不要在训练/现有
-  容器运行时执行。
+- 本轮没有执行生产数据库迁移副本或部署回滚演练。部署侧使用
+  `install_server.sh` 的时间戳备份、EXIT trap 和 SQLite 快照；执行前确认维护窗口。
 
-## 8. 目标机未执行事项及授权
+## 8. 实机验收与未开放范围
 
-D2 需要：可销毁 Linux 主机/VM、真实 sshd、`useradd`、XFS/ext4 quota、systemd、
-真实浏览器/Playwright，以及实验室 TLS 反向代理。执行清单见
-`docs/acceptance.md` 5.8。
+D2 核心已完成：一次性成员、真实 SSH、`useradd`/quota、systemd intake/provision、
+本地浏览器路径、restricted profile、GPU 审计和 active acceptance 均已验证。
 
-D3 需要：独立批准、旧权限回收、现有 P5、GPU/存储隔离、真实 VS Code 和恢复
-通道验收。**本轮未获 D3 授权**，没有在 amax 部署、重启 Docker/NVIDIA、修改
-udev、创建/停止容器或改真实成员账号。
+D3 尚未开放，剩余项包括：
 
-**最终分级：D1 实现完成（本地测试通过；浏览器测试代码已提供但本机 SKIP；
-§5.4 的 GUI 首屏/密钥选择 UX 缺口见 §6），D2 待执行，D3 未授权。不得把本报告
-表述为 Goal 全部验收通过。**
+- 外部 443/DNS/TLS onboarding；
+- VS Code、文件传输和容器 root/宿主 GPU 5.6；
+- 备份恢复、监控告警、安装器可复现性和浏览器 CI；
+- reboot/NVIDIA driver reload 后的复验。
+
+amax 未改动，未重启 Docker/NVIDIA，未修改 udev，未创建/停止容器或修改真实成员账号。
+
+**最终分级：D1 完成；D2 核心实机验收完成；D3 未开放。**

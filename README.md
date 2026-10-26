@@ -12,18 +12,28 @@ monitor/maintenance 模式、重启对账，以及仅绑定回环地址的本地
 
 ## 2. 当前状态
 
-- 代码实现：P0–P4 及后续安全加固已完成；成员自助接入/审批/开户/撤权闭环
-  已实现并通过本地自动化测试；P5 实机验收尚未执行。
-- 目标环境：尚未在 amax 部署，未启动 Broker，未创建或停止任何训练容器。
-- amax 当前仍承担训练任务。在训练结束且管理员明确批准前，不得部署、重启
-  Docker 或 NVIDIA 服务，也不得改动现有容器或资源分配。
-- `lab/resources.local.toml` 保存本地资源清单，已被 `.gitignore` 排除，不得提交。
+当前实机已部署并处于 active 模式；公开树不包含服务器地址、管理员账号、SSH 端口
+或实例名，完整实机信息保存在未跟踪的 `docs/handoff.local.md`。
+
+| 范围 | 状态 | 证据 |
+|---|---|---|
+| 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
+| 自动化验证 | 完成 | 本地 `392 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
+| CI | 完成 | GitHub Actions 运行 `40308426242` 通过 |
+| 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
+| 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
+| 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
+| 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
+| amax | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
+
 - 生产基线为 Python 3.12；本地开发可使用 Python 3.13。
-- 文件传输与 VS Code 接入仍需目标机验收，示例配置中分别保持
+- `lab/resources.local.toml` 保存本地资源清单，已被 `.gitignore` 排除。
+- 仓库当前保持 public，便于外部审理；稳定后另行转为 private。
+- 文件传输与 VS Code 在目标机验收完成前保持关闭，示例配置中分别为
   `file_transfer_enabled = false` 与 `vscode_enabled = false`。
 
 完整规格见 [server-resource-manager-vibe.md](server-resource-manager-vibe.md)；当前实施状态、
-目标机待验证项和下一会话的操作边界见 [docs/handoff.md](docs/handoff.md)。
+已验证项、剩余工作和下一会话的操作边界见 [docs/handoff.md](docs/handoff.md)。
 
 ## 3. 系统组成
 
@@ -153,27 +163,30 @@ uv.lock              # 锁定依赖版本
 - [docs/reports/member-onboarding-and-ux.md](docs/reports/member-onboarding-and-ux.md)：
   本轮实现、实际测试结果与 D1/D2/D3 结论。
 
-## 8. 实施阶段
+## 8. 实现里程碑
 
-- P0 已完成：Python 基线、依赖锁定、SQLite schema、配置上限、login wrapper
+> 以下 M0–M5 是初始实现阶段；历史文档中的 P0–P5 指同一组里程碑。后续变更优先级
+> 使用 P0–P2，见 [docs/handoff.md](docs/handoff.md)。
+
+- M0 已完成：Python 基线、依赖锁定、SQLite schema、配置上限、login wrapper
   绝对路径、只读 preflight 与 CI。
-- P1 已完成：Unix socket Broker、`SO_PEERCRED`、SQLite 事务、多 GPU claim、
+- M1 已完成：Unix socket Broker、`SO_PEERCRED`、SQLite 事务、多 GPU claim、
   用户/管理员权限、审计事件，以及 CLI `list/status/apply/admin/config`。
-- P2 已完成：Docker driver、GPU/CPU/RAM 限制、workspace 创建、release、到期
+- M2 已完成：Docker driver、GPU/CPU/RAM 限制、workspace 创建、release、到期
   worker、重启对账、未纳管资源展示，以及 detached tmux job 与受限文件传输。
-- P3 已完成：幂等安装脚本、成员/管理员账号脚本、udev/sshd/systemd 模板，以及
+- M3 已完成：幂等安装脚本、成员/管理员账号脚本、udev/sshd/systemd 模板，以及
   只读 monitor-only 安全验收脚本。
-- P4 已完成：本地 Web GUI、GPU 总览/申请/release/logs、管理员页、未纳管只读页
+- M4 已完成：本地 Web GUI、GPU 总览/申请/release/logs、管理员页、未纳管只读页
   和内嵌 xterm.js 终端。
-- P5 待执行：训练结束后的实机 monitor-only → CPU → 单 GPU 验收，以及开发容器、
-  VS Code、GPU 审计和存储闸门的 target-host 验证。验收步骤见
-  [docs/acceptance.md](docs/acceptance.md)。
-- 后续安全加固已完成本地实现与测试：active 启动/切换强制 legacy 审计、全局/每
-  分配/每用户预算拆分、全 NVIDIA 节点与有效组验收、队列准入/取消/等待、开发
-  容器存储与 `nosuid` 闸门、Broker 隧道和容器 SSH 准备。
+- M5 核心完成：active 模式核心验收已在实机通过，覆盖 preflight、真实 SSH
+  边界、并发 apply、队列、到期/重启、workspace 保留和一次性成员开户闭环。
+  外部 onboarding、VS Code、文件传输、development profile 和容器 root/宿主 GPU
+  5.6 尚未开放；验收步骤见 [docs/acceptance.md](docs/acceptance.md)。
+- 后续安全加固已完成本地实现与测试并部署：active 启动/切换强制 legacy 审计、
+  全局/每分配/每用户预算拆分、全 NVIDIA 节点与有效组验收、队列准入/取消/等待、
+  开发容器存储与 `nosuid` 闸门、Broker 隧道和容器 SSH 准备。
 - Linux-only 的 UDS/`SO_PEERCRED` 集成测试在 Windows 本地跳过，由 Ubuntu CI
-  执行。
-- 真实 Docker 集成测试需设置 `CITESPEC_RESOURCE_RUN_DOCKER_TESTS=1`，默认跳过。
+  执行；真实 Docker 集成测试需设置 `CITESPEC_RESOURCE_RUN_DOCKER_TESTS=1`。
 
 ## 9. 命令行示例
 
@@ -201,7 +214,7 @@ citespec-resource tunnel <allocation-id>
 citespec-resource vscode <allocation-id>
 citespec-resource menu
 citespec-resource maintenance
-citespec-resource gui --server amax
+citespec-resource gui --server <server-alias>
 citespec-resource admin users --json
 citespec-resource admin resources --json
 citespec-resource admin audit --limit 100 --json
@@ -221,7 +234,7 @@ host SSH 不因此开放转发或 shell。
 ## 10. 本地 GUI
 
 ```bash
-citespec-resource gui --server amax --admin-server amax-admin
+citespec-resource gui --server <server-alias> --admin-server <admin-alias>
 ```
 
 - 仅绑定 `127.0.0.1`，使用随机端口和随机 token，并自动打开浏览器。
@@ -232,8 +245,7 @@ citespec-resource gui --server amax --admin-server amax-admin
   `citespec-resource shell <id>`。
 - xterm.js 与 addon-fit 已 vendored 到包内，离线可用，无 Node 构建或 CDN 依赖。
 
-示例中的 `amax` 仅为 SSH alias 示例；实际值以本地 `lab/resources.local.toml`
-和 SSH 配置为准。
+示例使用 `<server-alias>`；实际值以本地 `lab/resources.local.toml` 或 SSH 配置为准。
 
 ## 11. 部署与验收状态
 
@@ -318,7 +330,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python -m ruff format --check .
 .\.venv\Scripts\python -m mypy src
 .\.venv\Scripts\python -c "from citespec_resource.config import load_config; c=load_config('lab/resources.example.toml'); print(c.server.name, c.policy.default_hours, c.policy.global_max_cpus, c.policy.max_cpus_per_user)"
-# 可选真实浏览器测试（D2 环境）
+# 可选真实浏览器测试（需安装 Playwright）
 .\.venv\Scripts\python -m pip install -e ".[browser]"
 .\.venv\Scripts\python -m playwright install chromium
 .\.venv\Scripts\python -m pytest tests/test_intake_browser.py -q
@@ -348,5 +360,5 @@ citespec-resource start --gpu-count 1                     # 批准后的正常�
 
 新成员申请、配置与日常使用见 `docs/guides/member-quickstart.md`；管理员审批与
 管理见 `docs/guides/admin-membership.md`。实现报告见
-`docs/reports/member-onboarding-and-ux.md`；D2 隔离环境验收尚未执行，不以本地
-单元测试替代真实 sshd/useradd/浏览器验收。
+`docs/reports/member-onboarding-and-ux.md`；D2 核心实机验收已完成，D3 对外生产
+开放仍未完成，剩余项包括外部 onboarding、VS Code、文件传输和 5.6。

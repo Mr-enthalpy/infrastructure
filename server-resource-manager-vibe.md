@@ -9,6 +9,9 @@
 > [README.md](README.md)、[docs/handoff.md](docs/handoff.md) 和
 > [docs/acceptance.md](docs/acceptance.md) 为准。文中“当前状态”均指
 > 2026-10-22 编写时的状态。
+>
+> 文中的 P0–P5 是初始实现里程碑，不是当前变更优先级；后续优先级 P0–P2 见
+> [docs/handoff.md](docs/handoff.md)。
 
 ---
 
@@ -530,7 +533,7 @@ citespec-resource/
 - 不新增 API；
 - 使用 Fake CLI 测试解析/错误。
 
-### P5 — 实机验收
+### P5 — 实机验收（历史里程碑）
 
 - 训练结束后，管理员批准；
 - monitor-only；

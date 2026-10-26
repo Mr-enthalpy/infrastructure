@@ -268,12 +268,14 @@ load-bearing requirements regardless.
 - A failed GPU audit, workspace quota check, or storage preflight must block new
   allocations while existing tasks continue and remain releasable.
 
-### 5.8 Member onboarding, central keys, and browser intake (D2)
+### 5.8 Member onboarding, central keys, and browser intake
 
-These checks require a disposable Linux host (VM/WSL/Docker where `sshd`,
-`useradd`, quota, and a browser are available), not the production host. The
-round that added the code did **not** execute them; local unit tests are not
-substitutes.
+These checks run on a disposable Linux host or on the controlled live instance
+with one-time accounts and full cleanup. Do not run them while other users'
+allocations or training containers are present. Record which environment was
+used and retain the evidence. Core active acceptance has been run on the live
+instance; external TLS onboarding and optional workstation paths remain
+separate checks.
 
 1. **Central-key SSH policy.** Install the drop-in on the disposable host and run
    `sshd -T -C user=<member>,host=<host>,addr=<addr>`. Record that
@@ -311,7 +313,8 @@ substitutes.
    python -m pytest tests/test_intake_browser.py -q
    ```
 
-   A Playwright skip is not PASS evidence. On a clean workstation profile, run
+   Playwright skips are recorded as SKIP and do not provide browser evidence.
+   On a clean workstation profile, run
    `setup --server ... --user ...`; confirm the SHA256 fingerprint is shown and
    not trusted before confirmation. Also run the same command with
    `--fingerprint SHA256:<wrong>` and confirm it fails without writing
@@ -326,9 +329,10 @@ substitutes.
    and re-enabling projects the current active key set. Record operation retries
    and audit events.
 
-Mark this section PASS only with captured host output and browser evidence. If
-the disposable environment is unavailable, record BLOCKED and keep the release
-conclusion at D1, not D2.
+Mark this section PASS only with captured host output and browser evidence. For
+the live instance, use one-time accounts and remove them after the test. A core
+PASS does not cover external HTTPS onboarding, VS Code, file transfer, or the
+container-root/host-GPU 5.6 gate.
 
 ## 6. Evidence to retain
 
