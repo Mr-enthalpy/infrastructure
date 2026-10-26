@@ -1,6 +1,7 @@
 [Unit]
 Description=Citespec membership intake (low-privilege application entry)
 After=network.target
+OnFailure=citespec-resource-alert@%n.service
 
 [Service]
 Type=simple

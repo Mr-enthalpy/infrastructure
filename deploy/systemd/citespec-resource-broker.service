@@ -3,6 +3,7 @@ Description=Citespec shared GPU resource broker
 After=docker.service citespec-gpu-permissions.service
 Wants=citespec-gpu-permissions.service
 Requires=docker.service
+OnFailure=citespec-resource-alert@%n.service
 
 [Service]
 Type=simple

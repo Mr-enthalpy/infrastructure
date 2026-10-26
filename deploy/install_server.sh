@@ -25,6 +25,11 @@ ROTATE_TIMER=/etc/systemd/system/citespec-resource-logrotate.timer
 DISK_SCRIPT=/usr/local/sbin/citespec-check-disk
 DISK_UNIT=/etc/systemd/system/citespec-resource-disk-check.service
 DISK_TIMER=/etc/systemd/system/citespec-resource-disk-check.timer
+ALERT_SCRIPT=/usr/local/sbin/citespec-alert
+ALERT_UNIT=/etc/systemd/system/citespec-resource-alert@.service
+BACKUP_UNIT=/etc/systemd/system/citespec-resource-backup.service
+BACKUP_TIMER=/etc/systemd/system/citespec-resource-backup.timer
+ALERT_LOG_DIR=/var/log/citespec-resource
 INTAKE_UNIT=/etc/systemd/system/citespec-resource-intake.service
 PROVISION_UNIT=/etc/systemd/system/citespec-resource-provision.service
 PROVISION_PATH=/etc/systemd/system/citespec-resource-provision.path
@@ -88,7 +93,7 @@ Options:
                         A fresh database still starts in monitor; existing active
                         leases are preserved only when deployment_allowed=true.
   --force-config        Overwrite an existing /etc/citespec-resource/config.toml.
-  --no-timers           Do not enable the disk-alert and log-rotation timers.
+  --no-timers           Do not enable the disk-alert, backup, and log-rotation timers.
   --config-source PATH  TOML config to install (default: lab/resources.local.toml
                         if present, otherwise lab/resources.example.toml).
   --python PATH         Python >= 3.11 used to create the venv.
@@ -355,6 +360,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
     if systemctl is-enabled --quiet citespec-resource-broker.service 2>/dev/null; then
         BROKER_WAS_ENABLED=1
     fi
+    install -d -o root -g root -m 0700 "$BACKUP_ROOT" \
+        || fail "could not secure backup root: $BACKUP_ROOT"
     BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
     mkdir -p "$BACKUP_DIR" || fail "could not create backup directory: $BACKUP_DIR"
     chmod 0700 "$BACKUP_DIR" || fail "could not secure backup directory: $BACKUP_DIR"
@@ -535,6 +542,8 @@ else
 fi
 
 run install -d -o root -g root -m 0750 "$STATE_DIR"
+run install -d -o root -g root -m 0700 "$BACKUP_ROOT"
+run install -d -o root -g root -m 0750 "$ALERT_LOG_DIR"
 run install -d -o "$INTAKE_USER" -g "$INTAKE_USER" -m 0700 "$INTAKE_STATE_DIR"
 ok "intake state directory ready: $INTAKE_STATE_DIR (owned by $INTAKE_USER)"
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -644,9 +653,14 @@ install_file 0644 "$SCRIPT_DIR/systemd/citespec-resource-logrotate.timer" "$ROTA
 install_file 0755 "$SCRIPT_DIR/check_disk.sh" "$DISK_SCRIPT"
 install_file 0644 "$SCRIPT_DIR/systemd/citespec-resource-disk-check.service" "$DISK_UNIT"
 install_file 0644 "$SCRIPT_DIR/systemd/citespec-resource-disk-check.timer" "$DISK_TIMER"
+install_file 0755 "$SCRIPT_DIR/alert.sh" "$ALERT_SCRIPT"
+install_file 0644 "$SCRIPT_DIR/systemd/citespec-resource-alert@.service" "$ALERT_UNIT"
+install_file 0644 "$SCRIPT_DIR/systemd/citespec-resource-backup.service" "$BACKUP_UNIT"
+install_file 0644 "$SCRIPT_DIR/systemd/citespec-resource-backup.timer" "$BACKUP_TIMER"
 if [ "$DRY_RUN" -eq 0 ] && have systemd-analyze; then
     systemd-analyze verify "$ROTATE_UNIT" "$ROTATE_TIMER" "$DISK_UNIT" "$DISK_TIMER" \
-        || fail "log rotation/disk unit validation failed"
+        "$ALERT_UNIT" "$BACKUP_UNIT" "$BACKUP_TIMER" \
+        || fail "log rotation, disk alert, and backup unit validation failed"
 fi
 if [ -e "$LEGACY_LOGROTATE" ]; then
     backup_file "$LEGACY_LOGROTATE"
@@ -749,16 +763,17 @@ fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
     if [ "$ENABLE_TIMERS" -eq 1 ]; then
-        note "would enable and start log-rotation and disk-alert timers"
+        note "would enable and start log-rotation, disk-alert, and state-backup timers"
     else
-        note "would leave log-rotation and disk-alert timers disabled"
+        note "would leave log-rotation, disk-alert, and state-backup timers disabled"
     fi
 elif [ "$ENABLE_TIMERS" -eq 1 ]; then
     # Enable timers only after the pre-activation audit and any broker start
     # attempt have succeeded, so a failed active install leaves no timer links.
     run systemctl enable --now citespec-resource-logrotate.timer
     run systemctl enable --now citespec-resource-disk-check.timer
-    ok "job-log rotation and disk-alert timers enabled"
+    run systemctl enable --now citespec-resource-backup.timer
+    ok "job-log rotation, disk-alert, and state-backup timers enabled"
 else
     note "timers left disabled by --no-timers"
 fi

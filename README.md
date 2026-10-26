@@ -18,11 +18,12 @@ monitor/maintenance 模式、重启对账，以及仅绑定回环地址的本地
 | 范围 | 状态 | 证据 |
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
-| 自动化验证 | 完成 | 本地 `392 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
+| 自动化验证 | 完成 | 本地 `400 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
 | CI | 完成 | GitHub Actions 运行 `40308426242` 通过 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
 | 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
+| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现；实机部署与恢复演练待维护窗口 |
 | 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
 | amax | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
 
@@ -154,6 +155,8 @@ uv.lock              # 锁定依赖版本
   文件传输。
 - [docs/legacy-access-revocation.md](docs/legacy-access-revocation.md)：旧管理员
   权限撤销与验证清单。
+- [docs/backup-restore.md](docs/backup-restore.md)：状态备份、校验、恢复和失败
+  告警 runbook。
 - [docs/handoff.md](docs/handoff.md)：当前实施状态、已验证项、目标机待验证项和
   下一会话的操作边界。
 - [docs/guides/member-quickstart.md](docs/guides/member-quickstart.md)：新成员申请、
@@ -261,8 +264,8 @@ bash deploy/verify_monitor_only.sh --member <member>
 ```
 
 `install_server.sh` 是幂等安装器。真实修改必须显式提供 `--yes`；默认只安装、不
-启动，启动后强制使用 `monitor` 模式。安装器默认启用磁盘告警和日志轮转 timer，
-可用 `--no-timers` 关闭。安装器会将严格审计脚本、GPU 权限验收脚本、root-owned
+启动，启动后强制使用 `monitor` 模式。安装器默认启用磁盘告警、日志轮转和每日
+状态备份 timer，可用 `--no-timers` 关闭。安装器会将严格审计脚本、GPU 权限验收脚本、root-owned
 成员 shell、窄开户执行器和 intake 服务安装到固定路径，并创建
 `/etc/citespec-resource/authorized-keys.d/`、开户 spool 与低权限 intake 状态目录。
 安装 Python 包时使用 `.[gui]` extras，使 intake/GUI 依赖可用。

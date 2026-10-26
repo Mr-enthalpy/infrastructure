@@ -1,5 +1,6 @@
 [Unit]
 Description=Check Citespec workspace free disk space
+OnFailure=citespec-resource-alert@%n.service
 
 [Service]
 Type=oneshot

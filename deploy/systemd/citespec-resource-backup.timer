@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Citespec state backup
+
+[Timer]
+OnCalendar=03:15
+RandomizedDelaySec=20m
+Persistent=true
+Unit=citespec-resource-backup.service
+
+[Install]
+WantedBy=timers.target

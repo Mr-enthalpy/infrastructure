@@ -256,12 +256,27 @@ must remain disabled.
 
 ## 7. systemd timers and operational controls
 
-The installer installs and enables `citespec-resource-logrotate.timer` and
-`citespec-resource-disk-check.timer` by default. Use `--no-timers` to leave them
-disabled. The log timer invokes the descriptor-relative
-`rotate_job_logs.py` helper instead of a logrotate `copytruncate` rule. The disk
-timer runs `check_disk.sh` and exits non-zero for warning and critical
-thresholds so failures are visible in `systemctl --failed` and the journal.
+The installer installs and enables `citespec-resource-logrotate.timer`,
+`citespec-resource-disk-check.timer`, and `citespec-resource-backup.timer` by
+default. Use `--no-timers` to leave them disabled. The log timer invokes the
+descriptor-relative `rotate_job_logs.py` helper instead of a logrotate
+`copytruncate` rule. The disk timer runs `check_disk.sh` and exits non-zero for
+warning and critical thresholds so failures are visible in
+`systemctl --failed` and the journal.
+
+The backup timer runs `python -m citespec_resource.backup backup` once a day.
+It uses SQLite's online backup API for `state.db` and the intake database,
+copies the root-owned `/etc/citespec-resource` tree (including central member
+keys), writes a SHA-256 manifest, verifies the result, and retains the newest 14
+`state-*` backups under `/var/backups/citespec-resource/`. Workspaces are not
+included. See `docs/backup-restore.md` for verification, restore, and restore
+drill commands.
+
+`citespec-resource-alert@.service` is the common `OnFailure=` target for the
+broker, intake, disk, log-rotation, and backup units. It writes the journal and
+`/var/log/citespec-resource/alerts.log`; an optional root-owned
+`/etc/citespec-resource/alert.env` can set `CITESPEC_ALERT_WEBHOOK` for JSON
+webhook delivery.
 
 The broker socket must be owned by `root:citespec-cli` with mode `0660`. Members must
 not receive Docker, sudo, GPU device group, `video`, or `render` access. The
@@ -285,11 +300,16 @@ container must not mount the host Docker socket.
 - `check_disk.sh`: workspace free-space alert; exits 0, 1, or 2.
 - `configure_quotas.sh`: XFS/ext4 project quota setup; dry-run by default.
 - `rotate_job_logs.py`: symlink-safe job-log rotation.
+- `alert.sh`: `OnFailure=` alert recorder; journal + local log + optional webhook.
+- `../src/citespec_resource/backup.py`: state backup, verify, restore, and
+  retention implementation used by the backup timer.
 - `acceptance_active.py`: destructive active-mode acceptance harness; see
   `docs/acceptance.md`.
 - `systemd/citespec-resource-broker.service`: hardened broker unit.
 - `systemd/citespec-resource-logrotate.service` and `.timer`: log rotation timer.
 - `systemd/citespec-resource-disk-check.service` and `.timer`: disk alert timer.
+- `systemd/citespec-resource-backup.service` and `.timer`: daily state backup.
+- `systemd/citespec-resource-alert@.service`: common failure alert template.
 - `systemd/citespec-resource-intake.service`: unprivileged public application entry;
   owns only its own SQLite store.
 - `systemd/citespec-resource-provision.service` and `.path`: root executor triggered

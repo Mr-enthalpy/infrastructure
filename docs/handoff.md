@@ -99,14 +99,14 @@
   and README updates`），工作区无未提交改动。
 - 本轮开始前本地验证：`360 passed, 21 skipped`；Ruff check/format、mypy、
   `node --check` 通过。
-- 本轮结束本地验证：`392 passed, 21 skipped`（新增 1 个 Playwright 浏览器
-  测试在本机因缺依赖 SKIP；新增命名/部署回归测试 3 项），Ruff check/format、mypy
-  （34 文件）、`node --check`、`bash -n deploy/*.sh` 通过。21 个 skip 为环境限制；
-  Ubuntu CI 执行 Linux-only 项，Playwright 浏览器任务待接入 CI。
+- 当前本地验证：`400 passed, 21 skipped`（包含 P0-2 备份/恢复/校验和部署单元
+  回归），Ruff check/format、mypy（35 文件）、`node --check`、`bash -n deploy/*.sh`
+  通过。21 个 skip 为环境限制；Ubuntu CI 执行 Linux-only 项，Playwright 浏览器
+  任务待接入 CI。
 - 本轮实现与 sanitized handoff 已提交并推送：`8772763`（cutover）、`d0294be`
-  （sanitized handoff + naming guard）；本次文档校准随后提交并推送。
+  （sanitized handoff + naming guard）；文档校准和 P0-2 实现见后续提交。
 - GitHub Actions 运行 `40308426242` 在 `d0294be` 上通过；当前分支 `main`，远程
-  `origin`。文档校准提交由后续 CI 验证。
+  `origin`。P0-2 提交由后续 CI 验证。
 - amax 未改动，未执行 Docker/NVIDIA 重启、容器操作或验收测试。期间一次
   `admin ... --help` 被旧的自动中继逻辑误判并尝试解析 `amax`，连接未建立，
   未认证、未修改主机状态；该缺陷已修复（含 `--help` 的命令不再中继，且新增
@@ -443,6 +443,8 @@ xfs_quota -x -c 'report -p -b -h' /data1
 - `src/citespec_resource/onboarding.py`：setup/doctor、严格主机密钥、托管 SSH 片段、
   成员状态探测。
 - `src/citespec_resource/db.py`：schema 迁移 3/4，备份与幂等索引/操作表。
+- `src/citespec_resource/backup.py`：在线 SQLite 备份、清单校验、恢复、保留策略。
+- `deploy/alert.sh`：systemd `OnFailure=` 本地日志和可选 webhook 告警。
 - `src/citespec_resource/broker/docker_driver.py`：development profile、存储/`nosuid`
   预检、容器 SSH passwd/key 准备、隧道 demux。
 - `src/citespec_resource/config.py`：路径校验、active/quota 策略闸门。
@@ -475,6 +477,7 @@ xfs_quota -x -c 'report -p -b -h' /data1
 - `docs/queue.md`：队列状态和公平性语义。
 - `docs/jobs-and-transfer.md`：job 和受限文件传输。
 - `docs/legacy-access-revocation.md`：legacy 管理员权限撤销。
+- `docs/backup-restore.md`：状态备份、校验、恢复和失败告警 runbook。
 
 ## 9. 剩余工作与优先级
 
@@ -483,7 +486,7 @@ xfs_quota -x -c 'report -p -b -h' /data1
 | 优先级 | 项目 | 当前状态 | 退出条件 |
 |---|---|---|---|
 | P0 | 文档状态基线 | 本次更新 | README/handoff/report/deploy README 使用同一状态口径 |
-| P0 | 备份、恢复与告警 | 待实现 | 定期备份、恢复演练、失败告警均通过 |
+| P0 | 备份、恢复与告警 | 代码实现完成；待实机部署/恢复演练 | 定期备份、恢复演练、失败告警均通过 |
 | P0 | SSH/管理员/审计基线 | 27 条 warning 待分类 | 无 critical/high；warning 有分类和负责人 |
 | P0 | 容器 root/宿主 GPU 5.6 | 未验证 | 容器 root 不能修改宿主 `/dev/nvidia*` 并影响他人 |
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |

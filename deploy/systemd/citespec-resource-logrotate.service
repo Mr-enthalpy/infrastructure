@@ -1,5 +1,6 @@
 [Unit]
 Description=Rotate Citespec per-allocation job logs safely
+OnFailure=citespec-resource-alert@%n.service
 
 [Service]
 Type=oneshot

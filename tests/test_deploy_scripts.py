@@ -15,6 +15,7 @@ SCRIPTS = [
     "verify_monitor_only.sh",
     "check_disk.sh",
     "configure_quotas.sh",
+    "alert.sh",
 ]
 
 
@@ -183,6 +184,36 @@ def test_installer_enables_timers_by_default_with_opt_out():
     assert "--no-timers" in source
     assert "systemctl enable --now citespec-resource-logrotate.timer" in source
     assert "systemctl enable --now citespec-resource-disk-check.timer" in source
+    assert "systemctl enable --now citespec-resource-backup.timer" in source
+    assert "citespec-resource-alert@.service" in source
+    assert "ALERT_LOG_DIR" in source
+
+
+def test_backup_and_alert_units_are_installed_and_failure_wired():
+    backup_unit = (ROOT / "deploy/systemd/citespec-resource-backup.service").read_text(
+        encoding="utf-8"
+    )
+    assert "OnFailure=citespec-resource-alert@%n.service" in backup_unit
+    assert "citespec_resource.backup" in backup_unit
+    assert "/var/backups/citespec-resource" in backup_unit
+    assert "User=root" in backup_unit
+    assert "ProtectSystem=strict" in backup_unit
+    timer = (ROOT / "deploy/systemd/citespec-resource-backup.timer").read_text(encoding="utf-8")
+    assert "Persistent=true" in timer
+    assert "citespec-resource-backup.service" in timer
+    alert_unit = (ROOT / "deploy/systemd/citespec-resource-alert@.service").read_text(
+        encoding="utf-8"
+    )
+    assert "ExecStart=/usr/local/sbin/citespec-alert %i" in alert_unit
+    assert "ReadWritePaths=/var/log/citespec-resource" in alert_unit
+    for name in (
+        "citespec-resource-broker.service",
+        "citespec-resource-intake.service",
+        "citespec-resource-disk-check.service",
+        "citespec-resource-logrotate.service",
+    ):
+        text = (ROOT / "deploy/systemd" / name).read_text(encoding="utf-8")
+        assert "OnFailure=citespec-resource-alert@%n.service" in text
 
 
 def test_development_container_image_has_sshd_sudo_and_bootstrap():

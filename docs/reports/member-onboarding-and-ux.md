@@ -3,7 +3,7 @@
 - 目标文档：`docs/goals/member-onboarding-and-ux.md`（v1.0）
 - 本轮起点：`01bc2bf`（工作区干净）
 - 本轮 cutover 结束：`d0294be`（功能/cutover 提交 `8772763`、`d0294be`；CI
-  `40308426242` 通过）；文档校准见本次提交
+  `40308426242` 通过）；文档校准和 P0-2 备份/告警实现见后续提交
 - 结论：**D1 完成；D2 核心实机验收完成；D3 对外生产开放未完成**
 
 ## 1. 实际基线与结束状态
@@ -11,9 +11,9 @@
 | 项目 | 本轮开始 | 本轮结束 |
 |---|---|---|
 | 提交 | `01bc2bf` | `d0294be`（cutover）；文档校准见本次提交 |
-| 测试 | 360 passed / 21 skipped | **392 passed / 21 skipped** |
+| 测试 | 360 passed / 21 skipped | **400 passed / 21 skipped** |
 | Ruff check/format | 通过 | 通过 |
-| mypy | 通过 | **34 个源文件通过** |
+| mypy | 通过 | **35 个源文件通过** |
 | `node --check` | 通过 | 通过 |
 | `bash -n`（部署脚本） | 通过 | 通过 |
 | 真实主机部署 | 未执行 | **active 核心验收完成** |
@@ -47,7 +47,7 @@ Linux/SSH/浏览器验收在实机完成。
 | AC-23/24 管理员与执行器边界 | `broker/server.py`、`provision_executor.py` | 普通成员直调拒绝、执行器动作/字段白名单测试 | 核心路径完成 |
 | AC-25 迁移旧数据 | `db.py`、`membership/service.py`、legacy manifest | v2→v4、迁移幂等、manifest dry-run/冲突/显式 apply 测试 | 生产数据库副本待补 |
 | AC-26 真实浏览器 | `enrollment/static`、`gui/static`、`tests/test_intake_browser.py` | 浏览器测试代码；本地手动路径完成 | 外部入口阻塞；Playwright CI 待接入 |
-| AC-27 兼容回归 | 全仓库 | **392 passed**；队列/到期/文件/GPU 预算回归通过 | 核心回归完成 |
+| AC-27 兼容回归 | 全仓库 | **400 passed**；队列/到期/文件/GPU 预算回归通过 | 核心回归完成 |
 | AC-28 服务失败 | CLI/GUI/Broker | 重试幂等、连接失败不伪装成拒绝、操作恢复测试 | 真实 systemd/网络故障待补 |
 | AC-29 生命周期 | 既有 allocation/cleanup 逻辑 | 原有回归通过 | active 验收完成 |
 | AC-30 权限投影收敛 | service/executor/broker | DB 变更失败回滚、主机密钥读回、inspect 测试 | 核心路径完成 |
@@ -96,7 +96,7 @@ Linux/SSH/浏览器验收在实机完成。
 
 ```bash
 .venv\Scripts\python -m pytest -q
-# 392 passed, 21 skipped
+# 400 passed, 21 skipped
 
 .venv\Scripts\python -m ruff check .
 # All checks passed!
@@ -104,7 +104,7 @@ Linux/SSH/浏览器验收在实机完成。
 # 通过
 
 .venv\Scripts\python -m mypy src
-# Success: no issues found in 34 source files
+# Success: no issues found in 35 source files
 
 node --check src\citespec_resource\gui\static\app.js
 # 通过
@@ -115,7 +115,7 @@ node --check src\citespec_resource\gui\static\app.js
 
 | 结果 | 内容 |
 |---|---|
-| PASS | 392 个本地测试：成员状态机、审批版本/并发、操作重试、初始化/迁移、队列/apply 幂等、GPU 张数、Broker 闸门/流关闭、密钥同步回滚、legacy import、setup 主机信任/配置、CLI/JSON、intake HTTP、GUI 路由、执行器固定动作 |
+| PASS | 400 个本地测试：成员状态机、审批版本/并发、操作重试、初始化/迁移、队列/apply 幂等、GPU 张数、Broker 闸门/流关闭、密钥同步回滚、legacy import、setup 主机信任/配置、CLI/JSON、intake HTTP、GUI 路由、执行器固定动作、备份/恢复/校验 |
 | SKIP | 21 个环境限制项：Linux/Docker/descriptor-relative 和 Playwright 浏览器测试 |
 | FAIL | 无本地失败 |
 | 已完成 | 真实 SSH 核心路径、useradd/quota、intake/provision、active 验收、GPU 审计、restricted profile |
@@ -179,7 +179,7 @@ node --check src\citespec_resource\gui\static\app.js
 | 优先级 | 项目 | 下一步 |
 |---|---|---|
 | P0 | 容器 root/宿主 GPU 5.6 | 在目标机执行 acceptance 5.6，保留前后 stat/权限证据 |
-| P0 | 备份、恢复和告警 | 定期备份、恢复演练、失败告警 |
+| P0 | 备份、恢复和告警 | 代码已实现；待实机部署、恢复演练和失败告警验证 |
 | P0 | SSH/管理员/审计 | 分类 27 条 warning，确认无 critical/high |
 | P1 | 安装器可复现性 | 固定镜像 digest，干净主机 dry-run/回滚 |
 | P1 | CI 覆盖 | Playwright 浏览器 job、必要 Linux 集成项 |
@@ -220,7 +220,7 @@ D3 尚未开放，剩余项包括：
 
 - 外部 443/DNS/TLS onboarding；
 - VS Code、文件传输和容器 root/宿主 GPU 5.6；
-- 备份恢复、监控告警、安装器可复现性和浏览器 CI；
+- 备份恢复/告警的实机部署与恢复演练、安装器可复现性和浏览器 CI；
 - reboot/NVIDIA driver reload 后的复验。
 
 amax 未改动，未重启 Docker/NVIDIA，未修改 udev，未创建/停止容器或修改真实成员账号。
