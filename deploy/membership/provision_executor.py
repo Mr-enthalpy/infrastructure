@@ -289,7 +289,11 @@ def _member_ssh_monitor_pids(username: str, proc_root: Path = Path("/proc")) -> 
         if uid != 0 or not _is_sshd_executable(pid):
             continue
         cmdline = _process_cmdline(pid)
-        if cmdline == prefix or cmdline.startswith(prefix + " ") or cmdline.startswith(prefix + "@"):
+        if (
+            cmdline == prefix
+            or cmdline.startswith(prefix + " ")
+            or cmdline.startswith(prefix + "@")
+        ):
             pids.append(pid)
     if inspected == 0:
         raise StageError("session_close", "cannot inspect /proc process ownership")
