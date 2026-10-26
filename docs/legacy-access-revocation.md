@@ -20,7 +20,7 @@ Run the following commands as root on the server:
 ```bash
 date -Is
 hostname
-getent group sudo docker udc-admins udc-members udc-cli udc-gpu || true
+getent group sudo docker citespec-admins citespec-members citespec-cli citespec-gpu || true
 getent passwd
 ```
 
@@ -62,8 +62,8 @@ Use a second, verified administrator session. Do not close the only known-good
 session until the new restrictions have been tested.
 
 - [ ] Remove the account from every administrator group, including
-      `udc-admins`, `sudo`, `wheel`, and any legacy administrator group.
-- [ ] Remove it from `docker`, `udc-gpu`, `video`, and `render`.
+      `citespec-admins`, `sudo`, `wheel`, and any legacy administrator group.
+- [ ] Remove it from `docker`, `citespec-gpu`, `video`, and `render`.
 - [ ] Remove `NOPASSWD` and sudoers drop-ins for the account. Validate with
       `visudo -cf /etc/sudoers` and every file in `/etc/sudoers.d/`.
 - [ ] Remove the account's `authorized_keys` entries, including keys in
@@ -82,10 +82,10 @@ The following commands are intentionally explicit; substitute the approved
 account names:
 
 ```bash
-gpasswd -d "$user" udc-admins || true
+gpasswd -d "$user" citespec-admins || true
 gpasswd -d "$user" sudo || true
 gpasswd -d "$user" docker || true
-gpasswd -d "$user" udc-gpu || true
+gpasswd -d "$user" citespec-gpu || true
 usermod -L "$user"
 chage -E0 "$user"
 pkill -KILL -u "$user" || true
@@ -96,10 +96,10 @@ pkill -KILL -u "$user" || true
 - [ ] Ensure `getent group docker` has no human members. The broker runs as root
       and uses the Docker socket; members must not.
 - [ ] Confirm that `/var/run/docker.sock` is not group-readable or
-      group-writable by `udc-members` or any legacy administrator group.
-- [ ] Ensure `udc-gpu` has no effective members, including primary-group
+      group-writable by `citespec-members` or any legacy administrator group.
+- [ ] Ensure `citespec-gpu` has no effective members, including primary-group
       membership, and that every `/dev/nvidia*` node, including `nvidia-uvm`,
-      `nvidia-uvm-tools`, and `nvidia-modeset`, is `0660 root:udc-gpu` or
+      `nvidia-uvm-tools`, and `nvidia-modeset`, is `0660 root:citespec-gpu` or
       stricter with no extra ACL. Run:
       `bash deploy/verify_gpu_permissions.sh --member <member> --expected-gpus 8`.
       Re-run it after reboot and after reloading the NVIDIA driver. The udev rule
@@ -127,14 +127,14 @@ be revoked.
       refreshes the role, or update it explicitly:
 
   ```bash
-  sqlite3 /var/lib/udc-resource/state.db \
+  sqlite3 /var/lib/citespec-resource/state.db \
     "UPDATE users SET role='member' WHERE username='<legacy-admin>';"
   ```
 
-- [ ] Confirm that `udc-resource admin users --json` no longer shows the account
+- [ ] Confirm that `citespec-resource admin users --json` no longer shows the account
       as an administrator.
-- [ ] Confirm that the account cannot run `udc-resource admin ...` through the
-      broker after removal from `udc-admins`.
+- [ ] Confirm that the account cannot run `citespec-resource admin ...` through the
+      broker after removal from `citespec-admins`.
 - [ ] Check audit events for old administrator actions and preserve the evidence.
 - [ ] Do not delete active allocations; let expiry or release handle them. If a
       legacy account owns running resources, transfer or release them through
@@ -147,7 +147,7 @@ produce the stated result:
 
 ```bash
 id <legacy-admin>
-getent group docker udc-gpu udc-admins
+getent group docker citespec-gpu citespec-admins
 sudo -l -U <legacy-admin>                 # must fail or show no privileges
 su -s /bin/bash <legacy-admin> -c 'docker ps'       # must fail
 su -s /bin/bash <legacy-admin> -c 'nvidia-smi -L'   # must fail
@@ -160,8 +160,8 @@ bash deploy/verify_gpu_permissions.sh --member <current-member> --expected-gpus 
 Also verify the positive path with a current member account:
 
 ```bash
-ssh <current-member>@<server> udc-resource list --json
-ssh <current-member>@<server> udc-resource apply --gpus 0 --cpus 1 --memory 1 --hours 1 --json
+ssh <current-member>@<server> citespec-resource list --json
+ssh <current-member>@<server> citespec-resource apply --gpus 0 --cpus 1 --memory 1 --hours 1 --json
 ```
 
 Release the test allocation afterward. Re-run the checks after a reboot and after

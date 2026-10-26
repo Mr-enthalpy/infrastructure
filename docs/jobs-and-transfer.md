@@ -41,20 +41,20 @@ writes both stdout and stderr to a persistent log in the allocation workspace.
 
 ```bash
 # Arguments after -- are passed to the job unchanged.
-udc-resource job start <allocation-id> --name train -- \
+citespec-resource job start <allocation-id> --name train -- \
   python train.py --config configs/train.yaml
 
-udc-resource job list <allocation-id>
-udc-resource job logs <allocation-id> --name train --tail 200
-udc-resource job attach <allocation-id> --name train
-udc-resource job stop <allocation-id> --name train
+citespec-resource job list <allocation-id>
+citespec-resource job logs <allocation-id> --name train --tail 200
+citespec-resource job attach <allocation-id> --name train
+citespec-resource job stop <allocation-id> --name train
 ```
 
-The tmux session name is `udc-<name>`. Names are limited to
+The tmux session name is `citespec-<name>`. Names are limited to
 `[A-Za-z0-9_.-]{1,32}`. Logs are stored at:
 
 ```text
-<workspace>/.udc-logs/<name>.log
+<workspace>/.citespec-logs/<name>.log
 ```
 
 `job attach` starts an interactive tmux client. If SSH disconnects, only the
@@ -67,7 +67,7 @@ Operational requirements:
 
 - Jobs run as the configured `policy.container_user` (default `member`, mapped to
   the allocation owner's host UID/GID) and have access to the allocation's GPU
-  devices. Workspace files and `.udc-logs` are owned by that member.
+  devices. Workspace files and `.citespec-logs` are owned by that member.
 - `job stop` terminates the tmux session and its process tree. Application-level
   checkpointing is required for graceful training recovery; stopping a training
   process is not a graceful shutdown.
@@ -76,7 +76,7 @@ Operational requirements:
 - The broker records `job_started` and `job_stopped` audit events.
 - Job logs are rotated by `deploy/rotate_job_logs.py`. The helper opens every
   directory with `O_NOFOLLOW` and refuses symlinks. A generic `copytruncate`
-  logrotate rule must not be used for the member-writable `.udc-logs` directory.
+  logrotate rule must not be used for the member-writable `.citespec-logs` directory.
 
 ## 4. Restricted file transfer
 
@@ -87,10 +87,10 @@ requires an active allocation and either its owner or a broker administrator.
 
 ```bash
 # Local workstation to server workspace
-udc-resource push <allocation-id> ./data/train.tar /workspace/data/train.tar
+citespec-resource push <allocation-id> ./data/train.tar /workspace/data/train.tar
 
 # Server workspace to local workstation
-udc-resource pull <allocation-id> /workspace/checkpoints/best.pt ./best.pt
+citespec-resource pull <allocation-id> /workspace/checkpoints/best.pt ./best.pt
 ```
 
 The path argument is relative to the workspace. A leading `/workspace/` is
@@ -103,8 +103,8 @@ use a tar archive for directory trees.
 The remote-side primitives are available for diagnostics:
 
 ```bash
-udc-resource file put <allocation-id> path/inside/workspace < local-file
-udc-resource file get <allocation-id> path/inside/workspace > local-file
+citespec-resource file put <allocation-id> path/inside/workspace < local-file
+citespec-resource file get <allocation-id> path/inside/workspace > local-file
 ```
 
 `file get` writes only file content to stdout; errors are written to stderr with a

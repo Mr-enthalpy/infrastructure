@@ -36,11 +36,11 @@ log in as the two member accounts.
 
 ```bash
 cd /path/to/infrastructure
-/opt/udc-resource/.venv/bin/python deploy/acceptance_active.py \
-  --member-a udc-alice \
-  --member-b udc-bob \
-  --member-a-user udc-alice \
-  --member-b-user udc-bob \
+/opt/citespec-resource/.venv/bin/python deploy/acceptance_active.py \
+  --member-a citespec-alice \
+  --member-b citespec-bob \
+  --member-a-user citespec-alice \
+  --member-b-user citespec-bob \
   --gpu 7 \
   --allow-test-container \
   --allow-db-time-travel \
@@ -67,7 +67,7 @@ modify host state and must be retained as evidence:
   with `prjquota` or `pquota`; `xfs_quota` is available; workspace project quotas
   are enabled; and the workspace filesystem is mounted `nosuid`.
 - Confirm the `nosuid` mount directly with
-  `findmnt -no OPTIONS -T /data1/udc-users`. Without a user namespace, container
+  `findmnt -no OPTIONS -T /data1/citespec-users`. Without a user namespace, container
   root is host root; a setuid file written through the workspace bind must not
   be honored by the host.
 - The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`
@@ -190,7 +190,7 @@ stop, restart, or alter training containers.
 
 ### 5.4 Broker-mediated VS Code tunnel
 
-- With `vscode_enabled = true`, run `udc-resource vscode <allocation-id>`.
+- With `vscode_enabled = true`, run `citespec-resource vscode <allocation-id>`.
   VS Code must connect as the member UID and open `/workspace`.
 - The local listener must bind only to `127.0.0.1`. The generated SSH config
   disables host-key verification for the loopback-only alias. Confirm that no
@@ -208,13 +208,13 @@ stop, restart, or alter training containers.
 ### 5.5 GPU device access on both login paths
 
 The container identity initialization must create a supplementary group with
-the host `udc-gpu` GID inside the container. Docker's `group_add` only applies
+the host `citespec-gpu` GID inside the container. Docker's `group_add` only applies
 to docker-exec sessions; an sshd login rebuilds supplementary groups from the
 container's `/etc/group`, so the VS Code path is the regression risk. Verify
 both paths separately, inside the same test allocation:
 
-- Via `udc-resource shell <allocation-id>` (docker-exec path):
-  1. `id -G` must list the host `udc-gpu` GID.
+- Via `citespec-resource shell <allocation-id>` (docker-exec path):
+  1. `id -G` must list the host `citespec-gpu` GID.
   2. `nvidia-smi -L` must list the allocated GPUs (and only concerns the
      member, not root).
   3. If the image ships PyTorch: `python -c "import torch;
@@ -268,12 +268,74 @@ load-bearing requirements regardless.
 - A failed GPU audit, workspace quota check, or storage preflight must block new
   allocations while existing tasks continue and remain releasable.
 
+### 5.8 Member onboarding, central keys, and browser intake (D2)
+
+These checks require a disposable Linux host (VM/WSL/Docker where `sshd`,
+`useradd`, quota, and a browser are available), not the production host. The
+round that added the code did **not** execute them; local unit tests are not
+substitutes.
+
+1. **Central-key SSH policy.** Install the drop-in on the disposable host and run
+   `sshd -T -C user=<member>,host=<host>,addr=<addr>`. Record that
+   `authorizedkeysfile` is exactly
+   `/etc/citespec-resource/authorized-keys.d/%u`. Add a key only to the member's home
+   `~/.ssh/authorized_keys`; confirm public-key login still fails. Add the same
+   key through approval/key-add; confirm login succeeds and a broker operation
+   runs. Revoke the key; confirm new SSH connections fail even though the member
+   can still edit the home directory.
+2. **Approval and provisioning.** Create an invitation, submit through the real
+   HTML form and through `citespec-resource join --portal` (including a machine with
+   no local server config), approve with the exact `--expected-version`, and
+   record the account UID, groups, shell, central key file, workspace, and quota
+   read back from the host. Attempt a stale-version approval and confirm it is
+   refused. Interrupt the executor mid-operation and retry; confirm the final
+   state is either fully active or visibly failed, never half-claimed.
+3. **Pre-existing accounts.** Run `admin members import-legacy` dry-run against
+   an unrelated account and confirm a conflict; confirm nothing is adopted by
+   name. Run apply with a reviewed manifest and verify the shell/groups/keys are
+   converged. Do not adopt a privileged or system account.
+4. **Bounded intake.** Submit oversized fields, private-key material, duplicate
+   idempotency keys, and rapid repeated requests. Confirm friendly rejection,
+   rate limiting, no secret in URL/logs, POST-only receipt status, and that one
+   invitation cannot mint unlimited applications. Verify the intake account
+   cannot read the broker socket, member database, Docker socket, or GPU nodes.
+5. **Browser and workstation UX.** Publish the loopback intake service through
+   the lab TLS reverse proxy and verify request-size, rate, and network policy.
+   In a real browser, complete the application form, confirm receipt is shown
+   once, then query status with only the receipt secret. The repository includes
+   `tests/test_intake_browser.py` for this path:
+
+   ```bash
+   python -m pip install -e ".[browser]"
+   python -m playwright install chromium
+   python -m pytest tests/test_intake_browser.py -q
+   ```
+
+   A Playwright skip is not PASS evidence. On a clean workstation profile, run
+   `setup --server ... --user ...`; confirm the SHA256 fingerprint is shown and
+   not trusted before confirmation. Also run the same command with
+   `--fingerprint SHA256:<wrong>` and confirm it fails without writing
+   known_hosts. Confirm existing `~/.ssh/config` is preserved, the managed
+   fragment is included once,
+   and the generated `~/.config/citespec-resource/client.toml` contains connection
+   data only. Confirm a wrong host key fails closed. Then run `me`, `start`,
+   `queue`, and `gui`; capture screenshots/output.
+6. **Lifecycle and revocation.** Suspend/resume/revoke through the GUI; confirm
+   the member's queued requests and broker streams/tunnels close, existing
+   allocations follow the documented policy, key files are removed on disable,
+   and re-enabling projects the current active key set. Record operation retries
+   and audit events.
+
+Mark this section PASS only with captured host output and browser evidence. If
+the disposable environment is unavailable, record BLOCKED and keep the release
+conclusion at D1, not D2.
+
 ## 6. Evidence to retain
 
 Retain the complete command output and the following artifacts:
 
 - member `list --json` output before and after the test;
-- `systemctl status udc-resource-broker` and relevant journal excerpts;
+- `systemctl status citespec-resource-broker` and relevant journal excerpts;
 - `docker ps -a` before and after the test;
 - test allocation status before and after expiry;
 - workspace marker path and existence result;
@@ -284,6 +346,13 @@ Retain the complete command output and the following artifacts:
 - development-profile preflight output, image digest, and `docker inspect`
   security fields;
 - VS Code tunnel logs and cancellation evidence;
+- `sshd -T` central `AuthorizedKeysFile` output and proof that a home-only key
+  does not authenticate;
+- intake/provision unit status, provisioning operation stages, and the
+  approved request version/ID;
+- browser screenshot/output for application, receipt, approval, and setup
+  fingerprint confirmation; the generated workstation profile with secrets
+  redacted;
 - operator name, timestamps, and approval reference for every state change.
 
 ## 7. Abort and recovery criteria

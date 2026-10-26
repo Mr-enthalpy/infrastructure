@@ -103,7 +103,7 @@
 | INV-05 | GUI 不是授权边界。所有关键操作必须经过 Broker/受控服务的服务端验证。 |
 | INV-06 | 未审批、开通失败、暂停、过期或已撤销成员不能通过旧接口、排队准入或旧连接重新获得资源。 |
 | INV-07 | 删除账号、删除 workspace、停止训练和关闭交互连接是不同动作，不得暗中捆绑。 |
-| INV-08 | 撤权不得依赖移除 `udc-members` 来解除 SSH 匹配；限制登录的 shell/组规则继续保留。 |
+| INV-08 | 撤权不得依赖移除 `citespec-members` 来解除 SSH 匹配；限制登录的 shell/组规则继续保留。 |
 | INV-09 | JSON、文件传输、SSH 隧道等机器协议不被欢迎词、菜单或进度输出污染。 |
 | INV-10 | 开通/撤权是跨数据库和操作系统的可恢复操作，不假装它们能靠一次 SQLite 事务整体回滚。 |
 | INV-11 | 既有 GPU 隔离、资源预算、存储闸门、到期回收和 `cleanup_pending` 语义不得退化。 |
@@ -182,7 +182,7 @@ OpenSSH 的 `Banner` 用于认证前提示；`ForceCommand` 用于认证后的�
 | 合法成员 `ssh alias` 且有终端 | 状态感知菜单；有环境时突出继续工作 | 给宿主机 shell；只打印英文命令清单 |
 | 合法成员直接执行 `bash`、`docker`、`nvidia-smi` 等宿主命令 | 拒绝执行，同时在 stderr 给对应的新方式 | 自动执行原命令；偷偷创建环境后执行 |
 | 旧 scp/SFTP 客户端连宿主机 | 协议失败保持清晰；stderr 给受控传输/容器入口说明 | 往协议 stdout 填菜单；为兼容放开宿主机 SFTP |
-| VS Code 直接连旧宿主目标 | 在可见诊断中说明应从 `udc-resource vscode` 或 GUI 进入 | 自动识别任意 bootstrap 脚本并在 host 执行 |
+| VS Code 直接连旧宿主目标 | 在可见诊断中说明应从 `citespec-resource vscode` 或 GUI 进入 | 自动识别任意 bootstrap 脚本并在 host 执行 |
 | 合法 `--json`、tunnel、file 命令 | 保持现有协议和退出码；仅必要诊断去 stderr | 插入欢迎语、ANSI 控制符或交互提问 |
 | 无 TTY、无明确命令 | 返回简短使用说明与适当非零状态，不等待菜单输入 | 在管道里永久挂起 |
 
@@ -219,7 +219,7 @@ legacy_login_notice_enabled = true
 
 继续使用：
   直接 ssh <你的服务器别名>，打开资源菜单；
-  或在你自己的电脑运行 udc-resource gui。
+  或在你自己的电脑运行 citespec-resource gui。
 
 进入已有环境后，可在容器内使用 sudo、安装软件和运行训练。
 使用指南：<guide_url>
@@ -285,7 +285,7 @@ SSH Banner/配置安装须备份、dry-run、`sshd -t`、有效配置检查；�
 
 ### 5.4 本地配置向导
 
-提供 `udc-resource setup` 或等价入口，并让未配置的 GUI 首屏可进入它。客户端最小配置只需要连接目标/别名、个人用户名、所用密钥和信任信息；不要要求成员复制包含硬件预算和管理员策略的服务器 TOML。
+提供 `citespec-resource setup` 或等价入口，并让未配置的 GUI 首屏可进入它。客户端最小配置只需要连接目标/别名、个人用户名、所用密钥和信任信息；不要要求成员复制包含硬件预算和管理员策略的服务器 TOML。
 
 向导应：
 
@@ -377,7 +377,7 @@ AND 本次操作满足所有资源与环境策略
 
 暂停或撤销成员时：
 
-- 保持受限登录 shell 与 `udc-members` 限制语义；
+- 保持受限登录 shell 与 `citespec-members` 限制语义；
 - 不能通过删除匹配组而让账号退回普通 shell；
 - 不得自动回收 UID 给新成员，也不得让新成员继承旧 workspace；
 - 未列入显式迁移/批准清单的历史 Linux 用户不能因“本来在组里”自动成为 active；
@@ -559,7 +559,7 @@ HTTPS 申请入口（独立低权限 intake）
 
 ### 9.2 intake 的权限限制
 
-- 使用独立非 root 系统身份，不能属于 `udc-cli`、`docker`、`sudo` 或管理员组。
+- 使用独立非 root 系统身份，不能属于 `citespec-cli`、`docker`、`sudo` 或管理员组。
 - 只能访问自己的申请存储；不能写 Broker 的成员、allocation、配置、审计数据库。
 - 生产默认仅绑定 loopback，通过已有 HTTPS 反向代理暴露；优先限制在实验室网络/VPN。开发可在本机 loopback HTTP 演示，但文档必须标注差异。
 - 暴露的公开操作仅限：显示指南、验证邀请并提交申请、凭私有回执查询/补充/取消该申请。
@@ -628,24 +628,24 @@ HTTPS 申请入口（独立低权限 intake）
 
 ```bash
 # 没有服务器账号也可使用；邀请秘密由安全提示输入，不放命令行参数。
-udc-resource join --portal https://lab.example.invalid/compute
-udc-resource join status
+citespec-resource join --portal https://lab.example.invalid/compute
+citespec-resource join status
 
 # 已批准后配置工作站。
-udc-resource setup --server amax
-udc-resource doctor
-udc-resource me
+citespec-resource setup --server amax
+citespec-resource doctor
+citespec-resource me
 
 # 普通工作路径。
-udc-resource start --gpu-count 1 --preset standard --open vscode
-udc-resource connect
-udc-resource vscode
-udc-resource gui
+citespec-resource start --gpu-count 1 --preset standard --open vscode
+citespec-resource connect
+citespec-resource vscode
+citespec-resource gui
 
 # 个人公钥。
-udc-resource me keys list
-udc-resource me keys add ~/.ssh/id_ed25519_new.pub
-udc-resource me keys revoke <key-id>
+citespec-resource me keys list
+citespec-resource me keys add ~/.ssh/id_ed25519_new.pub
+citespec-resource me keys revoke <key-id>
 ```
 
 `join status` 的查询秘密由受保护的本地存储或交互输入提供，不能要求用户把秘密当作普通查询参数公开分享。
@@ -655,20 +655,20 @@ udc-resource me keys revoke <key-id>
 ### 11.2 管理员
 
 ```bash
-udc-resource admin invitations create
-udc-resource admin requests list
-udc-resource admin requests show <request-id>
-udc-resource admin requests approve <request-id>
-udc-resource admin requests reject <request-id> --reason "身份尚无法核验"
+citespec-resource admin invitations create
+citespec-resource admin requests list
+citespec-resource admin requests show <request-id>
+citespec-resource admin requests approve <request-id>
+citespec-resource admin requests reject <request-id> --reason "身份尚无法核验"
 
-udc-resource admin members list
-udc-resource admin members show <member-id>
-udc-resource admin members suspend <member-id> --reason "暂时离组"
-udc-resource admin members resume <member-id>
-udc-resource admin members revoke <member-id> --reason "成员资格结束"
+citespec-resource admin members list
+citespec-resource admin members show <member-id>
+citespec-resource admin members suspend <member-id> --reason "暂时离组"
+citespec-resource admin members resume <member-id>
+citespec-resource admin members revoke <member-id> --reason "成员资格结束"
 
-udc-resource admin operations show <operation-id>
-udc-resource admin operations retry <operation-id>
+citespec-resource admin operations show <operation-id>
+citespec-resource admin operations retry <operation-id>
 ```
 
 危险操作默认交互确认；自动化调用必须显式确认并提供审计原因。参数不能直接映射成任意 shell 命令。
@@ -712,7 +712,7 @@ udc-resource admin operations retry <operation-id>
 尽量从大型 `cli.py`、`broker/server.py` 中抽出可测试的模块，不继续把成员系统全部堆进两个文件。以下是职责建议，不强制逐字照搬目录名：
 
 ```text
-src/udc_resource/
+src/citespec_resource/
   membership/
     models.py          # 成员、申请快照、操作状态
     store.py           # 权威记录、幂等、迁移
@@ -898,7 +898,7 @@ python -m pytest -q
 python -m ruff check .
 python -m ruff format --check .
 python -m mypy src
-node --check src/udc_resource/gui/static/app.js
+node --check src/citespec_resource/gui/static/app.js
 bash -n deploy/*.sh
 ```
 
@@ -972,11 +972,11 @@ D2 之外，还需要独立批准、旧权限回收、现有 P5、GPU 与存储�
 本文中的新增接口、状态、服务和文案均为本轮设计要求，不表示设计参照版本已经支持。仓库事实以 agent 开始执行时的真实工作区为准；引用用于定位已有实现和底层机制。
 
 - **[R1] 仓库基线**：[`0a99bfd6`](https://github.com/Mr-enthalpy/infrastructure/commit/0a99bfd6d46524d01426069cf3972818d909074b)。
-- **[R2] 现有受限登录入口**：[`login_wrapper.py`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/src/udc_resource/login_wrapper.py)。
-- **[R3] 调用者记录，不等于成员审批**：[`store.py`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/src/udc_resource/store.py#L21-L39)。
-- **[R4] 身份和公开资料**：[`identity.py`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/src/udc_resource/identity.py)、[`members.py`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/src/udc_resource/members.py)。
-- **[R5] Broker 服务防护**：[`udc-resource-broker.service`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/deploy/systemd/udc-resource-broker.service)。
-- **[R6] 既有交互和开户入口**：[`cli.py`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/src/udc_resource/cli.py)、[`gui/server.py`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/src/udc_resource/gui/server.py)、[`create_user.sh`](https://github.com/Mr-enthalpy/infrastructure/blob/0a99bfd6d46524d01426069cf3972818d909074b/deploy/create_user.sh)。
+- **[R2] 现有受限登录入口**：[`login_wrapper.py`](../../src/citespec_resource/login_wrapper.py)。
+- **[R3] 调用者记录，不等于成员审批**：[`store.py`](../../src/citespec_resource/store.py#L21-L39)。
+- **[R4] 身份和公开资料**：[`identity.py`](../../src/citespec_resource/identity.py)、[`members.py`](../../src/citespec_resource/members.py)。
+- **[R5] Broker 服务防护**：[`citespec-resource-broker.service`](../../deploy/systemd/citespec-resource-broker.service)。
+- **[R6] 既有交互和开户入口**：[`cli.py`](../../src/citespec_resource/cli.py)、[`gui/server.py`](../../src/citespec_resource/gui/server.py)、[`create_user.sh`](../../deploy/create_user.sh)。
 - **[R7] OpenSSH 官方配置说明**：[`sshd_config(5)`](https://man.openbsd.org/sshd_config)，重点核对 `Banner`、`ForceCommand`、`AuthorizedKeysFile`、`AuthorizedKeysCommand` 和 `Match`。部署时使用目标发行版实际安装版本的支持范围，不能只按最新手册复制配置。
 - **[R8] systemd 官方执行环境说明**：[`systemd.exec`](https://www.freedesktop.org/software/systemd/man/258/systemd.exec.html)，重点核对 `ProtectSystem`、`ProtectHome`、`ReadWritePaths` 和 `NoNewPrivileges`。部署时以目标机 systemd 版本为准。
 

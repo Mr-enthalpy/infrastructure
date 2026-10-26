@@ -2,7 +2,7 @@
 
 ## 1. 设计目标
 
-当 GPU、全局 CPU/内存或每用户预算不足时，`udc-resource apply` 默认创建排队请求，
+当 GPU、全局 CPU/内存或每用户预算不足时，`citespec-resource apply` 默认创建排队请求，
 而不是直接失败。排队请求不占用 GPU claim，因此不会阻塞其他用户。Broker 仅在真正
 准入时创建 allocation 并写入 claim。
 
@@ -85,14 +85,14 @@ GPU 权限审计、workspace 配额检查或 Docker 存储预检失败时，队�
 ## 5. CLI
 
 ```text
-udc-resource apply --gpus 7 --cpus 8 --memory 32 --hours 12
-udc-resource apply --gpus 7 --cpus 8 --memory 32 --no-queue
-udc-resource apply --gpus 7 --cpus 8 --memory 32 --wait --wait-timeout 3600
-udc-resource queue list
-udc-resource queue list --history
-udc-resource queue list --all --history
-udc-resource queue wait <queue-id> --timeout 3600
-udc-resource queue cancel <queue-id> --reason "不再需要"
+citespec-resource apply --gpus 7 --cpus 8 --memory 32 --hours 12
+citespec-resource apply --gpus 7 --cpus 8 --memory 32 --no-queue
+citespec-resource apply --gpus 7 --cpus 8 --memory 32 --wait --wait-timeout 3600
+citespec-resource queue list
+citespec-resource queue list --history
+citespec-resource queue list --all --history
+citespec-resource queue wait <queue-id> --timeout 3600
+citespec-resource queue cancel <queue-id> --reason "不再需要"
 ```
 
 `apply --wait` 和 `queue wait` 每 2 秒查询一次，直到请求变为 `admitted` 并返回
