@@ -89,6 +89,12 @@ queue_backfill_reserve_minutes = 30
 vscode_enabled = false
 vscode_max_tunnels = 8
 vscode_identity_file = ""
+# Hard caps for long-lived shell/tunnel streams. Idle terminals use dedicated
+# bounded worker pools and can never starve release/expiry/audit work.
+max_shells_per_user = 2
+max_shells_global = 16
+max_tunnels_per_user = 8
+max_tunnels_global = 16
 
 [groups]
 members = "citespec-members"

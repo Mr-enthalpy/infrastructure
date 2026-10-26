@@ -29,11 +29,20 @@ class FakeExecutor:
     def __post_init__(self) -> None:
         self.calls: list = []
 
-    def execute(self, action: str, frozen_input: dict) -> dict:
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict,
+        *,
+        operation_id: str | None = None,
+    ) -> dict:
         from citespec_resource.membership.provisioning import validate_request
 
         validate_request({"action": action, "frozen_input": frozen_input})
         self.calls.append((action, frozen_input))
+        if operation_id is not None:
+            self.operation_ids: list[str] = getattr(self, "operation_ids", [])
+            self.operation_ids.append(operation_id)
         if action == "inspect_member":
             return {
                 "status": "succeeded",
@@ -460,6 +469,168 @@ def test_admin_key_add_and_revoke_project_to_host(dbs):
     assert executor.calls[-1][0] == "set_keys"
     active = member_store.get_member(connection, member_id)["keys"]
     assert len([key for key in active if key["status"] == "active"]) == 1
+
+
+def test_resume_member_reinstalls_active_keys(dbs):
+    connection, intake_db = dbs
+    result = _approve(connection, intake_db, _submit(connection, intake_db), FakeExecutor())
+    member_id = str(result["member_id"])
+    suspended = member_service.suspend_member(
+        connection,
+        member_id,
+        actor_uid=0,
+        reason="temporary pause",
+        provisioning=FakeExecutor(),
+    )
+    assert suspended["credential_revocation"] == "done"
+
+    executor = FakeExecutor()
+    resumed = member_service.resume_member(
+        connection,
+        member_id,
+        actor_uid=0,
+        reason="pause over",
+        provisioning=executor,
+    )
+    assert resumed["status"] == "active"
+    assert resumed["credential_revocation"] == "done"
+    assert executor.calls[-1][0] == "enable_member"
+    enabled_keys = executor.calls[-1][1]["public_keys"]
+    assert len(enabled_keys) == 1
+    assert enabled_keys[0].startswith("ssh-ed25519 ")
+    assert member_store.get_member(connection, member_id)["member"]["status"] == "active"
+
+
+class _ConcurrentWriterExecutor(FakeExecutor):
+    def __init__(self, db_path: str) -> None:
+        super().__init__()
+        self.db_path = db_path
+
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict,
+        *,
+        operation_id: str | None = None,
+    ) -> dict:
+        if action == "set_keys":
+            from citespec_resource.db import connect
+
+            other = connect(self.db_path)
+            try:
+                other.execute("PRAGMA busy_timeout=0")
+                other.execute(
+                    "INSERT INTO settings(key, value, updated_at) VALUES ('probe', '1', 'now') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                )
+                other.commit()
+            finally:
+                other.close()
+        return super().execute(action, frozen_input, operation_id=operation_id)
+
+
+class _VersionRaceExecutor(FakeExecutor):
+    def __init__(self, db_path: str, member_id: str) -> None:
+        super().__init__()
+        self.db_path = db_path
+        self.member_id = member_id
+
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict,
+        *,
+        operation_id: str | None = None,
+    ) -> dict:
+        if action == "set_keys":
+            from citespec_resource.db import connect
+
+            other = connect(self.db_path)
+            try:
+                other.execute(
+                    "UPDATE members SET access_version = access_version + 1 WHERE member_id = ?",
+                    (self.member_id,),
+                )
+                other.commit()
+            finally:
+                other.close()
+        return super().execute(action, frozen_input, operation_id=operation_id)
+
+
+def test_key_projection_does_not_hold_sqlite_write_lock(dbs):
+    connection, intake_db = dbs
+    db_path = str(connection.execute("PRAGMA database_list").fetchone()["file"])
+    result = _approve(connection, intake_db, _submit(connection, intake_db), FakeExecutor())
+    member_id = str(result["member_id"])
+    second_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIConcurrentWriterKeyForTests00000000000000 w"
+    executor = _ConcurrentWriterExecutor(db_path)
+    added = member_service.add_member_key(
+        connection,
+        member_id,
+        public_key=second_key,
+        actor_uid=0,
+        provisioning=executor,
+    )
+    assert added["key_id"]
+    probe = connection.execute("SELECT value FROM settings WHERE key = 'probe'").fetchone()
+    assert probe is not None and probe["value"] == "1"
+    operations = member_store.get_member(connection, member_id)["operations"]
+    assert operations[0]["action"] == "set_keys"
+    assert operations[0]["status"] == "succeeded"
+    assert executor.operation_ids == [operations[0]["operation_id"]]
+
+
+def test_key_projection_rejects_stale_member_version(dbs):
+    connection, intake_db = dbs
+    db_path = str(connection.execute("PRAGMA database_list").fetchone()["file"])
+    result = _approve(connection, intake_db, _submit(connection, intake_db), FakeExecutor())
+    member_id = str(result["member_id"])
+    before = member_store.get_member(connection, member_id)["keys"]
+    second_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIVersionRaceKeyForTests00000000000000000 v"
+    with pytest.raises(ProvisioningError) as error:
+        member_service.add_member_key(
+            connection,
+            member_id,
+            public_key=second_key,
+            actor_uid=0,
+            provisioning=_VersionRaceExecutor(db_path, member_id),
+        )
+    assert "stale_key_operation" in str(error.value)
+    after = member_store.get_member(connection, member_id)["keys"]
+    assert len(after) == len(before)
+    operations = member_store.get_member(connection, member_id)["operations"]
+    assert operations[0]["action"] == "set_keys"
+    assert operations[0]["status"] == "failed"
+    assert operations[0]["stage"] == "stale_key_operation"
+
+
+def test_legacy_key_projection_without_version_fails_closed(dbs):
+    connection, intake_db = dbs
+    result = _approve(connection, intake_db, _submit(connection, intake_db), FakeExecutor())
+    member_id = str(result["member_id"])
+    member = member_store.get_member(connection, member_id)["member"]
+    operation_id, _created = member_store.create_operation(
+        connection,
+        action="set_keys",
+        frozen_input={
+            "username": member["linux_username"],
+            "public_keys": [KEY],
+        },
+        member_id=member_id,
+        expected_access_version=0,
+    )
+    connection.commit()
+
+    retried = member_service.retry_operation(
+        connection,
+        operation_id,
+        provisioning=FakeExecutor(),
+        intake_db=intake_db,
+        actor_uid=0,
+    )
+
+    assert retried["status"] == "failed"
+    assert retried["stage"] == "stale_key_operation"
 
 
 def test_admin_key_sync_failure_rolls_back(dbs):

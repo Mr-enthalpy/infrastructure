@@ -24,11 +24,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+
+try:  # pragma: no cover - Windows test host
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - exercised only on the Linux executor host
     import pwd
@@ -224,9 +232,155 @@ def _scrub_home_keys(username: str, stages: list[str]) -> None:
     stages.append(f"home_keys_removed:{removed}")
 
 
-def _kill_member_sessions(username: str) -> None:
-    """Terminate the member's host-side SSH/login processes, not other users."""
-    _run(["pkill", "-KILL", "-u", username], check=False)
+def _process_uid(pid: int) -> int | None:
+    """Return the real UID from /proc without trusting a caller-supplied name."""
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            fields = line.split()
+            if len(fields) >= 2:
+                try:
+                    return int(fields[1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _process_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+
+
+def _is_sshd_executable(pid: int) -> bool:
+    try:
+        executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
+    except OSError:
+        return False
+    return executable.name == "sshd"
+
+
+def _member_ssh_monitor_pids(username: str, proc_root: Path = Path("/proc")) -> list[int]:
+    """Find root-owned sshd session monitors belonging to one member.
+
+    This deliberately scans only sshd processes whose kernel-reported real UID
+    is 0 and whose command line names the member.  It never selects processes
+    by the member UID, so a same-UID process inside a training container (or a
+    user-started process) cannot be caught by this cleanup path.
+    """
+    if not proc_root.is_dir():
+        raise StageError("session_close", "/proc is unavailable; cannot verify SSH sessions")
+    prefix = f"sshd: {username}"
+    pids: list[int] = []
+    inspected = 0
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        uid = _process_uid(pid)
+        if uid is None:
+            continue
+        inspected += 1
+        if uid != 0 or not _is_sshd_executable(pid):
+            continue
+        cmdline = _process_cmdline(pid)
+        if cmdline == prefix or cmdline.startswith(prefix + " ") or cmdline.startswith(prefix + "@"):
+            pids.append(pid)
+    if inspected == 0:
+        raise StageError("session_close", "cannot inspect /proc process ownership")
+    return sorted(set(pids))
+
+
+def _process_children(pid: int) -> list[int]:
+    try:
+        raw = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    children: list[int] = []
+    for value in raw.split():
+        try:
+            children.append(int(value))
+        except ValueError:
+            continue
+    return children
+
+
+def _process_tree(roots: list[int]) -> list[int]:
+    seen: set[int] = set()
+    ordered: list[int] = []
+
+    def visit(pid: int) -> None:
+        if pid in seen:
+            return
+        seen.add(pid)
+        for child in _process_children(pid):
+            visit(child)
+        ordered.append(pid)
+
+    for root in roots:
+        visit(root)
+    return ordered
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_member_ssh_sessions(username: str) -> int:
+    """Close only this member's authenticated SSH session trees.
+
+    Key revocation must make every existing ControlMaster/session
+    reauthenticate.  Running Docker training is not part of this process tree
+    and is intentionally left untouched (INV-08).
+    """
+    monitors = _member_ssh_monitor_pids(username)
+    if not monitors:
+        return 0
+    tree = _process_tree(monitors)
+    for pid in tree:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise StageError("session_close", f"cannot signal SSH session pid {pid}") from exc
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not any(_pid_alive(pid) for pid in tree):
+            break
+        time.sleep(0.05)
+    for pid in tree:
+        if not _pid_alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise StageError("session_close", f"cannot kill SSH session pid {pid}") from exc
+    remaining = _member_ssh_monitor_pids(username)
+    if remaining:
+        raise StageError(
+            "session_close",
+            f"{len(remaining)} SSH session(s) for {username} are still alive",
+        )
+    return len(monitors)
+
+
+def _close_member_ssh_sessions(username: str, stages: list[str], *, stage: str) -> None:
+    count = _terminate_member_ssh_sessions(username)
+    stages.append(f"{stage}:{count}")
 
 
 def _write_central_keys(username: str, keys: list[str]) -> None:
@@ -373,6 +527,10 @@ def _action_set_keys(frozen: dict[str, Any], stages: list[str]) -> None:
     _write_central_keys(username, keys)
     _verify_central_keys(username, keys)
     stages.append(f"central_keys_updated:{len(keys)}")
+    # A revoked key must not remain usable through an already authenticated
+    # ControlMaster.  Adding a key also closes old sessions so every future
+    # channel is authenticated against the new central keyset.
+    _close_member_ssh_sessions(username, stages, stage="ssh_sessions_reauthenticated")
 
 
 def _action_disable_member(frozen: dict[str, Any], stages: list[str]) -> None:
@@ -388,9 +546,8 @@ def _action_disable_member(frozen: dict[str, Any], stages: list[str]) -> None:
     _write_central_keys(username, [])
     _scrub_home_keys(username, stages)
     _run(["usermod", "-L", username])
-    _kill_member_sessions(username)
     stages.append("account_locked")
-    stages.append("sessions_terminated")
+    _close_member_ssh_sessions(username, stages, stage="sessions_terminated")
 
 
 def _action_enable_member(frozen: dict[str, Any], stages: list[str]) -> None:
@@ -454,29 +611,93 @@ def _process_one(request: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _run_spool(spool: Path) -> int:
-    """Process every pending request file; write results next to them.
+_OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-    Idempotent: a request whose result file already exists is skipped so a
-    retried executor pass never re-runs a finished operation.
+
+def _write_result(result_file: Path, result: dict[str, Any]) -> None:
+    temp = result_file.with_name(f".{result_file.name}.tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(result, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, result_file)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _process_spool_file(request_file: Path, result_file: Path) -> None:
+    """Process one claimed request and remove it only after result is durable."""
+    if result_file.exists():
+        request_file.unlink(missing_ok=True)
+        return
+    operation_id = request_file.stem
+    try:
+        request = json.loads(request_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        result = {
+            "operation_id": operation_id,
+            "status": "failed",
+            "stage": "validate",
+            "error": "invalid request JSON",
+        }
+    else:
+        request_id = str(request.get("operation_id", ""))
+        if not _OPERATION_ID_RE.fullmatch(operation_id) or request_id != operation_id:
+            result = {
+                "operation_id": operation_id,
+                "status": "failed",
+                "stage": "validate",
+                "error": "operation id does not match request filename",
+            }
+        else:
+            result = _process_one(request)
+    _write_result(result_file, result)
+    # Only after the result is durable may the claim/request disappear.  A
+    # crash before this point leaves the file for the next pass; operations
+    # are idempotent and re-verify real system state.
+    request_file.unlink(missing_ok=True)
+
+
+def _run_spool(spool: Path) -> int:
+    """Claim, execute, and complete every pending operation exactly once.
+
+    requests/<id>.json  -> processing/<id>.json (atomic rename claim)
+    processing/<id>.json -> results/<id>.json (atomic result write)
+    processing/<id>.json is removed only after the result exists.  The watched
+    requests directory therefore becomes empty, so the path unit re-arms
+    instead of retriggering forever on a completed request.
     """
     requests_dir = spool / "requests"
     results_dir = spool / "results"
+    processing_dir = spool / "processing"
+    requests_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
-    if not requests_dir.is_dir():
-        return 0
-    for request_file in sorted(requests_dir.glob("*.json")):
-        result_file = results_dir / request_file.name
-        if result_file.exists():
-            continue
-        try:
-            request = json.loads(request_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        result = _process_one(request)
-        temp = result_file.with_suffix(".tmp")
-        temp.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
-        temp.replace(result_file)
+    processing_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    lock_handle = None
+    try:
+        lock_handle = (spool / ".executor.lock").open("a+")
+        if fcntl is not None:  # pragma: no branch - platform dependent
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        # Crash recovery: a claimed request without a result is retried.
+        for claimed in sorted(processing_dir.glob("*.json")):
+            _process_spool_file(claimed, results_dir / claimed.name)
+        for request_file in sorted(requests_dir.glob("*.json")):
+            result_file = results_dir / request_file.name
+            if result_file.exists():
+                request_file.unlink(missing_ok=True)
+                continue
+            claimed = processing_dir / request_file.name
+            try:
+                request_file.replace(claimed)
+            except OSError:
+                # Another executor won the claim; it owns the result.
+                continue
+            _process_spool_file(claimed, result_file)
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
     return 0
 
 

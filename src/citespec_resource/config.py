@@ -86,6 +86,13 @@ class PolicyConfig:
     vscode_enabled: bool = False
     vscode_max_tunnels: int = 8
     vscode_identity_file: str = ""
+    # Hard caps for long-lived blocking shell/tunnel streams. The broker keeps
+    # their I/O on dedicated bounded executors so idle terminals cannot exhaust
+    # the default asyncio thread pool used by release/expiry/audit work.
+    max_shells_per_user: int = 2
+    max_shells_global: int = 16
+    max_tunnels_per_user: int = 8
+    max_tunnels_global: int = 16
     # Authoritative membership gating (goal §6): when true, normal resource
     # operations require an active member record. Admin identities keep the
     # trusted admin-group path and are exempt.
@@ -319,6 +326,10 @@ def load_config(path: str | Path) -> LabConfig:
         vscode_enabled=bool(policy_raw.get("vscode_enabled", False)),
         vscode_max_tunnels=int(policy_raw.get("vscode_max_tunnels", 8)),
         vscode_identity_file=str(policy_raw.get("vscode_identity_file", "")),
+        max_shells_per_user=int(policy_raw.get("max_shells_per_user", 2)),
+        max_shells_global=int(policy_raw.get("max_shells_global", 16)),
+        max_tunnels_per_user=int(policy_raw.get("max_tunnels_per_user", 8)),
+        max_tunnels_global=int(policy_raw.get("max_tunnels_global", 16)),
     )
     if not 1 <= policy.default_hours <= policy.max_hours:
         raise ValueError("default_hours must be between 1 and max_hours")
@@ -419,6 +430,16 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("vscode_enabled requires the development container profile")
     if policy.vscode_max_tunnels <= 0:
         raise ValueError("policy.vscode_max_tunnels must be positive")
+    if policy.max_shells_per_user <= 0 or policy.max_shells_global <= 0:
+        raise ValueError("policy shell limits must be positive")
+    if policy.max_shells_per_user > policy.max_shells_global:
+        raise ValueError("max_shells_per_user must not exceed max_shells_global")
+    if policy.max_tunnels_per_user <= 0 or policy.max_tunnels_global <= 0:
+        raise ValueError("policy tunnel limits must be positive")
+    if policy.max_tunnels_per_user > policy.max_tunnels_global:
+        raise ValueError("max_tunnels_per_user must not exceed max_tunnels_global")
+    if policy.max_shells_global > 64 or policy.max_tunnels_global > 64:
+        raise ValueError("global stream limits must not exceed 64")
     if policy.max_queue_length <= 0 or policy.max_queued_allocations_per_user <= 0:
         raise ValueError("policy queue limits must be positive")
     if policy.max_queue_hours <= 0:

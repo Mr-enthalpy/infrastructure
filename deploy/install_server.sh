@@ -502,6 +502,7 @@ ok "central member key directory ready: $CENTRAL_KEY_DIR"
 run install -d -o root -g root -m 0750 "$PROVISION_SPOOL_DIR"
 run install -d -o root -g root -m 0750 "$PROVISION_SPOOL_DIR/requests"
 run install -d -o root -g root -m 0750 "$PROVISION_SPOOL_DIR/results"
+run install -d -o root -g root -m 0700 "$PROVISION_SPOOL_DIR/processing"
 ok "provisioning spool ready: $PROVISION_SPOOL_DIR"
 for member in $(effective_members citespec-members); do
     current_shell=$(getent passwd "$member" | cut -d: -f7)

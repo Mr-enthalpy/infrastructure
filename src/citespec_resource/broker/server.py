@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import stat
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -161,6 +162,17 @@ class Broker:
         self._storage_failure: str | None = None
         self._gpu_fingerprint = device_fingerprint()
         self._tunnels: dict[str, set[asyncio.Task[None]]] = {}
+        self._tunnel_tasks: set[asyncio.Task[None]] = set()
+        self._tunnel_uids: dict[asyncio.Task[None], int] = {}
+        self._shell_tasks: set[asyncio.Task[None]] = set()
+        self._shell_uids: dict[asyncio.Task[None], int] = {}
+        # Long-lived shell/tunnel reads block in worker threads. Keep them off
+        # the loop's default executor so idle terminals cannot starve release,
+        # expiry, audit, or other control-plane work. Writes/resizes/closes use
+        # a small separate lane so they never queue behind a blocking read.
+        self._stream_read_executor: ThreadPoolExecutor | None = None
+        self._stream_control_executor: ThreadPoolExecutor | None = None
+        self._ensure_stream_executors()
         # Every authenticated broker connection, grouped by peer UID. Closing
         # these streams on suspend/revoke/failed-key-sync terminates already
         # authenticated shell, tunnel, and file-transfer sessions; the database
@@ -177,6 +189,70 @@ class Broker:
 
     def _now(self) -> datetime:
         return self.clock()
+
+    def _ensure_stream_executors(self) -> None:
+        if self._stream_read_executor is None:
+            # One blocking read may be outstanding per admitted stream. The
+            # caps below therefore also bound how many read workers can be
+            # occupied at once.
+            workers = self.config.policy.max_shells_global + self.config.policy.max_tunnels_global
+            self._stream_read_executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="citespec-stream-read",
+            )
+        if self._stream_control_executor is None:
+            self._stream_control_executor = ThreadPoolExecutor(
+                max_workers=8,
+                thread_name_prefix="citespec-stream-control",
+            )
+
+    async def _stream_read(self, func: Callable[..., Any], *args: Any) -> Any:
+        self._ensure_stream_executors()
+        assert self._stream_read_executor is not None
+        return await asyncio.get_running_loop().run_in_executor(
+            self._stream_read_executor, func, *args
+        )
+
+    async def _stream_control(self, func: Callable[..., Any], *args: Any) -> Any:
+        self._ensure_stream_executors()
+        assert self._stream_control_executor is not None
+        return await asyncio.get_running_loop().run_in_executor(
+            self._stream_control_executor, func, *args
+        )
+
+    def _reserve_shell(self, task: asyncio.Task[None] | None, uid: int) -> None:
+        if task is None:
+            return
+        if len(self._shell_tasks) >= self.config.policy.max_shells_global:
+            raise Conflict("too many open shell sessions on this server")
+        per_user = sum(1 for item in self._shell_tasks if self._shell_uids.get(item) == uid)
+        if per_user >= self.config.policy.max_shells_per_user:
+            raise Conflict("too many open shell sessions for this member")
+        self._shell_tasks.add(task)
+        self._shell_uids[task] = uid
+
+    def _release_shell(self, task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
+        self._shell_tasks.discard(task)
+        self._shell_uids.pop(task, None)
+
+    def _reserve_tunnel(self, task: asyncio.Task[None] | None, uid: int) -> None:
+        if task is None:
+            return
+        if len(self._tunnel_tasks) >= self.config.policy.max_tunnels_global:
+            raise Conflict("too many open tunnels on this server")
+        per_user = sum(1 for item in self._tunnel_tasks if self._tunnel_uids.get(item) == uid)
+        if per_user >= self.config.policy.max_tunnels_per_user:
+            raise Conflict("too many open tunnels for this member")
+        self._tunnel_tasks.add(task)
+        self._tunnel_uids[task] = uid
+
+    def _release_tunnel(self, task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
+        self._tunnel_tasks.discard(task)
+        self._tunnel_uids.pop(task, None)
 
     def _allocation_map(self, connection: Any, now: datetime) -> dict[str, dict[str, Any]]:
         rows = store.list_allocations(
@@ -250,7 +326,18 @@ class Broker:
         identity: Any,
         command: str,
     ) -> dict[str, Any] | None:
-        """Unified member authorization for one command (§6.2)."""
+        """Unified member authorization for one command (§6.2).
+
+        The mode matrix is checked first so streaming handlers enforce the same
+        maintenance/monitor restrictions as regular RPC commands.
+        """
+        mode_denial = member_authz.check_for_mode(
+            mode=self._mode,
+            command=command,
+            is_admin=identity.is_admin,
+        )
+        if mode_denial is not None:
+            return mode_denial
         return member_authz.check_for_command(
             connection,
             command=command,
@@ -259,6 +346,15 @@ class Broker:
             membership_required=self.config.policy.membership_required,
             now=self._now(),
         )
+
+    def _require_member_access(self, identity: Any, command: str) -> None:
+        """Defense-in-depth check immediately before a privileged side effect."""
+        if identity.is_admin or not self.config.policy.membership_required:
+            return
+        with self._connection() as connection:
+            denial = self._membership_denial(connection, identity, command)
+        if denial is not None:
+            raise Forbidden(denial["message"])
 
     def _provisioning_for_member(self, member_id: str) -> None:
         """Cancel queues and tunnels for one member (§8.4 steps 2-3).
@@ -638,6 +734,7 @@ class Broker:
                             actor_uid=identity.uid,
                             reason=reason,
                             provisioning=provisioning,
+                            on_member_change=self._provisioning_for_member,
                             now=self._now(),
                         )
                     connection.commit()
@@ -676,37 +773,27 @@ class Broker:
             self_public_key = args.get("public_key")
             if not isinstance(self_public_key, str) or not self_public_key.strip():
                 raise BadRequest("public_key must be a non-empty string")
-            from ..membership.models import parse_public_key
-
-            normalized, fingerprint = parse_public_key(self_public_key)
 
             def _add_key() -> Any:
                 with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
                     decision = member_store.check_access(connection, identity.uid, now=self._now())
                     if not decision["allowed"]:
                         raise Forbidden("成员状态不允许管理公钥")
-                    member = member_store.get_member(connection, str(decision["member_id"]))
-                    username = str(member["member"]["linux_username"] or "")
-                    if not username:
-                        raise Conflict("成员尚未完成开户，不能管理公钥")
-                    key_id = member_store.add_key(
-                        connection,
-                        str(decision["member_id"]),
-                        public_key=normalized,
-                        fingerprint=fingerprint,
-                        now=self._now(),
-                    )
-                    keys = member_store.active_keys(connection, identity.uid)
                     try:
-                        provisioning.execute(
-                            "set_keys", {"username": username, "public_keys": keys}
+                        result = member_service.add_member_key(
+                            connection,
+                            str(decision["member_id"]),
+                            public_key=self_public_key,
+                            actor_uid=identity.uid,
+                            provisioning=provisioning,
+                            now=self._now(),
                         )
                     except ProvisioningError as exc:
-                        connection.rollback()
                         raise Conflict("无法同步宿主机登录凭据；公钥未添加，请稍后重试") from exc
-                    connection.commit()
-                    return {"key_id": key_id, "fingerprint": fingerprint}
+                return {
+                    "key_id": result["key_id"],
+                    "fingerprint": result["fingerprint"],
+                }
 
             return await asyncio.to_thread(_add_key)
         if command == "me_keys_revoke":
@@ -717,30 +804,20 @@ class Broker:
 
             def _revoke_key() -> Any:
                 with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
                     decision = member_store.check_access(connection, identity.uid, now=self._now())
                     if not decision["allowed"]:
                         raise Forbidden("成员状态不允许管理公钥")
-                    member = member_store.get_member(connection, str(decision["member_id"]))
-                    username = str(member["member"]["linux_username"] or "")
-                    if not username:
-                        raise Conflict("成员尚未完成开户，不能管理公钥")
-                    member_store.revoke_key(
-                        connection,
-                        str(decision["member_id"]),
-                        key_id=self_key_id,
-                        actor_uid=identity.uid,
-                        now=self._now(),
-                    )
-                    keys = member_store.active_keys(connection, identity.uid)
                     try:
-                        provisioning.execute(
-                            "set_keys", {"username": username, "public_keys": keys}
+                        member_service.revoke_member_key(
+                            connection,
+                            str(decision["member_id"]),
+                            key_id=self_key_id,
+                            actor_uid=identity.uid,
+                            provisioning=provisioning,
+                            now=self._now(),
                         )
                     except ProvisioningError as exc:
-                        connection.rollback()
                         raise Conflict("无法同步宿主机登录凭据；撤销未生效，请稍后重试") from exc
-                    connection.commit()
                 # A revoked key may still sit in an open ControlMaster; close
                 # this member's established broker streams as well.
                 self._close_member_connections(identity.uid)
@@ -1192,6 +1269,11 @@ class Broker:
             self._server = None
         if self.socket_path.exists():
             self.socket_path.unlink()
+        for executor in (self._stream_read_executor, self._stream_control_executor):
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+        self._stream_read_executor = None
+        self._stream_control_executor = None
 
     async def run(self) -> None:
         await self.start()
@@ -1327,7 +1409,7 @@ class Broker:
             if command not in {"file_put", "file_get"}:
                 raise BadRequest("expected file transfer command")
             self._check_args(args, {"id", "path"})
-            if self.config.policy.membership_required and not identity.is_admin:
+            if not identity.is_admin:
                 with self._connection() as connection:
                     denial = self._membership_denial(connection, identity, command)
                 if denial is not None:
@@ -1524,6 +1606,27 @@ class Broker:
         uid: int,
         gid: int,
     ) -> None:
+        task = asyncio.current_task()
+        try:
+            await self._handle_shell_inner(
+                payload,
+                reader=reader,
+                writer=writer,
+                uid=uid,
+                gid=gid,
+            )
+        finally:
+            self._release_shell(task)
+
+    async def _handle_shell_inner(
+        self,
+        payload: Any,
+        *,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        uid: int,
+        gid: int,
+    ) -> None:
         try:
             identity = self.identity_resolver.resolve(uid, gid)
             with self._connection() as connection:
@@ -1538,7 +1641,7 @@ class Broker:
             if command != "shell":
                 raise BadRequest("expected shell command")
             self._check_args(args, {"id", "cols", "rows", "job"})
-            if self.config.policy.membership_required and not identity.is_admin:
+            if not identity.is_admin:
                 with self._connection() as connection:
                     denial = self._membership_denial(connection, identity, "shell")
                 if denial is not None:
@@ -1561,11 +1664,13 @@ class Broker:
             container_id = str(allocation["container_id"])
             if not container_id:
                 raise NotFound("allocation has no container")
+            task = asyncio.current_task()
+            self._reserve_shell(task, identity.uid)
             shell_command: list[str] | None = None
             job = args.get("job")
             if job is not None:
                 job_name = self._job_name(job)
-                jobs = await asyncio.to_thread(self.docker.list_jobs, container_id)
+                jobs = await self._stream_control(self.docker.list_jobs, container_id)
                 if not any(item.get("name") == job_name for item in jobs):
                     raise NotFound(f"job not found: {job_name}")
                 shell_command = [
@@ -1576,7 +1681,7 @@ class Broker:
                     "-t",
                     f"citespec-{job_name}",
                 ]
-            session = await asyncio.to_thread(
+            session = await self._stream_control(
                 self.docker.open_shell,
                 container_id,
                 cols,
@@ -1608,7 +1713,7 @@ class Broker:
         async def pump_output() -> None:
             try:
                 while True:
-                    data = await asyncio.to_thread(session.read, 65536)
+                    data = await self._stream_read(session.read, 65536)
                     if not data:
                         break
                     await write_frame(writer, FRAME_DATA, data)
@@ -1623,10 +1728,10 @@ class Broker:
                     return
                 kind, payload = frame
                 if kind == FRAME_DATA:
-                    await asyncio.to_thread(session.write, payload)
+                    await self._stream_control(session.write, payload)
                 elif kind == FRAME_RESIZE:
                     cols, rows = parse_resize(payload)
-                    await asyncio.to_thread(session.resize, cols, rows)
+                    await self._stream_control(session.resize, cols, rows)
                 elif kind == FRAME_EXIT:
                     return
 
@@ -1643,7 +1748,7 @@ class Broker:
                 task.cancel()
         finally:
             try:
-                await asyncio.to_thread(session.close)
+                await self._stream_control(session.close)
             except Exception:
                 logger.warning("could not close shell session", exc_info=True)
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1765,7 +1870,7 @@ class Broker:
                     identity = self.identity_resolver.resolve(uid, gid)
                 except (KeyError, RuntimeError) as exc:
                     raise Forbidden(f"peer identity failed: {exc}") from exc
-                if self.config.policy.membership_required and not identity.is_admin:
+                if not identity.is_admin:
                     with self._connection() as connection:
                         denial = self._membership_denial(connection, identity, "tunnel")
                     if denial is not None:
@@ -1808,6 +1913,7 @@ class Broker:
                     active.discard(task)
                 if len(active) >= self.config.policy.vscode_max_tunnels:
                     raise Conflict("too many open VS Code tunnels for this allocation")
+                self._reserve_tunnel(task, identity.uid)
                 if task is not None:
                     active.add(task)
 
@@ -1843,9 +1949,9 @@ class Broker:
                         else []
                     )
                 connecter_keys = connecter_member_keys or (
-                    await asyncio.to_thread(self._member_public_keys, identity.username)
+                    await self._stream_control(self._member_public_keys, identity.username)
                 )
-                owner_keys = owner_member_keys or await asyncio.to_thread(
+                owner_keys = owner_member_keys or await self._stream_control(
                     self._member_public_keys,
                     container_user,
                 )
@@ -1857,7 +1963,7 @@ class Broker:
                 if not keys:
                     raise Conflict("no SSH public keys found for this allocation on the host")
                 home = self._container_home(container_user, owner_uid)
-                await asyncio.to_thread(
+                await self._stream_control(
                     self.docker.prepare_container_ssh,
                     container_id,
                     owner_uid,
@@ -1866,7 +1972,7 @@ class Broker:
                     keys,
                     home,
                 )
-                session = await asyncio.to_thread(self.docker.open_tunnel, container_id)
+                session = await self._stream_control(self.docker.open_tunnel, container_id)
             except CitespecError as exc:
                 await self._send(writer, _error(exc.code, exc.message))
                 return
@@ -1882,10 +1988,11 @@ class Broker:
                 await self._relay_tunnel(reader, writer, active_session)
             finally:
                 try:
-                    await asyncio.to_thread(active_session.close)
+                    await self._stream_control(active_session.close)
                 except Exception:
                     logger.warning("could not close VS Code tunnel session", exc_info=True)
         finally:
+            self._release_tunnel(task)
             if task is not None:
                 remaining = self._tunnels.get(allocation_id)
                 if remaining is not None:
@@ -1904,11 +2011,11 @@ class Broker:
                 data = await reader.read(65536)
                 if not data:
                     return
-                await asyncio.to_thread(session.write, data)
+                await self._stream_control(session.write, data)
 
         async def pump_output() -> None:
             while True:
-                data = await asyncio.to_thread(session.read, 65536)
+                data = await self._stream_read(session.read, 65536)
                 if not data:
                     return
                 writer.write(data)
@@ -1929,7 +2036,7 @@ class Broker:
             # A blocking recv() cannot be cancelled directly. Closing the
             # session socket unblocks the worker before we join it.
             try:
-                await asyncio.to_thread(session.close)
+                await self._stream_control(session.close)
             except Exception:
                 logger.warning("could not close tunnel session", exc_info=True)
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1998,9 +2105,11 @@ class Broker:
                         ],
                     }
                 )
-            if self._mode == "active":
-                # In monitor/maintenance modes everything is denied by the
-                # mode itself; report that first (honest, no info leaks).
+            # Mode and membership are independent gates.  Maintenance/monitor
+            # never bypasses membership, and membership never overrides the
+            # mode matrix that blocks new work.  Admin operations keep their
+            # trusted path and are checked by _require_admin below.
+            if not identity.is_admin:
                 with self._connection() as connection:
                     denial = self._membership_denial(connection, identity, command)
                 if denial is not None:
@@ -2928,6 +3037,8 @@ class Broker:
             allocation = store.get_allocation(connection, allocation_id, now=self._now())
         if not admin and allocation["owner_uid"] != identity.uid:
             raise Forbidden("only the owner or an admin may release this allocation")
+        if not admin:
+            self._require_member_access(identity, "release")
         try:
             container_id = str(allocation["container_id"])
             if container_id:
@@ -2979,6 +3090,7 @@ class Broker:
             allocation = store.get_allocation(connection, allocation_id, now=self._now())
         if allocation["owner_uid"] != identity.uid and not identity.is_admin:
             raise Forbidden("only the owner or an admin may manage jobs")
+        self._require_member_access(identity, "job_start")
         if allocation["status"] != "active":
             raise Conflict(f"allocation is {allocation['status']}, not active")
         if not allocation["container_id"]:

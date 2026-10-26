@@ -160,6 +160,108 @@ async def test_suspended_member_queue_requests_fail_at_admission(tmp_path, membe
     assert request["status"] == "failed"
 
 
+async def test_maintenance_blocks_new_jobs_but_allows_release(tmp_path, member_config):
+    broker, fake = _broker(tmp_path, member_config)
+    with broker._connection() as connection:
+        _provision_alice(connection, status="active")
+    applied = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert applied["ok"] is True
+    allocation_id = applied["data"]["id"]
+    switched = await _call(broker, "admin_mode", {"mode": "maintenance"}, ADMIN)
+    assert switched["ok"] is True
+    blocked = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "second", "command": ["python", "train.py"]},
+        ALICE,
+    )
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "monitor_only"
+    assert fake.started_job_commands == []
+
+    released = await _call(broker, "release", {"id": allocation_id}, ALICE)
+    assert released["ok"] is True
+    assert released["data"]["status"] == "released"
+
+
+async def test_maintenance_mode_applies_when_membership_gate_is_disabled(tmp_path, member_config):
+    config = replace(
+        member_config,
+        policy=replace(member_config.policy, membership_required=False),
+    )
+    broker, _ = _broker(tmp_path, config)
+    assert (await _call(broker, "admin_mode", {"mode": "maintenance"}, ADMIN))["ok"] is True
+
+    with broker._connection() as connection:
+        denial = broker._membership_denial(connection, ALICE, "shell")
+    assert denial is not None
+    assert denial["code"] == "monitor_only"
+
+
+async def test_admin_revoke_closes_already_authenticated_broker_streams(tmp_path, member_config):
+    broker, _ = _broker(tmp_path, member_config, provisioning=_FakeProvisioning())
+    with broker._connection() as connection:
+        member_id = _provision_alice(connection)
+
+    class Writer:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    writer = Writer()
+    broker._client_writers[ALICE.uid] = {writer}  # type: ignore[assignment]
+
+    result = await _call(
+        broker,
+        "admin_members_revoke",
+        {"member_id": member_id, "reason": "trial ended"},
+        ADMIN,
+    )
+
+    assert result["ok"] is True
+    assert writer.closed is True
+
+
+async def test_maintenance_blocks_streaming_handlers_for_members(tmp_path, member_config):
+    broker, _ = _broker(tmp_path, member_config)
+    with broker._connection() as connection:
+        _provision_alice(connection, status="active")
+    applied = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert applied["ok"] is True
+    assert (await _call(broker, "admin_mode", {"mode": "maintenance"}, ADMIN))["ok"] is True
+
+    with broker._connection() as connection:
+        for command in ("shell", "tunnel", "file_get", "file_put"):
+            denial = broker._membership_denial(connection, ALICE, command)
+            assert denial is not None
+            assert denial["code"] == "monitor_only"
+        assert broker._membership_denial(connection, ADMIN, "shell") is None
+        assert broker._membership_denial(connection, ALICE, "release") is None
+
+
+async def test_maintenance_still_enforces_suspended_membership(tmp_path, member_config):
+    broker, _ = _broker(tmp_path, member_config)
+    with broker._connection() as connection:
+        _provision_alice(connection, status="active")
+    applied = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+    assert (await _call(broker, "admin_mode", {"mode": "maintenance"}, ADMIN))["ok"] is True
+    with broker._connection() as connection:
+        member_store.transition_member(
+            connection,
+            _member_id_for(connection, ALICE.uid),
+            target="suspended",
+            reason="pause",
+            actor_uid=ADMIN.uid,
+        )
+    # Mode permits release, but membership is checked independently and denies
+    # a suspended member's cleanup command.
+    blocked = await _call(broker, "release", {"id": allocation_id}, ALICE)
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "membership_suspended"
+
+
 async def test_idempotent_apply_returns_same_allocation(tmp_path, member_config):
     """AC-06: a retried apply (client timeout) must not create a second env."""
     broker, docker = _broker(tmp_path, member_config)
@@ -205,7 +307,13 @@ class _FakeProvisioning:
         self.fail = fail
         self.inspect = inspect or {}
 
-    def execute(self, action: str, frozen_input: dict) -> dict:
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict,
+        *,
+        operation_id: str | None = None,
+    ) -> dict:
         from citespec_resource.membership.provisioning import (
             ProvisioningError,
             validate_request,
@@ -254,6 +362,44 @@ async def test_member_self_service_key_add_and_revoke(tmp_path, member_config):
     assert revoked["ok"] is True
     assert executor.calls[-1][0] == "set_keys"
     assert len(executor.calls[-1][1]["public_keys"]) == 1
+
+
+async def test_readding_revoked_key_to_suspended_member_reactivates_it(tmp_path, member_config):
+    broker, _ = _broker(tmp_path, member_config, provisioning=_FakeProvisioning())
+    with broker._connection() as connection:
+        member_id = _provision_alice(connection, status="suspended")
+
+    first = await _call(
+        broker,
+        "admin_members_keys_add",
+        {"member_id": member_id, "public_key": KEY_ONE},
+        ADMIN,
+    )
+    second = await _call(
+        broker,
+        "admin_members_keys_add",
+        {"member_id": member_id, "public_key": KEY_TWO},
+        ADMIN,
+    )
+    assert first["ok"] is True
+    assert second["ok"] is True
+    revoked = await _call(
+        broker,
+        "admin_members_keys_revoke",
+        {"member_id": member_id, "key_id": first["data"]["key_id"]},
+        ADMIN,
+    )
+    assert revoked["ok"] is True
+
+    restored = await _call(
+        broker,
+        "admin_members_keys_add",
+        {"member_id": member_id, "public_key": KEY_ONE},
+        ADMIN,
+    )
+
+    assert restored["ok"] is True
+    assert restored["data"]["key_id"] == first["data"]["key_id"]
 
 
 async def test_admin_key_add_rolls_back_when_host_sync_fails(tmp_path, member_config):

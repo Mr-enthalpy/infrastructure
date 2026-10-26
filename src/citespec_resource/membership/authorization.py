@@ -33,6 +33,52 @@ MEMBER_COMMANDS = frozenset(
 # Streaming/special entries checked at their own handlers (same rule).
 SPECIAL_ENTRIES = frozenset({"shell", "file_put", "file_get", "tunnel"})
 
+# Maintenance/monitor are not an authorization bypass.  Members may inspect
+# state and clean up their own work, but they may not start new allocations,
+# queue entries, jobs, or interactive/file/tunnel sessions.  The cleanup set is
+# deliberately explicit; unknown commands continue to the normal handler so
+# they fail as bad requests instead of being misreported as mode denials.
+NON_ACTIVE_MEMBER_ALLOWED = frozenset(
+    {
+        "logs",
+        "job_files",
+        "job_list",
+        "job_logs",
+        "job_stop",
+        "queue_cancel",
+        "release",
+    }
+)
+
+
+def check_for_mode(
+    *,
+    mode: str,
+    command: str,
+    is_admin: bool,
+) -> dict[str, Any] | None:
+    """Return a mode denial for a member command, or None when allowed.
+
+    Active mode is unrestricted.  In maintenance/monitor, read-only and
+    cleanup commands stay available so members can inspect and release their
+    own resources, while every path that can create or extend work is denied.
+    """
+    if is_admin or mode == "active":
+        return None
+    if command not in MEMBER_COMMANDS and command not in SPECIAL_ENTRIES:
+        return None
+    if command in NON_ACTIVE_MEMBER_ALLOWED:
+        return None
+    if mode == "maintenance":
+        message = "broker is in maintenance mode; new work and interactive sessions are disabled"
+    else:
+        message = "broker is in monitor-only mode; new work and interactive sessions are disabled"
+    return {
+        "code": "monitor_only",
+        "message": message,
+        "next_actions": ["contact_admin", "retry_later"],
+    }
+
 
 def check_for_command(
     connection: sqlite3.Connection,

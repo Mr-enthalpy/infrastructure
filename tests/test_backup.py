@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from citespec_resource import backup
+from citespec_resource import backup, store
+from citespec_resource.db import connect, init_db
 
 
 def _write_config(
     config_path: Path,
     state_db: Path,
     intake_db: Path | None = None,
+    spool_dir: Path | None = None,
 ) -> None:
     lines = [
         "[server]",
@@ -20,8 +23,12 @@ def _write_config(
         'ssh_alias = "test"',
         f'state_db = "{state_db.as_posix()}"',
     ]
+    if intake_db is not None or spool_dir is not None:
+        lines += ["", "[onboarding]"]
     if intake_db is not None:
-        lines += ["", "[onboarding]", f'intake_db = "{intake_db.as_posix()}"']
+        lines.append(f'intake_db = "{intake_db.as_posix()}"')
+    if spool_dir is not None:
+        lines.append(f'provisioning_spool = "{spool_dir.as_posix()}"')
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -36,22 +43,65 @@ def _make_db(path: Path, value: str) -> None:
         connection.close()
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _make_state_db(path: Path, value: str, *, mode: str = "active") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = init_db(path)
+    try:
+        connection.execute("CREATE TABLE items (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO items VALUES (?)", (value,))
+        connection.commit()
+        store.set_mode(connection, mode, actor_uid=0)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _make_spool(path: Path) -> None:
+    for name in ("requests", "results", "processing"):
+        (path / name).mkdir(parents=True, exist_ok=True)
+    (path / "requests" / "op-1.json").write_text('{"operation_id": "op-1"}\n', encoding="utf-8")
+    (path / "results" / "op-1.json").write_text('{"ok": true}\n', encoding="utf-8")
+
+
+def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
     config_dir = tmp_path / "etc" / "citespec-resource"
     config_dir.mkdir(parents=True)
     state_db = tmp_path / "var" / "state.db"
     intake_db = tmp_path / "var" / "intake.db"
-    _make_db(state_db, "broker")
+    spool_dir = tmp_path / "var" / "provision"
+    _make_state_db(state_db, "broker")
     _make_db(intake_db, "intake")
+    _make_spool(spool_dir)
     (config_dir / "authorized-keys.d").mkdir()
     (config_dir / "authorized-keys.d" / "alice").write_text("ssh-ed25519 AAAA test\n")
     config_path = config_dir / "config.toml"
-    _write_config(config_path, state_db, intake_db)
-    return config_path, state_db, intake_db, tmp_path / "backups"
+    _write_config(config_path, state_db, intake_db, spool_dir)
+    return config_path, state_db, intake_db, spool_dir, tmp_path / "backups"
 
 
-def test_backup_contains_state_intake_config_and_verified_manifest(tmp_path):
-    config_path, _, _, backup_root = _fixture(tmp_path)
+def _make_restore_target(
+    tmp_path: Path,
+    *,
+    with_intake_and_spool: bool,
+) -> tuple[Path, Path, Path | None, Path | None]:
+    restore_dir = tmp_path / "restore"
+    state_db = restore_dir / "state.db"
+    _make_state_db(state_db, "old")
+    intake_db: Path | None = None
+    spool_dir: Path | None = None
+    if with_intake_and_spool:
+        intake_db = restore_dir / "intake.db"
+        spool_dir = restore_dir / "provision"
+        _make_db(intake_db, "old intake")
+        _make_spool(spool_dir)
+        (spool_dir / "requests" / "stale.json").write_text("stale\n", encoding="utf-8")
+    config_path = restore_dir / "config.toml"
+    _write_config(config_path, state_db, intake_db, spool_dir)
+    return config_path, state_db, intake_db, spool_dir
+
+
+def test_backup_contains_state_intake_config_spool_and_verified_manifest(tmp_path):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
 
     result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
 
@@ -59,44 +109,145 @@ def test_backup_contains_state_intake_config_and_verified_manifest(tmp_path):
     assert (result / "state.db").is_file()
     assert (result / "intake.db").is_file()
     assert (result / "etc" / "citespec-resource" / "authorized-keys.d" / "alice").is_file()
+    assert (result / "provision" / "requests" / "op-1.json").is_file()
+    assert (result / "provision" / "results" / "op-1.json").is_file()
     manifest = json.loads((result / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["schema"] == backup.BACKUP_SCHEMA
     assert {entry["path"] for entry in manifest["files"]} >= {
         "state.db",
         "intake.db",
         "etc/citespec-resource/config.toml",
+        "provision/requests/op-1.json",
     }
+    assert manifest["sources"]["spool_dir"] == str(tmp_path / "var" / "provision")
     assert backup.verify_backup(result)["schema"] == backup.BACKUP_SCHEMA
 
     with sqlite3.connect(result / "state.db") as connection:
         assert connection.execute("SELECT value FROM items").fetchone() == ("broker",)
 
 
-def test_restore_replaces_state_database_and_keeps_safety_copy(tmp_path):
-    config_path, _, _, backup_root = _fixture(tmp_path)
-    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
-    target = tmp_path / "restore" / "state.db"
-    _make_db(target, "old")
-    restore_config = tmp_path / "restore" / "config.toml"
-    _write_config(restore_config, target)
+def test_restore_replaces_databases_and_spool_and_forces_maintenance(tmp_path):
+    _, _, _, _, backup_root = _fixture(tmp_path)
+    result = backup.create_backup(
+        tmp_path / "etc" / "citespec-resource" / "config.toml",
+        backup_root,
+        stamp="20260101-000000",
+    )
+    restore_config, target, target_intake, target_spool = _make_restore_target(
+        tmp_path, with_intake_and_spool=True
+    )
 
     restored = backup.restore_backup(
         result,
         restore_config,
-        state_db=target,
         confirmed=True,
         skip_service_check=True,
     )
 
-    with sqlite3.connect(target) as connection:
-        assert connection.execute("SELECT value FROM items").fetchone() == ("broker",)
+    connection = connect(target)
+    try:
+        assert connection.execute("SELECT value FROM items").fetchone()["value"] == "broker"
+        assert store.get_mode(connection) == "maintenance"
+    finally:
+        connection.close()
+    connection = connect(target_intake)
+    try:
+        assert connection.execute("SELECT value FROM items").fetchone()["value"] == "intake"
+    finally:
+        connection.close()
+    assert target_spool is not None
+    assert (target_spool / "requests" / "op-1.json").is_file()
+    assert not (target_spool / "requests" / "stale.json").exists()
     assert restored["state_db"] == str(target)
+    assert restored["intake_db"] == str(target_intake)
+    assert restored["spool_dir"] == str(target_spool)
+    assert restored["mode"] == "maintenance"
     assert restored["safety_backup"] is not None
+    assert Path(restored["safety_backup"]).parent == backup_root
     assert Path(restored["safety_backup"]).is_dir()
+    backup.verify_backup(Path(restored["safety_backup"]))
+
+
+def test_full_restore_replaces_config_tree_exactly(tmp_path):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+    stale = config_path.parent / "obsolete.txt"
+    stale.write_text("remove me\n", encoding="utf-8")
+
+    restored = backup.restore_backup(
+        result,
+        config_path,
+        restore_config=True,
+        confirmed=True,
+        skip_service_check=True,
+    )
+
+    assert restored["config_restored"] is True
+    assert not stale.exists()
+    assert (config_path.parent / "authorized-keys.d" / "alice").is_file()
+    connection = connect(tmp_path / "var" / "state.db")
+    try:
+        assert store.get_mode(connection) == "maintenance"
+    finally:
+        connection.close()
+
+
+def test_restore_stops_all_writer_units_before_replacing_state(tmp_path, monkeypatch):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+    restore_config, target, _, _ = _make_restore_target(tmp_path, with_intake_and_spool=False)
+    calls: list[str] = []
+
+    def stop_writers() -> None:
+        connection = sqlite3.connect(target)
+        try:
+            assert connection.execute("SELECT value FROM items").fetchone() == ("old",)
+        finally:
+            connection.close()
+        calls.append("stop")
+
+    monkeypatch.setattr(backup, "_stop_writer_units", stop_writers)
+
+    backup.restore_backup(
+        result,
+        restore_config,
+        confirmed=True,
+    )
+
+    assert calls == ["stop"]
+
+
+def test_restore_rolls_back_all_swaps_when_post_restore_check_fails(tmp_path, monkeypatch):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+    restore_config, target, _, _ = _make_restore_target(tmp_path, with_intake_and_spool=False)
+    calls = 0
+
+    def fail_after_swap(path: Path) -> bool:
+        nonlocal calls
+        calls += 1
+        return calls == 1
+
+    monkeypatch.setattr(backup, "_force_maintenance", fail_after_swap)
+
+    with pytest.raises(backup.BackupError, match="settings table"):
+        backup.restore_backup(
+            result,
+            restore_config,
+            confirmed=True,
+            skip_service_check=True,
+        )
+
+    connection = sqlite3.connect(target)
+    try:
+        assert connection.execute("SELECT value FROM items").fetchone() == ("old",)
+    finally:
+        connection.close()
+    assert not (target.parent / f".{target.name}.pre-restore-{os.getpid()}").exists()
 
 
 def test_restore_requires_confirmation_and_rejects_tampered_backup(tmp_path):
-    config_path, _, _, backup_root = _fixture(tmp_path)
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
     result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
 
     with pytest.raises(backup.BackupError, match="confirmation"):
@@ -107,8 +258,16 @@ def test_restore_requires_confirmation_and_rejects_tampered_backup(tmp_path):
         backup.verify_backup(result)
 
 
+def test_backup_fails_if_configured_spool_is_missing(tmp_path):
+    config_path, _, _, spool_dir, backup_root = _fixture(tmp_path)
+    spool_dir.rename(tmp_path / "var" / "provision-moved")
+
+    with pytest.raises(backup.BackupError, match="provisioning spool"):
+        backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+
+
 def test_retention_keeps_newest_state_backups_and_preserves_other_directories(tmp_path):
-    config_path, _, _, backup_root = _fixture(tmp_path)
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
     backup_root.mkdir()
     (backup_root / "pre-cutover-20260101").mkdir()
     (backup_root / "state-old").mkdir()
@@ -122,7 +281,7 @@ def test_retention_keeps_newest_state_backups_and_preserves_other_directories(tm
 
 
 def test_cli_verify_and_backup_json(tmp_path, capsys):
-    config_path, _, _, backup_root = _fixture(tmp_path)
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
     assert (
         backup.main(
             ["backup", "--config", str(config_path), "--backup-root", str(backup_root), "--json"]

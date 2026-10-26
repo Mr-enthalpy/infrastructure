@@ -2,8 +2,9 @@
 
 The backup set contains:
 - the broker SQLite database, copied through SQLite's backup API;
-- the intake SQLite database when configured and present;
-- the root-owned ``/etc/citespec-resource`` configuration/key directory.
+- the intake SQLite database when configured;
+- the root-owned ``/etc/citespec-resource`` configuration/key directory;
+- the provisioning spool, including in-flight and completed operations.
 
 Workspaces are intentionally not copied: they can be very large and have their
 own quota/retention policy. The manifest records source paths and SHA-256
@@ -33,8 +34,16 @@ DEFAULT_CONFIG = "/etc/citespec-resource/config.toml"
 DEFAULT_BACKUP_ROOT = "/var/backups/citespec-resource"
 DEFAULT_KEEP = 14
 MANIFEST_NAME = "manifest.json"
-BACKUP_SCHEMA = 1
-SERVICE_NAME = "citespec-resource-broker.service"
+BACKUP_SCHEMA = 2
+SPOOL_BACKUP_NAME = "provision"
+# Units that can write the state/intake databases or the provisioning spool.
+# Restore stops every one of them and re-checks before touching live files.
+WRITER_UNITS = (
+    "citespec-resource-provision.path",
+    "citespec-resource-provision.service",
+    "citespec-resource-intake.service",
+    "citespec-resource-broker.service",
+)
 _STATE_BACKUP_NAME = re.compile(r"^state-\d{8}-\d{6}-\d+$")
 
 
@@ -54,7 +63,7 @@ def _chmod(path: Path, mode: int) -> None:
 def _read_config_paths(
     config_path: Path,
     state_db_override: Path | None = None,
-) -> tuple[Path, Path | None, Path]:
+) -> tuple[Path, Path | None, Path | None, Path]:
     try:
         with config_path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -69,15 +78,18 @@ def _read_config_paths(
         raise BackupError(f"{config_path} has no server.state_db")
     state_db = Path(state_value).expanduser()
 
-    intake_value = (
-        data.get("onboarding", {}).get("intake_db")
-        if isinstance(data.get("onboarding"), dict)
-        else None
-    )
+    onboarding = data.get("onboarding")
+    if not isinstance(onboarding, dict):
+        onboarding = {}
+    intake_value = onboarding.get("intake_db")
     intake_db = (
         Path(intake_value).expanduser() if isinstance(intake_value, str) and intake_value else None
     )
-    return state_db, intake_db, config_path.parent
+    spool_value = onboarding.get("provisioning_spool")
+    spool_dir = (
+        Path(spool_value).expanduser() if isinstance(spool_value, str) and spool_value else None
+    )
+    return state_db, intake_db, spool_dir, config_path.parent
 
 
 def _sqlite_backup(source: Path, destination: Path) -> None:
@@ -186,7 +198,7 @@ def create_backup(
 
     config = Path(config_path)
     root = Path(backup_root)
-    state_db, intake_db, config_dir = _read_config_paths(
+    state_db, intake_db, spool_dir, config_dir = _read_config_paths(
         config,
         Path(state_db_override) if state_db_override is not None else None,
     )
@@ -194,6 +206,10 @@ def create_backup(
         raise BackupError(f"configuration directory does not exist: {config_dir}")
     if not state_db.is_file():
         raise BackupError(f"state database does not exist: {state_db}")
+    if intake_db is not None and not intake_db.is_file():
+        raise BackupError(f"intake database does not exist: {intake_db}")
+    if spool_dir is not None and not spool_dir.is_dir():
+        raise BackupError(f"provisioning spool does not exist: {spool_dir}")
 
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     _chmod(root, 0o700)
@@ -206,7 +222,7 @@ def create_backup(
 
     try:
         _sqlite_backup(state_db, temporary / "state.db")
-        if intake_db is not None and intake_db.is_file():
+        if intake_db is not None:
             _sqlite_backup(intake_db, temporary / "intake.db")
         # Preserve the whole root-owned config tree, including central member
         # keys. Symlinks are copied as links, never followed during backup.
@@ -216,6 +232,15 @@ def create_backup(
             symlinks=True,
             copy_function=shutil.copy2,
         )
+        # The spool is part of the recovery state: operation ids and results
+        # must match the databases after a restore.
+        if spool_dir is not None:
+            shutil.copytree(
+                spool_dir,
+                temporary / SPOOL_BACKUP_NAME,
+                symlinks=True,
+                copy_function=shutil.copy2,
+            )
         payload: dict[str, Any] = {
             "schema": BACKUP_SCHEMA,
             "created_at": datetime.now(UTC).isoformat(),
@@ -225,6 +250,7 @@ def create_backup(
                 "config_dir": str(config_dir),
                 "state_db": str(state_db),
                 "intake_db": str(intake_db) if intake_db is not None else None,
+                "spool_dir": str(spool_dir) if spool_dir is not None else None,
             },
             "files": _manifest_files(temporary),
         }
@@ -273,14 +299,36 @@ def verify_backup(backup_dir: str | Path) -> dict[str, Any]:
             raise BackupError(f"backup file checksum mismatch: {path}")
         if key in {"state.db", "intake.db"}:
             _sqlite_integrity(path)
+    if "state.db" not in seen:
+        raise BackupError(f"backup manifest has no state.db: {manifest_path}")
+    sources = payload.get("sources")
+    if not isinstance(sources, dict):
+        raise BackupError(f"backup manifest has no sources: {manifest_path}")
+    if sources.get("intake_db") is not None and "intake.db" not in seen:
+        raise BackupError(f"backup manifest has no intake.db: {manifest_path}")
+    config_value = sources.get("config")
+    config_dir_value = sources.get("config_dir")
+    if not isinstance(config_value, str) or not isinstance(config_dir_value, str):
+        raise BackupError(f"backup manifest has no config sources: {manifest_path}")
+    config_name = Path(config_value).name
+    config_dir_name = Path(config_dir_value).name
+    restored_config = root / "etc" / config_dir_name / config_name
+    if not restored_config.is_file():
+        raise BackupError(f"backup has no config file: {restored_config}")
+    if sources.get("spool_dir") is not None and not (root / SPOOL_BACKUP_NAME).is_dir():
+        raise BackupError(f"backup has no provisioning spool: {root / SPOOL_BACKUP_NAME}")
     return payload
 
 
-def _service_is_active() -> bool:
-    if os.name != "posix" or shutil.which("systemctl") is None:
+def _systemctl_available() -> bool:
+    return os.name == "posix" and shutil.which("systemctl") is not None
+
+
+def _unit_is_active(unit: str) -> bool:
+    if not _systemctl_available():
         return False
     result = subprocess.run(
-        ["systemctl", "is-active", "--quiet", SERVICE_NAME],
+        ["systemctl", "is-active", "--quiet", unit],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -288,21 +336,137 @@ def _service_is_active() -> bool:
     return result.returncode == 0
 
 
-def _atomic_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.restore-{os.getpid()}")
+def _stop_writer_units() -> None:
+    if not _systemctl_available():
+        raise BackupError(
+            "systemctl is unavailable; stop broker/intake/provisioning manually "
+            "and pass --skip-service-check only after verifying they are inactive"
+        )
+    for unit in WRITER_UNITS:
+        result = subprocess.run(
+            ["systemctl", "stop", unit],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip()
+            if "not loaded" in detail or "could not be found" in detail:
+                continue
+            raise BackupError(f"could not stop {unit}: {detail}")
+    active = [unit for unit in WRITER_UNITS if _unit_is_active(unit)]
+    if active:
+        raise BackupError("writers are still active: " + ", ".join(active))
+
+
+def _force_maintenance(path: Path) -> bool:
+    """Set the Citespec mode to maintenance; return False for a non-Citespec DB."""
+    if not path.is_file():
+        return False
+    connection: sqlite3.Connection | None = None
     try:
-        shutil.copy2(source, temporary)
-        _chmod(temporary, 0o600)
-        _sqlite_integrity(temporary)
-        for suffix in ("-wal", "-shm"):
-            sidecar = destination.with_name(destination.name + suffix)
-            if sidecar.exists():
-                sidecar.unlink()
-        os.replace(temporary, destination)
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
+        ).fetchone()
+        if table is None:
+            return False
+        from . import store
+
+        store.set_mode(connection, "maintenance", actor_uid=0, now=datetime.now(UTC))
+        return store.get_mode(connection, "") == "maintenance"
+    except sqlite3.Error as exc:
+        raise BackupError(f"cannot force maintenance mode in {path}: {exc}") from exc
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if connection is not None:
+            connection.close()
+
+
+def _stage_sqlite(source: Path, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = destination.with_name(f".{destination.name}.restore-{os.getpid()}")
+    try:
+        staged.unlink(missing_ok=True)
+        shutil.copy2(source, staged)
+        _chmod(staged, 0o600)
+        _sqlite_integrity(staged)
+        return staged
+    except Exception:
+        staged.unlink(missing_ok=True)
+        raise
+
+
+def _inherit_owner(staged: Path, target: Path) -> None:
+    """Keep the intake DB writable by its low-privilege service account.
+
+    The backup copy is created by root, but the live intake database may be
+    owned by ``citespec-intake``.  Restore it with the target's owner (or the
+    owner of its state directory when the DB does not exist yet).
+    """
+    chown = getattr(os, "chown", None)
+    if chown is None:  # pragma: no cover - Windows test host
+        return
+    try:
+        info = target.stat()
+    except FileNotFoundError:
+        try:
+            info = target.parent.stat()
+        except OSError:
+            return
+    try:
+        chown(staged, info.st_uid, info.st_gid)
+    except OSError as exc:
+        raise BackupError(f"cannot restore database ownership for {target}: {exc}") from exc
+
+
+def _stage_tree(source: Path, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = destination.with_name(f".{destination.name}.restore-{os.getpid()}")
+    if staged.exists():
+        shutil.rmtree(staged)
+    shutil.copytree(source, staged, symlinks=True, copy_function=shutil.copy2)
+    return staged
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _swap_in(staged: Path, target: Path, *, sqlite: bool = False) -> Path | None:
+    """Replace one target, returning the old path for rollback."""
+    old = target.with_name(f".{target.name}.pre-restore-{os.getpid()}")
+    _remove_path(old)
+    if sqlite:
+        for suffix in ("-wal", "-shm"):
+            target.with_name(target.name + suffix).unlink(missing_ok=True)
+    had_target = target.exists() or target.is_symlink()
+    if had_target:
+        os.replace(target, old)
+    try:
+        os.replace(staged, target)
+    except Exception:
+        if had_target and old.exists():
+            os.replace(old, target)
+        raise
+    return old if had_target else None
+
+
+def _rollback_swaps(swaps: list[tuple[Path, Path | None]]) -> None:
+    for target, old in reversed(swaps):
+        _remove_path(target)
+        if old is not None and old.exists():
+            os.replace(old, target)
+
+
+def _cleanup_swaps(swaps: list[tuple[Path, Path | None]]) -> None:
+    for _target, old in swaps:
+        if old is not None:
+            _remove_path(old)
 
 
 def restore_backup(
@@ -315,19 +479,27 @@ def restore_backup(
     safety_backup: bool = True,
     skip_service_check: bool = False,
 ) -> dict[str, Any]:
-    """Restore a verified backup. Live broker use requires confirmed=True."""
+    """Restore databases, optional exact config tree, and the provisioning spool.
+
+    The command stops every writer unit itself, forces the current and restored
+    state to maintenance, stages and verifies every file before swapping any
+    live path, and rolls back all swaps if a later step fails.
+    """
 
     if not confirmed:
         raise BackupError("restore requires explicit confirmation (--yes)")
     root = Path(backup_dir)
-    verify_backup(root)
+    payload = verify_backup(root)
     config = Path(config_path)
-    state_target, _intake_db, config_dir = _read_config_paths(
+    state_target, intake_target, spool_target, config_dir = _read_config_paths(
         config,
         Path(state_db) if state_db is not None else None,
     )
-    if not skip_service_check and _service_is_active():
-        raise BackupError("broker is active; stop citespec-resource-broker.service before restore")
+    if not skip_service_check:
+        _stop_writer_units()
+
+    # Even if a later step fails, the live database must not reopen active.
+    _force_maintenance(state_target)
 
     safety_path: Path | None = None
     if safety_backup and state_target.exists():
@@ -339,20 +511,89 @@ def restore_backup(
             state_db_override=state_target,
         )
 
-    _atomic_copy(root / "state.db", state_target)
-    config_restored = False
-    if restore_config:
-        source_etc = root / "etc" / config_dir.name
-        if not source_etc.is_dir():
-            raise BackupError(f"backup has no config directory: {source_etc}")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source_etc, config_dir, dirs_exist_ok=True, symlinks=True)
-        config_restored = True
+    staged: list[Path] = []
+    swaps: list[tuple[Path, Path | None]] = []
+    succeeded = False
+    try:
+        staged_state = _stage_sqlite(root / "state.db", state_target)
+        staged.append(staged_state)
+        staged_intake: Path | None = None
+        if intake_target is not None:
+            intake_source = root / "intake.db"
+            if not intake_source.is_file():
+                raise BackupError("backup does not contain the configured intake database")
+            staged_intake = _stage_sqlite(intake_source, intake_target)
+            _inherit_owner(staged_intake, intake_target)
+            staged.append(staged_intake)
+        staged_spool: Path | None = None
+        if spool_target is not None:
+            spool_source = root / SPOOL_BACKUP_NAME
+            if not spool_source.is_dir():
+                raise BackupError("backup does not contain the configured provisioning spool")
+            staged_spool = _stage_tree(spool_source, spool_target)
+            staged.append(staged_spool)
+        staged_config: Path | None = None
+        if restore_config:
+            source_etc = root / "etc" / config_dir.name
+            if not source_etc.is_dir():
+                raise BackupError(f"backup has no config directory: {source_etc}")
+            staged_config = _stage_tree(source_etc, config_dir)
+            staged.append(staged_config)
+            restored_state, restored_intake, restored_spool, _ = _read_config_paths(
+                staged_config / config.name
+            )
+            if restored_state != state_target:
+                raise BackupError(
+                    "restored config server.state_db does not match the restore target"
+                )
+            if restored_intake != intake_target:
+                raise BackupError(
+                    "restored config onboarding.intake_db does not match the restore target"
+                )
+            if restored_spool != spool_target:
+                raise BackupError(
+                    "restored config onboarding.provisioning_spool does not match the target"
+                )
+
+        swaps.append((state_target, _swap_in(staged_state, state_target, sqlite=True)))
+        staged.remove(staged_state)
+        if staged_intake is not None and intake_target is not None:
+            swaps.append((intake_target, _swap_in(staged_intake, intake_target, sqlite=True)))
+            staged.remove(staged_intake)
+        if staged_spool is not None and spool_target is not None:
+            swaps.append((spool_target, _swap_in(staged_spool, spool_target)))
+            staged.remove(staged_spool)
+        if staged_config is not None:
+            swaps.append((config_dir, _swap_in(staged_config, config_dir)))
+            staged.remove(staged_config)
+
+        if not _force_maintenance(state_target):
+            raise BackupError("restored state database has no Citespec settings table")
+        _sqlite_integrity(state_target)
+        if intake_target is not None:
+            _sqlite_integrity(intake_target)
+        if spool_target is not None and not spool_target.is_dir():
+            raise BackupError("restored provisioning spool is missing")
+        if restore_config and not config_dir.is_dir():
+            raise BackupError("restored configuration directory is missing")
+        succeeded = True
+    except Exception:
+        _rollback_swaps(swaps)
+        raise
+    finally:
+        for path in staged:
+            _remove_path(path)
+        if succeeded:
+            _cleanup_swaps(swaps)
 
     return {
         "backup": str(root),
         "state_db": str(state_target),
-        "config_restored": config_restored,
+        "intake_db": str(intake_target) if intake_target is not None else None,
+        "spool_dir": str(spool_target) if spool_target is not None else None,
+        "config_restored": restore_config,
+        "mode": "maintenance",
+        "schema": int(payload.get("schema", BACKUP_SCHEMA)),
         "safety_backup": str(safety_path) if safety_path is not None else None,
     }
 

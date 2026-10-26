@@ -244,6 +244,17 @@ def test_provisioning_service_allows_request_bursts():
     assert "StartLimitIntervalSec=0" in unit
 
 
+def test_provisioning_spool_has_atomic_claim_and_recovery_paths():
+    path_unit = (ROOT / "deploy/systemd/citespec-resource-provision.path").read_text(
+        encoding="utf-8"
+    )
+    assert "requests/*.json" in path_unit
+    assert "processing/*.json" in path_unit
+    installer = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "PROVISION_SPOOL_DIR/processing" in installer
+    assert "-m 0700" in installer
+
+
 def test_active_acceptance_python_syntax():
     path = ROOT / "deploy/acceptance_active.py"
     source = path.read_text(encoding="utf-8")

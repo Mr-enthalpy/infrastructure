@@ -1,5 +1,7 @@
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +13,7 @@ from citespec_resource.broker import workspace_io
 from citespec_resource.broker.docker_driver import ContainerInfo, GPUProcess
 from citespec_resource.broker.server import Broker
 from citespec_resource.db import connect, init_db
+from citespec_resource.errors import Conflict
 from citespec_resource.gpu_audit import GpuAuditResult
 from citespec_resource.identity import Identity
 from citespec_resource.legacy_audit import LegacyAuditResult
@@ -359,6 +362,97 @@ def test_managed_container_match_requires_container_owner_and_gpus(tmp_path, act
         gpu_refs=("GPU-2",),
     )
     assert broker._managed_container_matches(wrong_gpu, allocations, gpus) is False
+
+
+class _BlockingShellSession(FakeShellSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = threading.Event()
+        self.started = threading.Event()
+        self.read_thread = ""
+
+    def read(self, size: int = 65536) -> bytes:
+        del size
+        self.read_thread = threading.current_thread().name
+        self.started.set()
+        self.gate.wait(5)
+        return b""
+
+    def close(self) -> None:
+        self.gate.set()
+        super().close()
+
+
+def test_shell_streams_do_not_use_or_starve_default_executor(tmp_path, active_config):
+    broker, _ = _broker(tmp_path, active_config)
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        session = _BlockingShellSession()
+        reader = asyncio.StreamReader()
+        writer = _TunnelWriter()
+        relay = asyncio.create_task(broker._relay_shell(reader, writer, session))
+        try:
+            assert await asyncio.to_thread(session.started.wait, 2)
+            control = await asyncio.wait_for(asyncio.to_thread(lambda: "control"), 1)
+            assert control == "control"
+            assert session.read_thread.startswith("citespec-stream-read")
+        finally:
+            session.gate.set()
+            await asyncio.wait_for(relay, 2)
+
+    asyncio.run(scenario())
+
+
+def test_shell_and_tunnel_caps_are_explicit_and_per_member(tmp_path, active_config):
+    config = replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            max_shells_per_user=1,
+            max_shells_global=2,
+            max_tunnels_per_user=1,
+            max_tunnels_global=2,
+        ),
+    )
+    broker, _ = _broker(tmp_path, config)
+
+    async def scenario() -> None:
+        async def hold() -> None:
+            await asyncio.Event().wait()
+
+        tasks = [asyncio.create_task(hold()) for _ in range(4)]
+        try:
+            broker._reserve_shell(tasks[0], 1000)
+            broker._reserve_shell(tasks[1], 1001)
+            with pytest.raises(Conflict, match="server"):
+                broker._reserve_shell(tasks[2], 1002)
+            broker._release_shell(tasks[0])
+            broker._release_shell(tasks[1])
+            broker._reserve_shell(tasks[0], 1000)
+            with pytest.raises(Conflict, match="member"):
+                broker._reserve_shell(tasks[1], 1000)
+            broker._release_shell(tasks[0])
+            broker._release_shell(tasks[1])
+
+            broker._reserve_tunnel(tasks[0], 1000)
+            broker._reserve_tunnel(tasks[1], 1001)
+            with pytest.raises(Conflict, match="server"):
+                broker._reserve_tunnel(tasks[2], 1002)
+            broker._release_tunnel(tasks[0])
+            broker._release_tunnel(tasks[1])
+            broker._reserve_tunnel(tasks[0], 1000)
+            with pytest.raises(Conflict, match="member"):
+                broker._reserve_tunnel(tasks[1], 1000)
+        finally:
+            for task in tasks:
+                broker._release_shell(task)
+                broker._release_tunnel(task)
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 async def test_relay_tunnel_closes_session_on_completion(tmp_path, active_config):

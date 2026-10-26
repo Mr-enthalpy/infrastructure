@@ -22,7 +22,7 @@ from typing import Final
 # user_version. Fresh installs therefore run the same migration path as
 # existing deployments.
 BASE_SCHEMA_VERSION: Final = 2
-SCHEMA_VERSION: Final = 4
+SCHEMA_VERSION: Final = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -306,6 +306,22 @@ def _apply_lifecycle_migration(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE member_operations_v4 RENAME TO member_operations")
 
 
+def _apply_key_projection_migration(connection: sqlite3.Connection) -> None:
+    """Bind key projection operations to the member version they reviewed.
+
+    A key change is applied to the host outside the SQLite write transaction,
+    so the completion step must prove the member did not change (suspend,
+    revoke, or another key operation) while the executor was running.  The
+    expected version is recorded when the operation is created and checked in
+    the short completion transaction.
+    """
+    if not _column_exists(connection, "member_operations", "expected_access_version"):
+        connection.execute(
+            "ALTER TABLE member_operations "
+            "ADD COLUMN expected_access_version INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a connection with the PRAGMAs required on every connection."""
     path = Path(path)
@@ -321,6 +337,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
 MIGRATIONS: Final[dict[int, Callable[[sqlite3.Connection], object]]] = {
     3: _apply_membership_migration,
     4: _apply_lifecycle_migration,
+    5: _apply_key_projection_migration,
 }
 
 

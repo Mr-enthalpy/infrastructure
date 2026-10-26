@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -110,6 +111,25 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     return request
 
 
+_OPERATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def valid_operation_id(value: str) -> bool:
+    return bool(_OPERATION_ID_RE.fullmatch(value))
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temp = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 class ProvisioningError(RuntimeError):
     """Raised when the executor reports a failed stage."""
 
@@ -118,10 +138,18 @@ class ProvisioningClient(ABC):
     """Submit one validated operation and wait for its result."""
 
     @abstractmethod
-    def execute(self, action: str, frozen_input: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict[str, Any],
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Run the operation; returns the executor result record.
 
-        Raises ProvisioningError with the executor's stage/error on failure.
+        ``operation_id`` is the durable membership operation id.  Supplying it
+        makes spool retries address exactly the same request/result pair
+        instead of creating an orphaned second request.
         """
 
 
@@ -132,25 +160,38 @@ class SpoolProvisioningClient(ProvisioningClient):
         self.spool_dir = Path(spool_dir)
         self.timeout_seconds = timeout_seconds
 
-    def execute(self, action: str, frozen_input: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict[str, Any],
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         import time
 
-        operation_id = uuid.uuid4().hex
+        resolved_id = operation_id or uuid.uuid4().hex
+        if not valid_operation_id(resolved_id):
+            raise ProvisioningError("invalid provisioning operation id")
         request = {
-            "operation_id": operation_id,
+            "operation_id": resolved_id,
             "action": action,
             "frozen_input": frozen_input,
         }
         validate_request(request)
         requests_dir = self.spool_dir / "requests"
         results_dir = self.spool_dir / "results"
-        requests_dir.mkdir(parents=True, exist_ok=True)
-        results_dir.mkdir(parents=True, exist_ok=True)
-        request_file = requests_dir / f"{operation_id}.json"
-        temp = request_file.with_suffix(".tmp")
-        temp.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
-        os.replace(temp, request_file)
-        result_file = results_dir / f"{operation_id}.json"
+        processing_dir = self.spool_dir / "processing"
+        for directory in (requests_dir, results_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+        processing_dir.mkdir(parents=True, exist_ok=True)
+        request_file = requests_dir / f"{resolved_id}.json"
+        processing_file = processing_dir / f"{resolved_id}.json"
+        result_file = results_dir / f"{resolved_id}.json"
+        # A retry must reuse the durable operation id.  Do not overwrite a
+        # request that the executor already claimed (processing/) and do not
+        # enqueue a second copy while the first is still being handled.
+        if not result_file.exists() and not processing_file.exists() and not request_file.exists():
+            _atomic_write_json(request_file, request)
         deadline = time.monotonic() + self.timeout_seconds
         while time.monotonic() < deadline:
             if result_file.exists():
@@ -159,16 +200,23 @@ class SpoolProvisioningClient(ProvisioningClient):
                 except (OSError, ValueError):
                     time.sleep(0.2)
                     continue
+                if str(result.get("operation_id", "")) != resolved_id:
+                    raise ProvisioningError("executor returned a mismatched operation id")
                 if result.get("status") == "succeeded":
                     result_file.unlink(missing_ok=True)
                     request_file.unlink(missing_ok=True)
+                    processing_file.unlink(missing_ok=True)
                     return result
                 result_file.unlink(missing_ok=True)
                 request_file.unlink(missing_ok=True)
+                processing_file.unlink(missing_ok=True)
                 raise ProvisioningError(
                     f"stage={result.get('stage', '')}: {result.get('error', 'unknown')}"
                 )
             time.sleep(0.25)
+        # Leave request/processing in place.  The caller's persisted operation
+        # id lets a retry continue the same operation instead of enqueueing a
+        # second, orphaned request.
         raise ProvisioningError("provisioning executor did not answer in time")
 
 
@@ -183,10 +231,20 @@ class CommandExecutorClient(ProvisioningClient):
         self.command = list(command)
         self.timeout_seconds = timeout_seconds
 
-    def execute(self, action: str, frozen_input: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        action: str,
+        frozen_input: dict[str, Any],
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         import subprocess
 
-        request = {"operation_id": uuid.uuid4().hex, "action": action, "frozen_input": frozen_input}
+        request = {
+            "operation_id": operation_id or uuid.uuid4().hex,
+            "action": action,
+            "frozen_input": frozen_input,
+        }
         validate_request(request)
         try:
             completed = subprocess.run(

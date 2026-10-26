@@ -2,7 +2,11 @@
 Description=Watch the Citespec provisioning spool for new operations
 
 [Path]
+# New requests and crash-claimed requests both retrigger the executor.  The
+# executor removes a request only after its result is durable, so the watched
+# directories return to empty instead of causing an endless restart loop.
 PathExistsGlob=/var/lib/citespec-resource/provision/requests/*.json
+PathExistsGlob=/var/lib/citespec-resource/provision/processing/*.json
 Unit=citespec-resource-provision.service
 
 [Install]

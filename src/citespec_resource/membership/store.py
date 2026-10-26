@@ -361,19 +361,33 @@ def add_key(
         if own:
             connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
-            "SELECT member_id FROM member_keys WHERE fingerprint = ? AND status = 'active'",
-            (fingerprint,),
+            "SELECT key_id, status FROM member_keys WHERE member_id = ? AND fingerprint = ?",
+            (member_id, fingerprint),
         ).fetchone()
-        if existing is not None:
-            raise Conflict("该公钥已登记给其他成员；如需转移请联系管理员")
-        connection.execute(
-            """
-            INSERT INTO member_keys(
-                key_id, member_id, public_key, fingerprint, status, created_at
-            ) VALUES (?, ?, ?, ?, 'active', ?)
-            """,
-            (key_id, member_id, public_key, fingerprint, timestamp),
-        )
+        if existing is not None and str(existing["status"]) == "active":
+            raise Conflict("该公钥已登记；无需重复添加")
+        if existing is None:
+            conflict = connection.execute(
+                "SELECT member_id FROM member_keys WHERE fingerprint = ? AND status = 'active'",
+                (fingerprint,),
+            ).fetchone()
+            if conflict is not None:
+                raise Conflict("该公钥已登记给其他成员；如需转移请联系管理员")
+            connection.execute(
+                """
+                INSERT INTO member_keys(
+                    key_id, member_id, public_key, fingerprint, status, created_at
+                ) VALUES (?, ?, ?, ?, 'active', ?)
+                """,
+                (key_id, member_id, public_key, fingerprint, timestamp),
+            )
+        else:
+            key_id = str(existing["key_id"])
+            connection.execute(
+                "UPDATE member_keys SET public_key = ?, status = 'active', revoked_at = '' "
+                "WHERE key_id = ?",
+                (public_key, key_id),
+            )
         bump_access_version(connection, member_id)
         broker_store.record_event(
             connection,
@@ -504,32 +518,55 @@ def set_member_keys(
     try:
         if own:
             connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "UPDATE member_keys SET status = 'revoked', revoked_at = ? "
-            "WHERE member_id = ? AND status = 'active'",
-            (timestamp, member_id),
-        )
+        desired: dict[str, dict[str, str]] = {}
         for key in keys:
+            desired[str(key["fingerprint"])] = key
+        for fingerprint, key in desired.items():
+            conflict = connection.execute(
+                "SELECT member_id FROM member_keys WHERE fingerprint = ? "
+                "AND status = 'active' AND member_id != ?",
+                (fingerprint, member_id),
+            ).fetchone()
+            if conflict is not None:
+                raise Conflict("该公钥已登记给其他成员；如需转移请联系管理员")
             existing = connection.execute(
-                "SELECT key_id, member_id FROM member_keys WHERE fingerprint = ? "
-                "AND status = 'active'",
-                (key["fingerprint"],),
+                "SELECT key_id FROM member_keys WHERE member_id = ? AND fingerprint = ?",
+                (member_id, fingerprint),
             ).fetchone()
             if existing is not None:
-                if str(existing["member_id"]) != member_id:
-                    raise Conflict("该公钥已登记给其他成员；如需转移请联系管理员")
                 connection.execute(
-                    "UPDATE member_keys SET status = 'active', revoked_at = '' WHERE key_id = ?",
-                    (str(existing["key_id"]),),
+                    "UPDATE member_keys SET public_key = ?, status = 'active', revoked_at = '' "
+                    "WHERE key_id = ?",
+                    (key["public_key"], str(existing["key_id"])),
                 )
-                continue
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO member_keys(
+                        key_id, member_id, public_key, fingerprint, status, created_at
+                    ) VALUES (?, ?, ?, ?, 'active', ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        member_id,
+                        key["public_key"],
+                        fingerprint,
+                        timestamp,
+                    ),
+                )
+        if desired:
+            placeholders = ",".join("?" for _ in desired)
             connection.execute(
-                """
-                INSERT INTO member_keys(
-                    key_id, member_id, public_key, fingerprint, status, created_at
-                ) VALUES (?, ?, ?, ?, 'active', ?)
-                """,
-                (uuid.uuid4().hex, member_id, key["public_key"], key["fingerprint"], timestamp),
+                "UPDATE member_keys SET status = 'revoked', revoked_at = ? "
+                f"WHERE member_id = ? AND status = 'active' "
+                f"AND fingerprint NOT IN ({placeholders})",
+                (timestamp, member_id, *desired.keys()),
+            )
+        else:
+            connection.execute(
+                "UPDATE member_keys SET status = 'revoked', revoked_at = ? "
+                "WHERE member_id = ? AND status = 'active'",
+                (timestamp, member_id),
             )
         bump_access_version(connection, member_id)
         if own:
@@ -553,6 +590,7 @@ def create_operation(
     member_id: str | None = None,
     request_id: str | None = None,
     idempotency_key: str | None = None,
+    expected_access_version: int = 0,
     now: datetime | None = None,
 ) -> tuple[str, bool]:
     """Create an operation record; returns (operation_id, created).
@@ -577,8 +615,9 @@ def create_operation(
             """
             INSERT INTO member_operations(
                 operation_id, idempotency_key, member_id, request_id, action,
-                frozen_input, stage, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, '', 'pending', ?, ?)
+                frozen_input, stage, status, expected_access_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '', 'pending', ?, ?, ?)
             """,
             (
                 operation_id,
@@ -587,6 +626,7 @@ def create_operation(
                 request_id,
                 action,
                 json.dumps(frozen_input, sort_keys=True, ensure_ascii=False),
+                expected_access_version,
                 timestamp,
                 timestamp,
             ),
@@ -627,6 +667,7 @@ def get_operation(connection: sqlite3.Connection, operation_id: str) -> dict[str
         "attempts": int(row["attempts"]),
         "last_error": str(row["last_error"]),
         "frozen_input": json.loads(str(row["frozen_input"])),
+        "expected_access_version": int(row["expected_access_version"]),
         "created_at": str(row["created_at"]),
         "updated_at": str(row["updated_at"]),
     }
@@ -680,6 +721,7 @@ def list_operations(
             "stage": str(row["stage"]),
             "attempts": int(row["attempts"]),
             "last_error": str(row["last_error"]),
+            "expected_access_version": int(row["expected_access_version"]),
             "created_at": str(row["created_at"]),
         }
         for row in rows

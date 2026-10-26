@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -55,6 +57,25 @@ def _begin(connection: sqlite3.Connection) -> bool:
         return False
     connection.execute("BEGIN IMMEDIATE")
     return True
+
+
+# Per-member serialization for operations that mutate host credentials.  This
+# is intentionally NOT a database transaction: SQLite must never stay locked
+# while the executor runs.  The lock only serializes work for the same member;
+# different members continue in parallel.
+_MEMBER_LOCKS: dict[str, threading.Lock] = {}
+_MEMBER_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _member_lock(member_id: str) -> Any:
+    with _MEMBER_LOCKS_GUARD:
+        lock = _MEMBER_LOCKS.setdefault(member_id, threading.Lock())
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def list_requests(intake_db: str, *, status: str | None = None) -> list[dict[str, Any]]:
@@ -430,8 +451,43 @@ def _execute_operation(
         if own:
             connection.rollback()
         raise
+    if action == "set_keys":
+        row = connection.execute(
+            "SELECT status, access_version FROM members WHERE member_id = ?",
+            (member_id,),
+        ).fetchone()
+        expected_version = int(operation.get("expected_access_version") or 0)
+        if row is None or str(row["status"]) != "active":
+            current = "missing" if row is None else str(row["status"])
+            _fail_operation(
+                connection,
+                operation,
+                f"member is {current}; refusing to install active login keys",
+                now=now,
+            )
+            return {
+                "operation_id": operation_id,
+                "status": "failed",
+                "stage": "member_not_active",
+                "error": f"member is {current}",
+                "member_id": member_id,
+            }
+        if int(row["access_version"]) != expected_version:
+            _fail_operation(
+                connection,
+                operation,
+                "member changed while preparing the key projection",
+                now=now,
+            )
+            return {
+                "operation_id": operation_id,
+                "status": "failed",
+                "stage": "stale_key_operation",
+                "error": "member access version changed",
+                "member_id": member_id,
+            }
     try:
-        result = provisioning.execute(action, frozen)
+        result = provisioning.execute(action, frozen, operation_id=operation_id)
     except ProvisioningError as exc:
         _fail_operation(connection, operation, str(exc), now=now)
         return {
@@ -452,6 +508,27 @@ def _execute_operation(
         }
 
     result_stages = [str(stage) for stage in result.get("stages", [])]
+    if action == "set_keys":
+        try:
+            return _complete_key_projection(
+                connection,
+                operation,
+                result_stages,
+                now=now,
+            )
+        except Exception as exc:
+            logger.exception("could not commit key projection for %s", member_id)
+            stage = (
+                "stale_key_operation" if "member changed" in str(exc) else "key_projection_commit"
+            )
+            _fail_operation(connection, operation, f"{stage}: {exc}", now=now)
+            return {
+                "operation_id": operation_id,
+                "status": "failed",
+                "stage": stage,
+                "error": str(exc),
+                "member_id": member_id,
+            }
     if action == "provision_member":
         try:
             return _activate_provisioned_member(
@@ -500,6 +577,70 @@ def _execute_operation(
         "status": "succeeded",
         "member_id": member_id,
         "stages": result_stages,
+    }
+
+
+def _complete_key_projection(
+    connection: sqlite3.Connection,
+    operation: dict[str, Any],
+    stages: list[str],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Commit a host-verified key change in one short SQLite transaction."""
+    from .models import parse_public_key
+
+    operation_id = str(operation["operation_id"])
+    member_id = str(operation["member_id"] or "")
+    frozen = operation["frozen_input"]
+    keys: list[dict[str, str]] = []
+    for raw in frozen.get("public_keys", []):
+        normalized, fingerprint = parse_public_key(str(raw))
+        keys.append({"public_key": normalized, "fingerprint": fingerprint})
+
+    own = _begin(connection)
+    try:
+        row = connection.execute(
+            "SELECT status, access_version FROM members WHERE member_id = ?",
+            (member_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"member not found: {member_id}")
+        if str(row["status"]) != "active":
+            raise Conflict(f"member {member_id} is {row['status']}, not active")
+        expected_version = int(operation.get("expected_access_version") or 0)
+        if int(row["access_version"]) != expected_version:
+            raise Conflict("member changed while the key projection was running")
+        member_store.set_member_keys(connection, member_id, keys, now=now)
+        member_store.update_operation(
+            connection,
+            operation_id,
+            status="succeeded",
+            stage=",".join(stages),
+            now=now,
+        )
+        broker_store.record_event(
+            connection,
+            actor_uid=None,
+            action="membership_set_keys_succeeded",
+            detail={
+                "operation_id": operation_id,
+                "member_id": member_id,
+                "key_count": len(keys),
+            },
+            now=now,
+        )
+        if own:
+            connection.commit()
+    except Exception:
+        if own:
+            connection.rollback()
+        raise
+    return {
+        "operation_id": operation_id,
+        "status": "succeeded",
+        "member_id": member_id,
+        "stages": stages,
     }
 
 
@@ -688,6 +829,37 @@ def retry_operation(
     actor_uid: int,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    operation = member_store.get_operation(connection, operation_id)
+    member_id = str(operation.get("member_id") or "")
+    if not member_id:
+        return _retry_operation_locked(
+            connection,
+            operation_id,
+            provisioning=provisioning,
+            intake_db=intake_db,
+            actor_uid=actor_uid,
+            now=now,
+        )
+    with _member_lock(member_id):
+        return _retry_operation_locked(
+            connection,
+            operation_id,
+            provisioning=provisioning,
+            intake_db=intake_db,
+            actor_uid=actor_uid,
+            now=now,
+        )
+
+
+def _retry_operation_locked(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    *,
+    provisioning: ProvisioningClient,
+    intake_db: str,
+    actor_uid: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """Retry a failed/interrupted operation or replay a projection (§7.3, AC-14)."""
     operation = member_store.get_operation(connection, operation_id)
     if operation["status"] == "succeeded":
@@ -804,6 +976,28 @@ def suspend_member(
     on_member_change: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    with _member_lock(member_id):
+        return _suspend_member_locked(
+            connection,
+            member_id,
+            actor_uid=actor_uid,
+            reason=reason,
+            provisioning=provisioning,
+            on_member_change=on_member_change,
+            now=now,
+        )
+
+
+def _suspend_member_locked(
+    connection: sqlite3.Connection,
+    member_id: str,
+    *,
+    actor_uid: int,
+    reason: str,
+    provisioning: ProvisioningClient,
+    on_member_change: Any = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """Suspend interactive access; running jobs keep their lease (§7.4)."""
     result = member_store.transition_member(
         connection,
@@ -857,6 +1051,26 @@ def resume_member(
     provisioning: ProvisioningClient,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    with _member_lock(member_id):
+        return _resume_member_locked(
+            connection,
+            member_id,
+            actor_uid=actor_uid,
+            reason=reason,
+            provisioning=provisioning,
+            now=now,
+        )
+
+
+def _resume_member_locked(
+    connection: sqlite3.Connection,
+    member_id: str,
+    *,
+    actor_uid: int,
+    reason: str,
+    provisioning: ProvisioningClient,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """Resume a suspended member: unlock and verify credentials first (§7.4)."""
     member = member_store.get_member(connection, member_id)
     status = member["member"]["status"]
@@ -865,7 +1079,13 @@ def resume_member(
     username = str(member["member"]["linux_username"] or "")
     if not username:
         raise Conflict("该成员尚未完成开户，不能恢复；请先重试开户操作")
-    keys = [key["public_key"] for key in member["keys"] if key["status"] == "active"]
+    # get_member() intentionally exposes only key metadata (fingerprint/status).
+    # Use the internal full-key view so resume can reinstall the active keyset.
+    keys = [
+        str(key["public_key"])
+        for key in member_store.list_keys(connection, member_id)
+        if key["status"] == "active"
+    ]
     if not keys:
         raise Conflict("该成员没有有效公钥；恢复前请先安装登录密钥")
     operation_id, _created = member_store.create_operation(
@@ -901,6 +1121,28 @@ def resume_member(
 
 
 def revoke_member(
+    connection: sqlite3.Connection,
+    member_id: str,
+    *,
+    actor_uid: int,
+    reason: str,
+    provisioning: ProvisioningClient,
+    on_member_change: Any = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    with _member_lock(member_id):
+        return _revoke_member_locked(
+            connection,
+            member_id,
+            actor_uid=actor_uid,
+            reason=reason,
+            provisioning=provisioning,
+            on_member_change=on_member_change,
+            now=now,
+        )
+
+
+def _revoke_member_locked(
     connection: sqlite3.Connection,
     member_id: str,
     *,
@@ -976,6 +1218,12 @@ def revoke_member(
     return result
 
 
+def _key_projection_failure(operation: dict[str, Any]) -> ProvisioningError:
+    return ProvisioningError(
+        f"stage={operation.get('stage', '')}: {operation.get('error', 'key projection failed')}"
+    )
+
+
 def add_member_key(
     connection: sqlite3.Connection,
     member_id: str,
@@ -985,49 +1233,92 @@ def add_member_key(
     provisioning: ProvisioningClient,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Administrator key add, projected to the host for active members.
+    """Add a login key without holding a SQLite write lock during host I/O.
 
-    For suspended/expired/provisioning members the key is stored only in the
-    database; resume/activation installs the current active keyset. A failed
-    host projection rolls the database change back, so the UI never claims a
-    key works when sshd does not accept it.
+    Active members use a persisted ``set_keys`` operation: the prospective
+    keyset is frozen and committed, the executor installs it, and only then a
+    short compare-and-set transaction applies it to the ledger.  Suspended and
+    not-yet-active members store the key for the next enable/activation.
     """
     from .models import parse_public_key
 
     normalized, fingerprint = parse_public_key(public_key)
-    own = _begin(connection)
-    try:
+    with _member_lock(member_id):
         member = member_store.get_member(connection, member_id)["member"]
         status = str(member["status"])
         if status == "revoked":
             raise Conflict("成员已撤销，不能再添加登录公钥")
-        key_id = member_store.add_key(
+        duplicate = connection.execute(
+            "SELECT member_id FROM member_keys WHERE fingerprint = ? AND status = 'active'",
+            (fingerprint,),
+        ).fetchone()
+        if duplicate is not None:
+            raise Conflict("该公钥已登记；无需重复添加")
+        if status != "active":
+            own = _begin(connection)
+            try:
+                key_id = member_store.add_key(
+                    connection,
+                    member_id,
+                    public_key=normalized,
+                    fingerprint=fingerprint,
+                    now=now,
+                )
+                if own:
+                    connection.commit()
+            except Exception:
+                if own:
+                    connection.rollback()
+                raise
+            return {"key_id": key_id, "fingerprint": fingerprint, "member_status": status}
+
+        username = str(member["linux_username"] or "")
+        if not username:
+            raise Conflict("成员尚未完成开户，不能同步登录公钥")
+        active_keys = [
+            key["public_key"]
+            for key in member_store.list_keys(connection, member_id)
+            if key["status"] == "active"
+        ]
+        target_keys = [*active_keys, normalized]
+        own = _begin(connection)
+        try:
+            operation_id, _created = member_store.create_operation(
+                connection,
+                action="set_keys",
+                frozen_input={"username": username, "public_keys": target_keys},
+                member_id=member_id,
+                expected_access_version=int(member["access_version"]),
+                now=now,
+            )
+            if own:
+                connection.commit()
+        except Exception:
+            if own:
+                connection.rollback()
+            raise
+        operation = _execute_operation(
             connection,
-            member_id,
-            public_key=normalized,
-            fingerprint=fingerprint,
+            operation_id,
+            provisioning=provisioning,
+            intake_db="",
             now=now,
         )
-        if status == "active":
-            username = str(member["linux_username"] or "")
-            if not username:
-                raise Conflict("成员尚未完成开户，不能同步登录公钥")
-            keys = [
-                row["public_key"]
-                for row in connection.execute(
-                    "SELECT public_key FROM member_keys "
-                    "WHERE member_id = ? AND status = 'active' ORDER BY created_at",
-                    (member_id,),
-                ).fetchall()
-            ]
-            provisioning.execute("set_keys", {"username": username, "public_keys": keys})
-        if own:
-            connection.commit()
-    except Exception:
-        if own:
-            connection.rollback()
-        raise
-    return {"key_id": key_id, "fingerprint": fingerprint, "member_status": status}
+        if operation["status"] != "succeeded":
+            raise _key_projection_failure(operation)
+        row = connection.execute(
+            "SELECT key_id FROM member_keys "
+            "WHERE member_id = ? AND fingerprint = ? AND status = 'active'",
+            (member_id, fingerprint),
+        ).fetchone()
+        if row is None:
+            raise Conflict("公钥已写入宿主机，但数据库投影未完成；请重试该操作")
+        return {
+            "key_id": str(row["key_id"]),
+            "fingerprint": fingerprint,
+            "member_status": status,
+            "operation_id": operation_id,
+        }
 
 
 def revoke_member_key(
@@ -1039,38 +1330,82 @@ def revoke_member_key(
     provisioning: ProvisioningClient,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Administrator key revoke, projected to the host for active members."""
-    own = _begin(connection)
-    try:
+    """Revoke a login key with a short projection transaction (see add)."""
+    with _member_lock(member_id):
         member = member_store.get_member(connection, member_id)["member"]
         status = str(member["status"])
-        member_store.revoke_key(
+        row = connection.execute(
+            "SELECT * FROM member_keys WHERE key_id = ? AND member_id = ?",
+            (key_id, member_id),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"key not found: {key_id}")
+        if str(row["status"]) != "active":
+            raise Conflict(f"key {key_id} is not active")
+        active_keys = [
+            key
+            for key in member_store.list_keys(connection, member_id)
+            if key["status"] == "active"
+        ]
+        if not any(key["key_id"] == key_id for key in active_keys):
+            raise Conflict(f"key {key_id} is not active")
+        remaining = [key["public_key"] for key in active_keys if key["key_id"] != key_id]
+        if not remaining:
+            raise Conflict(
+                "这是最后一个有效公钥；移除后你将无法登录。请先添加新密钥，或联系管理员走恢复流程"
+            )
+        if status != "active":
+            own = _begin(connection)
+            try:
+                member_store.revoke_key(
+                    connection,
+                    member_id,
+                    key_id=key_id,
+                    actor_uid=actor_uid,
+                    now=now,
+                )
+                if own:
+                    connection.commit()
+            except Exception:
+                if own:
+                    connection.rollback()
+                raise
+            return {"key_id": key_id, "revoked": True, "member_status": status}
+
+        username = str(member["linux_username"] or "")
+        if not username:
+            raise Conflict("成员尚未完成开户，不能同步登录公钥")
+        own = _begin(connection)
+        try:
+            operation_id, _created = member_store.create_operation(
+                connection,
+                action="set_keys",
+                frozen_input={"username": username, "public_keys": remaining},
+                member_id=member_id,
+                expected_access_version=int(member["access_version"]),
+                now=now,
+            )
+            if own:
+                connection.commit()
+        except Exception:
+            if own:
+                connection.rollback()
+            raise
+        operation = _execute_operation(
             connection,
-            member_id,
-            key_id=key_id,
-            actor_uid=actor_uid,
+            operation_id,
+            provisioning=provisioning,
+            intake_db="",
             now=now,
         )
-        if status == "active":
-            username = str(member["linux_username"] or "")
-            if not username:
-                raise Conflict("成员尚未完成开户，不能同步登录公钥")
-            keys = [
-                row["public_key"]
-                for row in connection.execute(
-                    "SELECT public_key FROM member_keys "
-                    "WHERE member_id = ? AND status = 'active' ORDER BY created_at",
-                    (member_id,),
-                ).fetchall()
-            ]
-            provisioning.execute("set_keys", {"username": username, "public_keys": keys})
-        if own:
-            connection.commit()
-    except Exception:
-        if own:
-            connection.rollback()
-        raise
-    return {"key_id": key_id, "revoked": True, "member_status": status}
+        if operation["status"] != "succeeded":
+            raise _key_projection_failure(operation)
+        return {
+            "key_id": key_id,
+            "revoked": True,
+            "member_status": status,
+            "operation_id": operation_id,
+        }
 
 
 def import_legacy_member(
