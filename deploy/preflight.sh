@@ -1,17 +1,79 @@
 #!/usr/bin/env bash
-# Read-only deployment preflight. This script must not change host state.
+# Read-only deployment preflight.  The only intended host-side effect is the
+# root nvidia-smi probe, which can reset /dev/nvidia* unless the wrapper is
+# installed; use --skip-nvidia to avoid it.
 set -u
 set -o pipefail
 
 FAIL=0
 WARN=0
 CONFIG_FILE=""
+SKIP_NVIDIA=0
+
+NVIDIA_SMI=/usr/bin/nvidia-smi
+NVIDIA_SMI_REAL=/usr/bin/nvidia-smi.real
+NVIDIA_SHIM=/usr/local/lib/citespec-resource/libcitespec-nvidia-chmod.so
 
 section() { printf '\n== %s ==\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
+note() { printf '[note] %s\n' "$1"; }
 warn() { printf '[warn] %s\n' "$1"; WARN=$((WARN + 1)); }
 fail() { printf '[fail] %s\n' "$1"; FAIL=$((FAIL + 1)); }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+nvidia_device_state() {
+    local device
+    for device in /dev/nvidia*; do
+        [ -e "$device" ] || continue
+        printf '%s %s\n' "$device" "$(stat -c '%a %u:%g' "$device" 2>/dev/null || printf 'unknown')"
+    done
+}
+
+mode_has_special_bits() {
+    # GNU stat prints a fourth digit only when setuid/setgid/sticky is present.
+    local mode=$1
+    [ "${#mode}" -eq 4 ] && [ "$((8#$mode & 8#6000))" -ne 0 ]
+}
+
+# nvidia-smi chmods /dev/nvidia* to 0666 root:root every time it runs as root.
+# Record the state around the query so preflight reports what its own probe did
+# instead of checking permissions before the probe and calling them clean.
+audit_nvidia_helpers() {
+    local real_installed=0
+    if [ -e "$NVIDIA_SMI_REAL" ]; then
+        real_installed=1
+    fi
+    if [ -e "$NVIDIA_SMI" ] && [ ! -L "$NVIDIA_SMI" ] \
+        && grep -Iq -- 'exec /usr/bin/nvidia-smi.real' "$NVIDIA_SMI" 2>/dev/null; then
+        ok "nvidia-smi is the citespec wrapper and execs $NVIDIA_SMI_REAL"
+    elif [ -e "$NVIDIA_SMI" ] && [ "$real_installed" -eq 1 ]; then
+        fail "$NVIDIA_SMI is not the citespec wrapper while $NVIDIA_SMI_REAL exists"
+    elif [ -e "$NVIDIA_SMI" ]; then
+        warn "$NVIDIA_SMI is not wrapped yet; running it can reset /dev/nvidia* to 0666"
+    else
+        warn "$NVIDIA_SMI is missing"
+    fi
+    if [ "$real_installed" -eq 1 ]; then
+        local mode
+        mode=$(stat -c '%a' "$NVIDIA_SMI_REAL" 2>/dev/null || printf 'unknown')
+        if [ "$mode" = "unknown" ]; then
+            fail "could not read the mode of $NVIDIA_SMI_REAL"
+        elif mode_has_special_bits "$mode"; then
+            fail "$NVIDIA_SMI_REAL has setuid/setgid bits ($mode); members could create host GPU nodes"
+        else
+            ok "$NVIDIA_SMI_REAL has no setuid/setgid bits (mode $mode)"
+        fi
+    else
+        warn "$NVIDIA_SMI_REAL is not installed yet; the installer keeps the original helper here"
+    fi
+    if [ -r "$NVIDIA_SHIM" ]; then
+        ok "NVIDIA chmod shim is installed: $NVIDIA_SHIM"
+    elif [ "$real_installed" -eq 1 ]; then
+        fail "NVIDIA chmod shim is missing: $NVIDIA_SHIM"
+    else
+        warn "NVIDIA chmod shim is not installed yet: $NVIDIA_SHIM"
+    fi
+}
 
 effective_members() {
     local group=$1 gid user uid
@@ -28,13 +90,25 @@ effective_members() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -h|--help)
-            printf 'usage: %s [--config PATH]\n\nRead-only preflight for the citespec-resource host.\n' "$0"
+            cat <<'EOF'
+usage: preflight.sh [--config PATH] [--skip-nvidia]
+
+Read-only preflight for the citespec-resource host.
+
+  --config PATH   Inspect a deployment config for profile/quota checks.
+  --skip-nvidia   Do not invoke nvidia-smi (for hosts where querying the GPU
+                  would disturb running workloads). Static NVIDIA wrapper and
+                  device-file audits still run.
+EOF
             exit 0
             ;;
         --config)
             shift
             [ "$#" -gt 0 ] || { printf 'missing --config value\n' >&2; exit 2; }
             CONFIG_FILE=$1
+            ;;
+        --skip-nvidia)
+            SKIP_NVIDIA=1
             ;;
         *)
             printf 'unknown argument: %s\n' "$1" >&2
@@ -247,11 +321,27 @@ else
 fi
 
 section "nvidia"
-if have nvidia-smi; then
+audit_nvidia_helpers
+if [ "$SKIP_NVIDIA" -eq 1 ]; then
+    note "nvidia-smi query skipped (--skip-nvidia); compute-process and post-query device checks not run"
+elif have nvidia-smi; then
+    NVIDIA_DEVICES_BEFORE=$(nvidia_device_state)
     if nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv,noheader; then
         ok "nvidia-smi query succeeded"
     else
         fail "nvidia-smi query failed"
+    fi
+    NVIDIA_DEVICES_AFTER=$(nvidia_device_state)
+    if [ "$NVIDIA_DEVICES_BEFORE" != "$NVIDIA_DEVICES_AFTER" ]; then
+        if [ -e "$NVIDIA_SMI_REAL" ]; then
+            fail "nvidia-smi changed /dev/nvidia* mode/ownership despite the wrapper"
+        else
+            warn "running nvidia-smi changed /dev/nvidia* mode/ownership; install the wrapper before allowing members"
+        fi
+        printf '  before: %s\n' "${NVIDIA_DEVICES_BEFORE:-no devices}"
+        printf '  after:  %s\n' "${NVIDIA_DEVICES_AFTER:-no devices}"
+    else
+        ok "nvidia-smi did not change /dev/nvidia* mode/ownership"
     fi
     COMPUTE_APPS=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null)
     COMPUTE_QUERY=$?
@@ -306,7 +396,7 @@ if compgen -G '/dev/nvidia*' >/dev/null; then
         if [ "$MODE" = "660" ] && [ "$GROUP" = "citespec-gpu" ]; then
             ok "$device is 0660 and owned by group citespec-gpu"
         else
-            warn "$device mode/group is ${MODE:-unknown}/${GROUP:-unknown}; udev rule may not be installed"
+            warn "$device mode/group is ${MODE:-unknown}/${GROUP:-unknown}; existing device nodes are not at the member-safe 0660:citespec-gpu state"
         fi
     done
 else

@@ -393,6 +393,12 @@ systemctl start citespec-resource-broker citespec-resource-intake.service citesp
 bash deploy/verify_monitor_only.sh --member <member>
 ```
 
+维护窗口内的安装应加 `--no-timers`，先不启用磁盘告警、日志轮转和每日备份 timer；
+验收通过后再单独 enable。Portal/apply vhost 部署后运行只读的
+`bash deploy/verify_portal_network.sh --nginx-root /etc/nginx`，确认 vhost 没有
+wildcard `listen`、有 `allow <vpn-source-cidr>; ... deny all;`、且只反代到
+`127.0.0.1`。
+
 `install_server.sh` 是幂等安装器。真实修改必须显式提供 `--yes`；默认只安装、不
 启动，启动后强制使用 `monitor` 模式。安装器默认启用磁盘告警、日志轮转和每日
 状态备份 timer，可用 `--no-timers` 关闭。安装器会将严格审计脚本、GPU 权限验收脚本、root-owned
@@ -442,6 +448,15 @@ NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-
 `nvidia-uvm-tools`、`nvidia-modeset` 等可能位于 `misc` 子系统的节点。验收脚本会
 检查所有 `/dev/nvidia*` 节点、有效组成员关系、ACL，以及成员 UID 的实际读写和
 `nvidia-smi` 拒绝结果。
+
+`nvidia-smi` 以 root 运行时会把 `/dev/nvidia*` 重置为 `0666 root:root`。安装器因此
+保留真实 helper 为 `/usr/bin/nvidia-smi.real`（去掉 setuid/setgid），安装
+`/usr/bin/nvidia-smi` wrapper 和窄 LD_PRELOAD shim，使 wrapper 调用真实 helper 时
+不再修改节点权限。`preflight.sh` 会在调用 `nvidia-smi` 前后比较每个节点的
+mode/owner：未安装 wrapper 时探测本身可能改权限，因此只报告 warning；wrapper 已
+安装却仍发生变化则报告 failure。若维护窗口内完全不能触碰 GPU 状态，使用
+`--skip-nvidia`；它会同时跳过 compute process 查询，其余静态 wrapper/设备审计仍
+执行。
 
 预算拆分为 `global_max_cpus` / `global_max_memory_gb`、每分配上限
 `max_cpus_per_allocation` / `max_memory_gb_per_allocation`、每用户上限

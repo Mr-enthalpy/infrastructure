@@ -14,6 +14,7 @@ SCRIPTS = [
     "create_user.sh",
     "verify_gpu_permissions.sh",
     "verify_monitor_only.sh",
+    "verify_portal_network.sh",
     "check_disk.sh",
     "configure_quotas.sh",
     "alert.sh",
@@ -92,6 +93,129 @@ def test_install_server_dry_run_does_not_require_root():
     )
     assert result.returncode == 0, result.stderr
     assert "[dry-run]" in result.stdout
+
+
+def test_preflight_reports_nvidia_side_effects_and_wrapper_integrity():
+    source = (ROOT / "deploy" / "preflight.sh").read_text(encoding="utf-8")
+    assert "--skip-nvidia" in source
+    assert "SKIP_NVIDIA=1" in source
+    assert "nvidia_device_state" in source
+    assert "NVIDIA_DEVICES_BEFORE" in source and "NVIDIA_DEVICES_AFTER" in source
+    assert "nvidia-smi did not change /dev/nvidia* mode/ownership" in source
+    assert "grep -Iq -- 'exec /usr/bin/nvidia-smi.real'" in source
+    assert "mode_has_special_bits" in source
+    assert "NVIDIA_SMI_REAL has setuid/setgid bits" in source
+    assert "NVIDIA chmod shim" in source
+
+
+def test_nginx_examples_restrict_sources_and_bind_private_addresses():
+    for name, port in (("portal", 8770), ("apply", 8765)):
+        source = (ROOT / "deploy" / "nginx" / f"citespec-{name}.conf.example").read_text(
+            encoding="utf-8"
+        )
+        assert "listen <host-private-ip>:443 ssl;" in source
+        assert "allow <vpn-source-cidr>;" in source
+        assert "deny all;" in source
+        assert f"proxy_pass http://127.0.0.1:{port};" in source
+        assert "X-Citespec-Client-IP $remote_addr;" in source
+        assert "listen 0.0.0.0" not in source
+        assert "listen [::]" not in source
+        assert source.index("allow <vpn-source-cidr>;") < source.index("deny all;")
+
+
+PORTAL_VHOST_GOOD = """server {
+    listen 10.20.30.40:443 ssl;
+    server_name citespec-portal.lab.example;
+    allow 10.20.0.0/16;
+    deny all;
+    location / {
+        proxy_pass http://127.0.0.1:8770;
+        proxy_set_header X-Citespec-Client-IP $remote_addr;
+    }
+}
+"""
+
+PORTAL_VHOST_WILDCARD = """server {
+    listen 0.0.0.0:443 ssl;
+    server_name citespec-portal.lab.example;
+    location / {
+        proxy_pass http://127.0.0.1:8770;
+        proxy_set_header X-Citespec-Client-IP $http_x_citespec_client_ip;
+    }
+}
+"""
+
+STUB_SS_WILDCARD = """#!/usr/bin/env bash
+cat <<'EOF'
+State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+LISTEN 0 4096 0.0.0.0:8770 0.0.0.0:*
+EOF
+"""
+
+
+def _portal_network_env(tmp_path, wildcard):
+    root = tmp_path / "nginx"
+    root.mkdir()
+    (root / "portal.conf").write_text(
+        PORTAL_VHOST_WILDCARD if wildcard else PORTAL_VHOST_GOOD,
+        encoding="utf-8",
+    )
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    ss = stub / "ss"
+    ss.write_text(
+        STUB_SS_WILDCARD if wildcard else "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+    )
+    ss.chmod(0o755)
+    systemctl = stub / "systemctl"
+    systemctl.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    systemctl.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+    }
+
+
+def test_verify_portal_network_accepts_a_private_restricted_vhost(tmp_path):
+    env = _portal_network_env(tmp_path, wildcard=False)
+    result = subprocess.run(
+        [
+            BASH,
+            str(ROOT / "deploy" / "verify_portal_network.sh"),
+            "--nginx-root",
+            str(tmp_path / "nginx"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "binds a specific address" in result.stdout
+    assert "allow rule(s) followed by deny all" in result.stdout
+    assert "portal network audit passed" in result.stdout
+
+
+def test_verify_portal_network_rejects_wildcard_and_missing_allow(tmp_path):
+    env = _portal_network_env(tmp_path, wildcard=True)
+    result = subprocess.run(
+        [
+            BASH,
+            str(ROOT / "deploy" / "verify_portal_network.sh"),
+            "--nginx-root",
+            str(tmp_path / "nginx"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "binds a wildcard address" in output
+    assert "must restrict sources" in output
+    assert "exposed beyond loopback" in output
+    assert "client-supplied X-Citespec-Client-IP" in output
 
 
 def test_installer_has_transactional_backup_and_rollback():

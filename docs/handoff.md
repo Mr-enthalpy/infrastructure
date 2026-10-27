@@ -393,6 +393,7 @@ git log --oneline -5
 bash -n deploy/preflight.sh
 bash -n deploy/install_server.sh
 bash -n deploy/verify_monitor_only.sh
+bash -n deploy/verify_portal_network.sh
 ```
 
 ### 步骤 3：变更前确认
@@ -414,8 +415,13 @@ bash -n deploy/verify_monitor_only.sh
 bash deploy/preflight.sh --config lab/resources.local.toml
 bash deploy/audit_legacy.sh --production
 bash deploy/verify_gpu_permissions.sh --json
+bash deploy/verify_portal_network.sh --nginx-root /etc/nginx
 bash deploy/verify_monitor_only.sh --member <member> --skip-snapshot
 ```
+
+`verify_portal_network.sh` 只读：检查 Portal/apply vhost 是否绑定具体私有地址、是否
+有 `allow <vpn-source-cidr>; ... deny all;`、是否只反代 loopback，以及 Portal
+unit/监听器的当前状态。Portal vhost 尚未部署时它会报告 warning，不会失败。
 
 同时保存：
 
@@ -427,8 +433,12 @@ systemctl show citespec-resource-broker \
 xfs_quota -x -c 'report -p -b -h' /data1
 ```
 
-上述命令均为只读。若 `preflight.sh`、GPU 审计、`nosuid` 或配额检查失败，停止，
-不得继续安装或切换到 active。
+上述命令除 `nvidia-smi` 探测外均为只读。`preflight.sh` 以 root 调用 `nvidia-smi`
+前后比较 `/dev/nvidia*` 的 mode/owner：未安装 wrapper 时该探测本身可能把节点重置为
+`0666 root:root`，因此只报告 warning；wrapper 已安装却仍变化则报告 failure。若维护
+窗口内不能触碰 GPU 状态，改用 `preflight.sh --skip-nvidia`（会同时跳过 compute
+process 查询），并在另一时刻单独确认没有训练进程。若 `preflight.sh`、GPU 审计、
+`nosuid` 或配额检查失败，停止，不得继续安装或切换到 active。
 
 ### 步骤 5：完整验收
 

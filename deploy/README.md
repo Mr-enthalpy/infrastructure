@@ -62,7 +62,23 @@ bash deploy/audit_legacy.sh --production
 groups, cgroup configuration, disk capacity, `/dev/nvidia*` permissions, and the
 development-profile storage requirements. `audit_legacy.sh` inventories legacy
 root, sudo, SSH, Docker, GPU, and privileged-container access. Both scripts are
-read-only.
+read-only except for one NVIDIA detail: `preflight.sh` invokes `nvidia-smi`,
+which as root resets `/dev/nvidia*` to `0666 root:root` unless the Citespec
+wrapper is installed. The script records device mode/owner before and after the
+probe, warns on an unwrapped host, and fails if the wrapper is installed but the
+probe still changes the devices. Pass `--skip-nvidia` when a maintenance window
+must not touch GPU state; this also skips the compute-process query.
+
+After installing a Portal/apply vhost, run the read-only network audit:
+
+```bash
+bash deploy/verify_portal_network.sh --nginx-root /etc/nginx
+```
+
+It fails on a wildcard `listen` address, a vhost without
+`allow <vpn-source-cidr>; ... deny all;`, a non-loopback upstream, or a
+client-supplied `X-Citespec-Client-IP`. It warns when the vhosts or Portal unit
+are not installed yet.
 
 The GPU permission gate also requires `stat`, `su`, `getent`, `udevadm`, and
 `getfacl` (provided by the `acl` package). `preflight.sh` must fail if any of
@@ -233,7 +249,9 @@ these tools is unavailable.
    campus/VPN listener. Example vhosts live in `deploy/nginx/` — they are not
    installed automatically and contain no certificate, DNS, or firewall changes.
    Confirm the certificate covers the chosen names and that nginx overwrites
-   `X-Citespec-Client-IP` with `$remote_addr`. Then, after a local activation and
+   `X-Citespec-Client-IP` with `$remote_addr`, then run
+   `bash deploy/verify_portal_network.sh --nginx-root /etc/nginx` and require a
+   zero exit before exposing the vhost. Then, after a local activation and
    admin review test:
 
    ```bash
@@ -354,6 +372,8 @@ container must not mount the host Docker socket.
 - `verify_gpu_permissions.sh`: read-only GPU/NVIDIA device permission
   verification; supports `--json` and no-member mode.
 - `verify_monitor_only.sh`: read-only monitor-only security acceptance.
+- `verify_portal_network.sh`: read-only nginx/Portal listener, allow/deny, and
+  loopback-upstream audit.
 - `check_disk.sh`: workspace free-space alert; exits 0, 1, or 2.
 - `configure_quotas.sh`: XFS/ext4 project quota setup; dry-run by default.
 - `rotate_job_logs.py`: symlink-safe job-log rotation.
@@ -374,7 +394,9 @@ container must not mount the host Docker socket.
 - `systemd/citespec-resource-portal.service`: unprivileged VPN-only membership
   portal; binds loopback and may use only the broker's narrow portal commands.
 - `nginx/citespec-portal.conf.example` and `nginx/citespec-apply.conf.example`:
-  example VPN-only vhosts; certificates, DNS, and firewall rules are external.
+  example VPN-only vhosts with a private `listen` address,
+  `allow <vpn-source-cidr>; ... deny all;`, and a loopback upstream;
+  certificates, DNS, and firewall rules are external.
 - `systemd/citespec-resource-provision.service` and `.path`: root executor triggered
   by fixed JSON requests in the provisioning spool.
 - `udev/99-citespec-gpu.rules`: NVIDIA device-node ownership rule.

@@ -58,8 +58,12 @@ Before starting, verify the read-only prerequisites in
 
 ## 3. Read-only prerequisites
 
-The following checks must pass before authorizing active mode. They do not
-modify host state and must be retained as evidence:
+The following checks must pass before authorizing active mode. They must be
+retained as evidence. They are read-only except that `preflight.sh` invokes
+`nvidia-smi`; on an unwrapped host that probe can reset `/dev/nvidia*` to
+`0666 root:root`. The script compares device mode/owner before and after and
+reports it, and `--skip-nvidia` avoids the probe entirely (at the cost of the
+compute-process query).
 
 - `preflight.sh --config <config>` reports the selected container profile as
   valid.
@@ -72,6 +76,10 @@ modify host state and must be retained as evidence:
   be honored by the host.
 - The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`
   are installed.
+- If a Portal/apply vhost is installed, `verify_portal_network.sh` reports a
+  specific private `listen` address, `allow <vpn-source-cidr>; ... deny all;`,
+  and a loopback-only upstream. A wildcard listener or missing allow rule is a
+  blocking failure.
 - After `configure_quotas.sh`, or after adding a member, confirm that the test
   member's workspace has the configured project hard limit. Use
   `xfs_quota -x -c 'report -p -b -h' <mount>` on XFS or
