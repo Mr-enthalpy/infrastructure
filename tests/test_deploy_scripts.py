@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -103,6 +104,169 @@ def test_installer_has_transactional_backup_and_rollback():
     assert "sshd" in source and "-t" in source
     assert "STATE_DB_BACKUP" in source and "source.backup" in source
     assert "udevadm verify" in source
+    # Rollback restores unit/timer enablement and active state, records the
+    # NVIDIA wrappers, and runs on an interrupting signal too.
+    assert "capture_unit_state" in source
+    assert "restore_unit_state" in source
+    assert "disable_new_units" in source
+    assert "record_nvidia_state" in source
+    assert "verify_nvidia_state" in source
+    assert "trap 'on_signal 129' HUP" in source
+    assert "trap 'on_signal 130' INT" in source
+    assert "trap 'on_signal 143' TERM" in source
+
+
+STUB_SYSTEMCTL = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$STUB_LOG"
+cmd=$1
+shift
+case "$cmd" in
+    is-active)
+        unit=${!#}
+        grep -Fxq "$unit" "$STUB_ACTIVE" && exit 0
+        exit 3
+        ;;
+    is-enabled)
+        unit=${!#}
+        grep -Fxq "$unit" "$STUB_ENABLED" && exit 0
+        exit 1
+        ;;
+    stop)
+        unit=${!#}
+        grep -Fxv "$unit" "$STUB_ACTIVE" > "$STUB_ACTIVE.tmp" || true
+        mv "$STUB_ACTIVE.tmp" "$STUB_ACTIVE"
+        ;;
+    start)
+        unit=${!#}
+        grep -Fxq "$unit" "$STUB_ACTIVE" || printf '%s\\n' "$unit" >> "$STUB_ACTIVE"
+        ;;
+    enable)
+        unit=${!#}
+        grep -Fxq "$unit" "$STUB_ENABLED" || printf '%s\\n' "$unit" >> "$STUB_ENABLED"
+        ;;
+    disable)
+        unit=${!#}
+        grep -Fxv "$unit" "$STUB_ENABLED" > "$STUB_ENABLED.tmp" || true
+        mv "$STUB_ENABLED.tmp" "$STUB_ENABLED"
+        ;;
+esac
+exit 0
+"""
+
+ROLLBACK_DRIVER = """set -u
+source "$INSTALLER"
+DRY_RUN=0
+INSTALL_COMPLETE=0
+ROLLBACK_ARMED=1
+BACKUP_DIR="$TMP/backup"
+mkdir -p "$BACKUP_DIR"
+UNIT_NAMES=(unit-a.service unit-b.service)
+UNIT_STOP_ORDER=(unit-b.service unit-a.service)
+TIMER_NAMES=(timer-a.timer timer-b.timer)
+printf 'unit-a.service\\ntimer-a.timer\\n' > "$STUB_ACTIVE"
+printf 'unit-a.service\\ntimer-a.timer\\n' > "$STUB_ENABLED"
+capture_unit_state
+# The installer then enabled and started its own units and timers.
+printf 'unit-a.service\\nunit-b.service\\ntimer-a.timer\\ntimer-b.timer\\n' > "$STUB_ACTIVE"
+printf 'unit-a.service\\nunit-b.service\\ntimer-a.timer\\ntimer-b.timer\\n' > "$STUB_ENABLED"
+
+UNIT_FILE="$TMP/etc/systemd/system/unit-b.service"
+mkdir -p "$(dirname "$UNIT_FILE")"
+backup_file "$UNIT_FILE"
+printf '[Unit]\\nDescription=installed\\n' > "$UNIT_FILE"
+
+NVIDIA_PATHS=("$TMP/usr/bin/nvidia-smi" "$TMP/usr/bin/nvidia-smi.real")
+NVIDIA_STATE_FILE="$BACKUP_DIR/nvidia-state.tsv"
+mkdir -p "$TMP/usr/bin"
+printf '#!/bin/sh\\necho real\\n' > "$TMP/usr/bin/nvidia-smi"
+chmod 0755 "$TMP/usr/bin/nvidia-smi"
+record_nvidia_state
+backup_file "$TMP/usr/bin/nvidia-smi"
+backup_file "$TMP/usr/bin/nvidia-smi.real"
+mv "$TMP/usr/bin/nvidia-smi" "$TMP/usr/bin/nvidia-smi.real"
+printf '#!/bin/sh\\necho wrapper\\n' > "$TMP/usr/bin/nvidia-smi"
+chmod 0755 "$TMP/usr/bin/nvidia-smi"
+if [ "${TAMPER_BACKUP:-0}" = "1" ]; then
+    printf 'tampered\\n' > "$BACKUP_DIR${TMP}/usr/bin/nvidia-smi"
+fi
+rollback 1
+"""
+
+
+def _rollback_env(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    systemctl = stub / "systemctl"
+    systemctl.write_text(STUB_SYSTEMCTL, encoding="utf-8")
+    systemctl.chmod(0o755)
+    udevadm = stub / "udevadm"
+    udevadm.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    udevadm.chmod(0o755)
+    log = tmp_path / "systemctl.log"
+    env = {
+        **os.environ,
+        "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+        "STUB_LOG": str(log),
+        "STUB_ACTIVE": str(tmp_path / "active"),
+        "STUB_ENABLED": str(tmp_path / "enabled"),
+        "TMP": str(tmp_path),
+        "INSTALLER": str(ROOT / "deploy" / "install_server.sh"),
+        "CITESPEC_INSTALL_LIB_ONLY": "1",
+    }
+    return env, log
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="stub-based installer rollback uses POSIX stat/cp semantics",
+)
+def test_installer_rollback_restores_units_timers_and_nvidia_state(tmp_path):
+    env, log = _rollback_env(tmp_path)
+    driver = tmp_path / "rollback.sh"
+    driver.write_text(ROLLBACK_DRIVER, encoding="utf-8")
+    result = subprocess.run(
+        [BASH, str(driver)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 1, result.stderr
+    nvidia = tmp_path / "usr/bin/nvidia-smi"
+    assert nvidia.read_text(encoding="utf-8") == "#!/bin/sh\necho real\n"
+    assert not (tmp_path / "usr/bin/nvidia-smi.real").exists()
+    assert not (tmp_path / "etc/systemd/system/unit-b.service").exists()
+    assert "rollback mismatch" not in result.stderr + result.stdout
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert lines.index("stop timer-b.timer") < lines.index("stop unit-b.service")
+    assert "disable unit-b.service" in lines
+    assert "disable timer-b.timer" in lines
+    assert "daemon-reload" in lines
+    assert "start unit-a.service" in lines
+    assert "start timer-a.timer" in lines
+    assert "start unit-b.service" not in lines
+    assert "start timer-b.timer" not in lines
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="stub-based installer rollback uses POSIX stat/cp semantics",
+)
+def test_installer_rollback_reports_nvidia_state_mismatch(tmp_path):
+    env, _ = _rollback_env(tmp_path)
+    env["TAMPER_BACKUP"] = "1"
+    driver = tmp_path / "rollback-tampered.sh"
+    driver.write_text(ROLLBACK_DRIVER, encoding="utf-8")
+    result = subprocess.run(
+        [BASH, str(driver)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 1
+    assert "rollback mismatch" in result.stdout + result.stderr
+    assert "state mismatches" in result.stdout + result.stderr
 
 
 def test_preflight_fails_active_mode_when_gpu_compute_is_busy():

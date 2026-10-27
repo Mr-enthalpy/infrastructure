@@ -80,13 +80,47 @@ BACKUP_ROOT=/var/backups/citespec-resource
 BACKUP_DIR=""
 ROLLBACK_ARMED=0
 INSTALL_COMPLETE=0
-BROKER_WAS_ACTIVE=0
-BROKER_WAS_ENABLED=0
-BROKER_START_ATTEMPTED=0
 BACKED_UP=()
 STATE_DB=""
 STATE_DB_BACKUP=""
 STATE_DB_EXISTED=0
+# Unit/timer state recorded before the installer touches anything.  Rollback
+# restores both enablement and active state, not just the broker.
+UNIT_NAMES=(
+    citespec-resource-provision.path
+    citespec-resource-provision.service
+    citespec-resource-intake.service
+    citespec-resource-broker.service
+    citespec-gpu-permissions.service
+    citespec-resource-portal.service
+)
+# Stop public entry points before the executor spool; timers are stopped first
+# so nothing is triggered while the rollback is restoring unit files.
+UNIT_STOP_ORDER=(
+    citespec-resource-broker.service
+    citespec-resource-portal.service
+    citespec-resource-intake.service
+    citespec-resource-provision.path
+    citespec-resource-provision.service
+    citespec-gpu-permissions.service
+)
+TIMER_NAMES=(
+    citespec-resource-logrotate.timer
+    citespec-resource-disk-check.timer
+    citespec-resource-backup.timer
+)
+UNIT_WAS_ACTIVE=()
+UNIT_WAS_ENABLED=()
+TIMER_WAS_ACTIVE=()
+TIMER_WAS_ENABLED=()
+NVIDIA_PATHS=(
+    /usr/bin/nvidia-smi
+    /usr/bin/nvidia-smi.real
+    /usr/bin/nvidia-modprobe
+    /usr/bin/nvidia-modprobe.real
+)
+NVIDIA_STATE_FILE=""
+ROLLBACK_MISMATCH=0
 
 usage() {
     cat <<'EOF'
@@ -118,6 +152,178 @@ warn() { printf '[warn] %s\n' "$1"; }
 note() { printf '[info] %s\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+contains() {
+    local needle=$1
+    shift
+    local item
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+unit_is_active() {
+    systemctl is-active --quiet "$1" >/dev/null 2>&1
+}
+
+unit_is_enabled() {
+    systemctl is-enabled --quiet "$1" >/dev/null 2>&1
+}
+
+# Record the state rollback must return to before the first host change.  An
+# installer that only restores files leaves newly enabled or newly started
+# units behind; capture both axes for every unit and timer it manages.
+capture_unit_state() {
+    local unit
+    UNIT_WAS_ACTIVE=()
+    UNIT_WAS_ENABLED=()
+    TIMER_WAS_ACTIVE=()
+    TIMER_WAS_ENABLED=()
+    for unit in "${UNIT_NAMES[@]}"; do
+        if unit_is_active "$unit"; then
+            UNIT_WAS_ACTIVE+=("$unit")
+        fi
+        if unit_is_enabled "$unit"; then
+            UNIT_WAS_ENABLED+=("$unit")
+        fi
+    done
+    for unit in "${TIMER_NAMES[@]}"; do
+        if unit_is_active "$unit"; then
+            TIMER_WAS_ACTIVE+=("$unit")
+        fi
+        if unit_is_enabled "$unit"; then
+            TIMER_WAS_ENABLED+=("$unit")
+        fi
+    done
+}
+
+stop_managed_units() {
+    local unit
+    for unit in "${TIMER_NAMES[@]}"; do
+        if unit_is_active "$unit"; then
+            systemctl stop "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not stop $unit"
+        fi
+    done
+    for unit in "${UNIT_STOP_ORDER[@]}"; do
+        if unit_is_active "$unit"; then
+            systemctl stop "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not stop $unit"
+        fi
+    done
+}
+
+# Remove enablement that the installer added while the new unit files still
+# exist; otherwise daemon-reload leaves dangling .wants symlinks behind.
+disable_new_units() {
+    local unit
+    for unit in "${UNIT_NAMES[@]}"; do
+        if ! contains "$unit" "${UNIT_WAS_ENABLED[@]}" && unit_is_enabled "$unit"; then
+            systemctl disable "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not remove enablement for $unit"
+        fi
+    done
+    for unit in "${TIMER_NAMES[@]}"; do
+        if ! contains "$unit" "${TIMER_WAS_ENABLED[@]}" && unit_is_enabled "$unit"; then
+            systemctl disable "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not remove enablement for $unit"
+        fi
+    done
+}
+
+# Start/enable exactly the units that were active/enabled before the installer
+# ran.  Called after daemon-reload restores the old unit files, so a
+# pre-existing unit gets its old ExecStart back.
+restore_unit_state() {
+    local unit
+    for unit in "${UNIT_NAMES[@]}"; do
+        if contains "$unit" "${UNIT_WAS_ENABLED[@]}"; then
+            if ! unit_is_enabled "$unit"; then
+                systemctl enable "$unit" >/dev/null 2>&1 \
+                    || warn "rollback could not re-enable $unit"
+            fi
+        fi
+    done
+    for unit in "${TIMER_NAMES[@]}"; do
+        if contains "$unit" "${TIMER_WAS_ENABLED[@]}"; then
+            if ! unit_is_enabled "$unit"; then
+                systemctl enable "$unit" >/dev/null 2>&1 \
+                    || warn "rollback could not re-enable $unit"
+            fi
+        fi
+    done
+    for unit in "${UNIT_WAS_ACTIVE[@]}"; do
+        systemctl start "$unit" >/dev/null 2>&1 \
+            || warn "rollback could not restart $unit"
+    done
+    for unit in "${TIMER_WAS_ACTIVE[@]}"; do
+        systemctl start "$unit" >/dev/null 2>&1 \
+            || warn "rollback could not restart $unit"
+    done
+}
+
+sha256_file() {
+    if have sha256sum; then
+        sha256sum -- "$1" 2>/dev/null | awk '{print $1}'
+    elif have shasum; then
+        shasum -a 256 -- "$1" 2>/dev/null | awk '{print $1}'
+    else
+        printf 'unavailable\n'
+    fi
+}
+
+# Capture every NVIDIA helper path, including the ".real" targets the installer
+# may create.  Mode %a keeps setuid/setgid bits, and the digest catches a
+# restore that silently replaced the original binary.
+record_nvidia_state() {
+    local path
+    [ -n "${NVIDIA_STATE_FILE:-}" ] || return 0
+    : > "$NVIDIA_STATE_FILE" || fail "could not create NVIDIA state record"
+    for path in "${NVIDIA_PATHS[@]}"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            printf '%s\texists\t%s\t%s\t%s\n' \
+                "$path" \
+                "$(stat -c '%a' "$path" 2>/dev/null || printf '?')" \
+                "$(stat -c '%u:%g' "$path" 2>/dev/null || printf '?')" \
+                "$(sha256_file "$path")" >> "$NVIDIA_STATE_FILE"
+        else
+            printf '%s\tabsent\t-\t-\t-\n' "$path" >> "$NVIDIA_STATE_FILE"
+        fi
+    done
+}
+
+verify_nvidia_state() {
+    local path expected mode owner digest current_mode current_owner current_digest
+    [ -n "${NVIDIA_STATE_FILE:-}" ] || return 0
+    [ -f "$NVIDIA_STATE_FILE" ] || return 0
+    while IFS=$'\t' read -r path expected mode owner digest; do
+        [ -n "$path" ] || continue
+        if [ "$expected" = "absent" ]; then
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                warn "rollback mismatch: $path should not exist"
+                ROLLBACK_MISMATCH=1
+            fi
+            continue
+        fi
+        if [ ! -e "$path" ]; then
+            warn "rollback mismatch: $path is missing"
+            ROLLBACK_MISMATCH=1
+            continue
+        fi
+        current_mode=$(stat -c '%a' "$path" 2>/dev/null || printf '?')
+        current_owner=$(stat -c '%u:%g' "$path" 2>/dev/null || printf '?')
+        current_digest=$(sha256_file "$path")
+        if [ "$current_mode" != "$mode" ] || [ "$current_owner" != "$owner" ]; then
+            warn "rollback mismatch: $path is $current_owner $current_mode, expected $owner $mode"
+            ROLLBACK_MISMATCH=1
+        fi
+        if [ "$digest" != "unavailable" ] && [ "$current_digest" != "$digest" ]; then
+            warn "rollback mismatch: $path content differs from the pre-install binary"
+            ROLLBACK_MISMATCH=1
+        fi
+    done < "$NVIDIA_STATE_FILE"
+}
 
 # List human members whose effective group set includes GROUP.  Supplementary
 # group lists omit users whose primary group is the target group, so always ask
@@ -197,14 +403,16 @@ rollback() {
     local code=${1:-$?}
     local path
     local rel
+    local broker_active=0
     if [ "$INSTALL_COMPLETE" -eq 1 ] || [ "$ROLLBACK_ARMED" -eq 0 ]; then
         return "$code"
     fi
-    trap - EXIT
-    printf '\n[rollback] installation failed (exit %s); restoring previous files\n' "$code" >&2
-    if [ "$BROKER_START_ATTEMPTED" -eq 1 ]; then
-        systemctl stop citespec-resource-broker.service 2>/dev/null || true
-    fi
+    trap - EXIT INT TERM HUP
+    printf '\n[rollback] installation failed (exit %s); restoring previous state\n' "$code" >&2
+    # Timers first, then every service this installer may have started.  Without
+    # this a newly enabled timer/service keeps running against restored files.
+    stop_managed_units
+    disable_new_units
     for path in "${BACKED_UP[@]}"; do
         rel=${path#/}
         if [ -f "$BACKUP_DIR/$rel.absent" ]; then
@@ -214,11 +422,10 @@ rollback() {
             cp -a -- "$BACKUP_DIR/$rel" "$path" || true
         fi
     done
-    BROKER_ACTIVE_NOW=0
-    if systemctl is-active --quiet citespec-resource-broker.service 2>/dev/null; then
-        BROKER_ACTIVE_NOW=1
+    if unit_is_active citespec-resource-broker.service; then
+        broker_active=1
     fi
-    if [ -n "$STATE_DB" ] && [ "$BROKER_ACTIVE_NOW" -eq 0 ]; then
+    if [ -n "$STATE_DB" ] && [ "$broker_active" -eq 0 ]; then
         if [ "$STATE_DB_EXISTED" -eq 1 ] && [ -f "$STATE_DB_BACKUP" ]; then
             rm -f -- "$STATE_DB-wal" "$STATE_DB-shm" || true
             cp -a -- "$STATE_DB_BACKUP" "$STATE_DB" || true
@@ -228,15 +435,14 @@ rollback() {
     elif [ -n "$STATE_DB" ]; then
         warn "broker is still running; leaving SQLite state in place during rollback"
     fi
-    systemctl daemon-reload 2>/dev/null || true
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --action=change --sysname-match='nvidia*' 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    restore_unit_state
+    verify_nvidia_state
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --action=change --sysname-match='nvidia*' >/dev/null 2>&1 || true
     reload_sshd
-    if [ "$BROKER_WAS_ENABLED" -eq 0 ]; then
-        systemctl disable citespec-resource-broker.service 2>/dev/null || true
-    fi
-    if [ "$START" -eq 1 ] && [ "$BROKER_WAS_ACTIVE" -eq 1 ]; then
-        systemctl restart citespec-resource-broker.service 2>/dev/null || true
+    if [ "$ROLLBACK_MISMATCH" -ne 0 ]; then
+        warn "rollback completed with state mismatches; inspect $BACKUP_DIR before retrying"
     fi
     printf '[rollback] restored %s path(s); backup: %s\n' "${#BACKED_UP[@]}" "$BACKUP_DIR" >&2
     exit "$code"
@@ -249,6 +455,22 @@ on_exit() {
     fi
     exit "$code"
 }
+
+# An interrupted installer must roll back just like a failed command: TERM/INT/
+# HUP arrive during package sync or unit replacement, not only as a command
+# failure.  128+signal preserves the conventional exit status.
+on_signal() {
+    local code=$1
+    trap - INT TERM HUP
+    rollback "$code"
+    exit "$code"
+}
+
+# Test hook: source this file with CITESPEC_INSTALL_LIB_ONLY=1 to exercise the
+# rollback helpers without touching the host.  Real runs continue below.
+if [ "${CITESPEC_INSTALL_LIB_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -372,20 +594,21 @@ if [ "$CONFIG_DEPLOYMENT_ALLOWED" = "true" ] && [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    if systemctl is-active --quiet citespec-resource-broker.service 2>/dev/null; then
-        BROKER_WAS_ACTIVE=1
-    fi
-    if systemctl is-enabled --quiet citespec-resource-broker.service 2>/dev/null; then
-        BROKER_WAS_ENABLED=1
-    fi
     install -d -o root -g root -m 0700 "$BACKUP_ROOT" \
         || fail "could not secure backup root: $BACKUP_ROOT"
     BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
     mkdir -p "$BACKUP_DIR" || fail "could not create backup directory: $BACKUP_DIR"
     chmod 0700 "$BACKUP_DIR" || fail "could not secure backup directory: $BACKUP_DIR"
+    capture_unit_state
+    NVIDIA_STATE_FILE="$BACKUP_DIR/nvidia-state.tsv"
+    record_nvidia_state
     ROLLBACK_ARMED=1
     trap on_exit EXIT
+    trap 'on_signal 129' HUP
+    trap 'on_signal 130' INT
+    trap 'on_signal 143' TERM
     note "transactional backup: $BACKUP_DIR"
+    note "unit rollback state: ${UNIT_WAS_ACTIVE[*]:-none active}; ${UNIT_WAS_ENABLED[*]:-none enabled}"
 else
     note "dry-run: no rollback backup is created"
 fi
@@ -509,6 +732,12 @@ ok "GPU device permission fixer installed: $GPU_FIX_INSTALL"
 # setuid/setgid bits are removed because members must not create host nodes.
 run install -d -o root -g root -m 0755 "$GPU_SHIM_DIR"
 install_file 0644 "$SCRIPT_DIR/nvidia/citespec_nvidia_chmod_shim.c" "$GPU_SHIM_SRC"
+if [ "$DRY_RUN" -eq 0 ]; then
+    # Record the .real targets before the move so rollback removes one that did
+    # not exist before, or restores the exact binary that did.
+    backup_file "$NVIDIA_SMI_REAL"
+    backup_file "$NVIDIA_MODPROBE_REAL"
+fi
 if [ "$DRY_RUN" -eq 0 ]; then
     CC_BIN=$(command -v gcc 2>/dev/null || command -v cc 2>/dev/null || true)
     [ -n "$CC_BIN" ] || fail "gcc or cc is required to build the NVIDIA chmod shim"
@@ -686,6 +915,8 @@ else
         || fail "could not read onboarding.intake_db from config"
     run install -d -o "$INTAKE_USER" -g "$INTAKE_USER" -m 0700 "$(dirname "$INTAKE_DB")"
     backup_file "$INTAKE_DB"
+    backup_file "$INTAKE_DB-wal"
+    backup_file "$INTAKE_DB-shm"
     (umask 077; "$VENV/bin/python" - "$INTAKE_DB" <<'PY'
 import sys
 
@@ -711,6 +942,8 @@ PY
         || fail "could not read portal.db_path from config"
     run install -d -o "$PORTAL_USER" -g "$PORTAL_USER" -m 0750 "$(dirname "$PORTAL_DB")"
     backup_file "$PORTAL_DB"
+    backup_file "$PORTAL_DB-wal"
+    backup_file "$PORTAL_DB-shm"
     (umask 077; "$VENV/bin/python" - "$PORTAL_DB" <<'PY'
 import sys
 
@@ -941,7 +1174,6 @@ if [ "$START" -eq 1 ] && [ "$AUDIT_FAILED" -eq 1 ]; then
     fail "legacy audit failed; resolve critical findings before starting the broker"
 fi
 if [ "$START" -eq 1 ]; then
-    BROKER_START_ATTEMPTED=1
     run systemctl restart citespec-resource-broker.service
     run systemctl restart citespec-resource-intake.service
     run systemctl restart citespec-resource-provision.path
