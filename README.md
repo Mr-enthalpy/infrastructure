@@ -455,8 +455,8 @@ NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-
 
 `nvidia-smi` 以 root 运行时会把 `/dev/nvidia*` 重置为 `0666 root:root`。安装器因此
 保留真实 helper 为 `/usr/bin/nvidia-smi.real`（去掉 setuid/setgid），安装
-`/usr/bin/nvidia-smi` wrapper 和窄 LD_PRELOAD shim，使 wrapper 调用真实 helper 时
-不再修改节点权限。`preflight.sh` 会在调用 `nvidia-smi` 前后比较每个节点的
+`/usr/bin/nvidia-smi` wrapper、`/usr/bin/nvidia-modprobe` wrapper 和窄 LD_PRELOAD
+shim，使 wrapper 调用真实 helper 时不再修改节点权限。`preflight.sh` 会在调用 `nvidia-smi` 前后比较每个节点的
 mode/owner：未安装 wrapper 时探测本身可能改权限，因此只报告 warning；wrapper 已
 安装却仍发生变化则报告 failure。若维护窗口内完全不能触碰 GPU 状态，使用
 `--skip-nvidia`；它会同时跳过 compute process 查询，其余静态 wrapper/设备审计仍

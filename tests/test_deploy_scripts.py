@@ -102,9 +102,12 @@ def test_preflight_reports_nvidia_side_effects_and_wrapper_integrity():
     assert "nvidia_device_state" in source
     assert "NVIDIA_DEVICES_BEFORE" in source and "NVIDIA_DEVICES_AFTER" in source
     assert "nvidia-smi did not change /dev/nvidia* mode/ownership" in source
-    assert "grep -Iq -- 'exec /usr/bin/nvidia-smi.real'" in source
+    assert "audit_wrapped_helper" in source
+    assert "exec /usr/bin/nvidia-smi.real" in source
+    assert "nvidia-modprobe.real" in source
+    assert "NVIDIA_MODPROBE_REAL" in source
     assert "mode_has_special_bits" in source
-    assert "NVIDIA_SMI_REAL has setuid/setgid bits" in source
+    assert "has setuid/setgid bits" in source
     assert "NVIDIA chmod shim" in source
 
 

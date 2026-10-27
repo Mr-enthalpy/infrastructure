@@ -158,16 +158,16 @@ wrapper 恢复且 `.real` 被移除，以及备份被篡改时报告 mismatch。
 
 - root 运行 `nvidia-smi` 会把 `/dev/nvidia*` 重置为 `0666 root:root`；旧 preflight
   在调用前检查权限，可能把探测后的状态误报为安全。
-- preflight 未验证 `/usr/bin/nvidia-smi` 是否仍是 Citespec wrapper、`.real` 是否
-  存在且无 setuid/setgid、shim 是否安装。
+- preflight 未验证 `/usr/bin/nvidia-smi` 和 `/usr/bin/nvidia-modprobe` 是否仍是
+  Citespec wrapper、`.real` 是否存在且无 setuid/setgid、shim 是否安装。
 - nginx 示例只有防火墙假设，没有 vhost 级 `allow/deny`，也没有只读审计脚本。
 
 **修复**：
 
 - preflight 调用 `nvidia-smi` 前后分别记录每个 `/dev/nvidia*` 的 mode/owner；未安装
   wrapper 时告警“探测本身可能改权限”，wrapper 已安装但仍变化时失败。
-- 校验 wrapper 的 `exec /usr/bin/nvidia-smi.real`、`.real` 存在且无 setuid/setgid、
-  shim 可读；`.real` 已存在但 wrapper/shim 缺失时失败。
+- 校验 `nvidia-smi` 和 `nvidia-modprobe` wrapper 的 `.real` 目标、`.real` 存在且无
+  setuid/setgid、shim 可读；`.real` 已存在但 wrapper/shim 缺失时失败。
 - 新增 `--skip-nvidia`：完全跳过 `nvidia-smi` 查询和 compute-process 检查，其余
   静态审计继续执行。
 - 两个 nginx 示例加入 `allow <vpn-source-cidr>; deny all;`，并保留

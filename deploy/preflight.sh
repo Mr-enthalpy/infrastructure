@@ -12,6 +12,8 @@ SKIP_NVIDIA=0
 
 NVIDIA_SMI=/usr/bin/nvidia-smi
 NVIDIA_SMI_REAL=/usr/bin/nvidia-smi.real
+NVIDIA_MODPROBE=/usr/bin/nvidia-modprobe
+NVIDIA_MODPROBE_REAL=/usr/bin/nvidia-modprobe.real
 NVIDIA_SHIM=/usr/local/lib/citespec-resource/libcitespec-nvidia-chmod.so
 
 section() { printf '\n== %s ==\n' "$1"; }
@@ -35,40 +37,48 @@ mode_has_special_bits() {
     [ "${#mode}" -eq 4 ] && [ "$((8#$mode & 8#6000))" -ne 0 ]
 }
 
-# nvidia-smi chmods /dev/nvidia* to 0666 root:root every time it runs as root.
-# Record the state around the query so preflight reports what its own probe did
-# instead of checking permissions before the probe and calling them clean.
-audit_nvidia_helpers() {
-    local real_installed=0
-    if [ -e "$NVIDIA_SMI_REAL" ]; then
+# nvidia-smi chmods /dev/nvidia* to 0666 root:root every time it runs as root,
+# and the stock nvidia-modprobe can recreate nodes with the same mode.  Record
+# the state around the query so preflight reports what its own probe did instead
+# of checking permissions before the probe and calling them clean.
+audit_wrapped_helper() {
+    local label=$1 wrapper=$2 real=$3 token=$4
+    local real_installed=0 mode
+    if [ -e "$real" ]; then
         real_installed=1
     fi
-    if [ -e "$NVIDIA_SMI" ] && [ ! -L "$NVIDIA_SMI" ] \
-        && grep -Iq -- 'exec /usr/bin/nvidia-smi.real' "$NVIDIA_SMI" 2>/dev/null; then
-        ok "nvidia-smi is the citespec wrapper and execs $NVIDIA_SMI_REAL"
-    elif [ -e "$NVIDIA_SMI" ] && [ "$real_installed" -eq 1 ]; then
-        fail "$NVIDIA_SMI is not the citespec wrapper while $NVIDIA_SMI_REAL exists"
-    elif [ -e "$NVIDIA_SMI" ]; then
-        warn "$NVIDIA_SMI is not wrapped yet; running it can reset /dev/nvidia* to 0666"
+    if [ -e "$wrapper" ] && [ ! -L "$wrapper" ] \
+        && grep -Iq -- "$token" "$wrapper" 2>/dev/null; then
+        ok "$label is the citespec wrapper and execs $real"
+    elif [ -e "$wrapper" ] && [ "$real_installed" -eq 1 ]; then
+        fail "$label is not the citespec wrapper while $real exists"
+    elif [ -e "$wrapper" ]; then
+        warn "$label is not wrapped yet; running it can reset /dev/nvidia* permissions"
     else
-        warn "$NVIDIA_SMI is missing"
+        warn "$label is missing"
     fi
     if [ "$real_installed" -eq 1 ]; then
-        local mode
-        mode=$(stat -c '%a' "$NVIDIA_SMI_REAL" 2>/dev/null || printf 'unknown')
+        mode=$(stat -c '%a' "$real" 2>/dev/null || printf 'unknown')
         if [ "$mode" = "unknown" ]; then
-            fail "could not read the mode of $NVIDIA_SMI_REAL"
+            fail "could not read the mode of $real"
         elif mode_has_special_bits "$mode"; then
-            fail "$NVIDIA_SMI_REAL has setuid/setgid bits ($mode); members could create host GPU nodes"
+            fail "$real has setuid/setgid bits ($mode); members could create host GPU nodes"
         else
-            ok "$NVIDIA_SMI_REAL has no setuid/setgid bits (mode $mode)"
+            ok "$real has no setuid/setgid bits (mode $mode)"
         fi
     else
-        warn "$NVIDIA_SMI_REAL is not installed yet; the installer keeps the original helper here"
+        warn "$real is not installed yet; the installer keeps the original helper here"
     fi
+}
+
+audit_nvidia_helpers() {
+    audit_wrapped_helper "nvidia-smi" "$NVIDIA_SMI" "$NVIDIA_SMI_REAL" \
+        "exec /usr/bin/nvidia-smi.real"
+    audit_wrapped_helper "nvidia-modprobe" "$NVIDIA_MODPROBE" "$NVIDIA_MODPROBE_REAL" \
+        "nvidia-modprobe.real"
     if [ -r "$NVIDIA_SHIM" ]; then
         ok "NVIDIA chmod shim is installed: $NVIDIA_SHIM"
-    elif [ "$real_installed" -eq 1 ]; then
+    elif [ -e "$NVIDIA_SMI_REAL" ] || [ -e "$NVIDIA_MODPROBE_REAL" ]; then
         fail "NVIDIA chmod shim is missing: $NVIDIA_SHIM"
     else
         warn "NVIDIA chmod shim is not installed yet: $NVIDIA_SHIM"
