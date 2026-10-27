@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -62,6 +64,25 @@ def _make_state_db(path: Path, value: str, *, mode: str = "active") -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def _insert_uncheckpointed_wal(path: Path, value: str) -> None:
+    """Leave a real WAL behind by ending the writer process without closing."""
+
+    script = (
+        "import os, sqlite3, sys\n"
+        "connection = sqlite3.connect(sys.argv[1])\n"
+        "connection.execute('PRAGMA journal_mode=WAL')\n"
+        "connection.execute('PRAGMA wal_autocheckpoint=0')\n"
+        "connection.execute('INSERT INTO items VALUES (?)', (sys.argv[2],))\n"
+        "connection.commit()\n"
+        "os._exit(0)\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(path), value],
+        check=True,
+        timeout=60,
+    )
 
 
 def _make_spool(path: Path) -> None:
@@ -252,6 +273,77 @@ def test_restore_rolls_back_all_swaps_when_post_restore_check_fails(tmp_path, mo
     finally:
         connection.close()
     assert not (target.parent / f".{target.name}.pre-restore-{os.getpid()}").exists()
+
+
+def test_restore_rolls_back_wal_group_when_post_restore_check_fails(tmp_path, monkeypatch):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+    restore_config, target, _, _ = _make_restore_target(tmp_path, with_intake_and_spool=False)
+    _insert_uncheckpointed_wal(target, "wal-only")
+    wal = target.with_name(target.name + "-wal")
+    assert wal.stat().st_size > 0
+    calls = 0
+
+    def fail_after_swap(path: Path) -> bool:
+        nonlocal calls
+        calls += 1
+        return calls == 1
+
+    monkeypatch.setattr(backup, "_force_maintenance", fail_after_swap)
+
+    with pytest.raises(backup.BackupError, match="settings table"):
+        backup.restore_backup(
+            result,
+            restore_config,
+            confirmed=True,
+            skip_service_check=True,
+        )
+
+    for suffix in ("", "-wal", "-shm"):
+        stale = target.with_name(f".{target.name}{suffix}.pre-restore-{os.getpid()}")
+        assert not stale.exists()
+    connection = sqlite3.connect(target)
+    try:
+        assert {row[0] for row in connection.execute("SELECT value FROM items")} == {
+            "old",
+            "wal-only",
+        }
+    finally:
+        connection.close()
+
+
+def test_restore_aborts_before_swap_when_wal_checkpoint_is_busy(tmp_path):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+    restore_config, target, _, _ = _make_restore_target(tmp_path, with_intake_and_spool=False)
+    writer = connect(target)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("INSERT INTO items VALUES ('wal-only')")
+    writer.commit()
+    writer.execute("BEGIN")
+    writer.execute("SELECT value FROM items").fetchall()
+
+    with pytest.raises(backup.BackupError, match="busy"):
+        backup.restore_backup(
+            result,
+            restore_config,
+            confirmed=True,
+            skip_service_check=True,
+        )
+
+    for suffix in ("", "-wal", "-shm"):
+        stale = target.with_name(f".{target.name}{suffix}.pre-restore-{os.getpid()}")
+        assert not stale.exists()
+    writer.rollback()
+    writer.close()
+    connection = sqlite3.connect(target)
+    try:
+        assert {row[0] for row in connection.execute("SELECT value FROM items")} == {
+            "old",
+            "wal-only",
+        }
+    finally:
+        connection.close()
 
 
 def test_restore_requires_confirmation_and_rejects_tampered_backup(tmp_path):

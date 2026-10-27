@@ -27,6 +27,7 @@ import sys
 import time
 import tomllib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -51,6 +52,18 @@ _STATE_BACKUP_NAME = re.compile(r"^state-\d{8}-\d{6}-\d+$")
 
 class BackupError(RuntimeError):
     """Raised when a backup or restore cannot be completed safely."""
+
+
+@dataclass(frozen=True)
+class _Swap:
+    """One restore swap, including every SQLite companion file.
+
+    Each member is ``(live_path, old_path_or_none)``.  Companion files are
+    recorded even when they did not exist so rollback can remove a WAL/SHM file
+    that appeared after the swap.
+    """
+
+    members: tuple[tuple[Path, Path | None], ...]
 
 
 def _chmod(path: Path, mode: int) -> None:
@@ -139,6 +152,43 @@ def _sqlite_integrity(path: Path) -> None:
     finally:
         if connection is not None:
             connection.close()
+
+
+def _checkpoint_sqlite(path: Path) -> None:
+    """Fold a live WAL into the main database before any restore file move.
+
+    ``wal_checkpoint(TRUNCATE)`` returns ``(busy, log, checkpointed)``.  A
+    non-zero ``busy`` means a reader or writer still holds the database; abort
+    before any live file is moved so the caller can retry with the writers
+    actually stopped.  After a successful truncate the ``-wal`` file must be
+    empty (or absent), making main+WAL+SHM safe to move as one group.
+    """
+
+    if not path.is_file():
+        return
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = path.resolve().as_uri() + "?mode=rw"
+        connection = sqlite3.connect(uri, uri=True, timeout=0)
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error as exc:
+        raise BackupError(f"cannot checkpoint SQLite database {path}: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        raise BackupError(f"SQLite checkpoint returned no result: {path}")
+    if int(row[0]) != 0:
+        raise BackupError(
+            f"SQLite database is busy; stop all writers/readers before restoring: {path}"
+        )
+    wal = path.with_name(path.name + "-wal")
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    if wal_size:
+        raise BackupError(f"SQLite WAL was not truncated before restore: {wal}")
 
 
 def _sha256(path: Path) -> str:
@@ -461,36 +511,58 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _swap_in(staged: Path, target: Path, *, sqlite: bool = False) -> Path | None:
-    """Replace one target, returning the old path for rollback."""
-    old = target.with_name(f".{target.name}.pre-restore-{os.getpid()}")
-    _remove_path(old)
+def _swap_in(staged: Path, target: Path, *, sqlite: bool = False) -> _Swap:
+    """Replace one target, returning every old path for rollback.
+
+    For SQLite the main database and its ``-wal``/``-shm`` companions move as a
+    group.  The live database is checkpointed first so the old main file is
+    self-contained; if the checkpoint is busy, nothing is moved at all.
+    """
+
     if sqlite:
-        for suffix in ("-wal", "-shm"):
-            target.with_name(target.name + suffix).unlink(missing_ok=True)
-    had_target = target.exists() or target.is_symlink()
-    if had_target:
-        os.replace(target, old)
+        _checkpoint_sqlite(target)
+        live_paths = [
+            target,
+            target.with_name(target.name + "-wal"),
+            target.with_name(target.name + "-shm"),
+        ]
+    else:
+        live_paths = [target]
+    old_paths = [path.with_name(f".{path.name}.pre-restore-{os.getpid()}") for path in live_paths]
+    for stale in old_paths:
+        _remove_path(stale)
+    members: list[tuple[Path, Path | None]] = []
     try:
+        for live, old in zip(live_paths, old_paths, strict=True):
+            if live.exists() or live.is_symlink():
+                os.replace(live, old)
+                members.append((live, old))
+            else:
+                members.append((live, None))
         os.replace(staged, target)
     except Exception:
-        if had_target and old.exists():
-            os.replace(old, target)
+        for live, old_path in reversed(members):
+            _remove_path(live)
+            if old_path is not None and old_path.exists():
+                os.replace(old_path, live)
         raise
-    return old if had_target else None
+    return _Swap(tuple(members))
 
 
-def _rollback_swaps(swaps: list[tuple[Path, Path | None]]) -> None:
-    for target, old in reversed(swaps):
-        _remove_path(target)
-        if old is not None and old.exists():
-            os.replace(old, target)
+def _rollback_swaps(swaps: list[_Swap]) -> None:
+    for swap in reversed(swaps):
+        for live, _old in swap.members:
+            _remove_path(live)
+        for live, old in swap.members:
+            if old is not None and old.exists():
+                os.replace(old, live)
 
 
-def _cleanup_swaps(swaps: list[tuple[Path, Path | None]]) -> None:
-    for _target, old in swaps:
-        if old is not None:
-            _remove_path(old)
+def _cleanup_swaps(swaps: list[_Swap]) -> None:
+    for swap in swaps:
+        for _live, old in swap.members:
+            if old is not None:
+                _remove_path(old)
 
 
 def restore_backup(
@@ -531,6 +603,13 @@ def restore_backup(
     if not skip_service_check:
         _stop_writer_units()
 
+    # Checkpoint every live database before any restore write.  This both makes
+    # the old main file self-contained for rollback and fails closed while any
+    # reader/writer still holds a WAL.
+    for live_db in (state_target, intake_target, portal_target):
+        if live_db is not None:
+            _checkpoint_sqlite(live_db)
+
     # Even if a later step fails, the live database must not reopen active.
     _force_maintenance(state_target)
 
@@ -545,7 +624,7 @@ def restore_backup(
         )
 
     staged: list[Path] = []
-    swaps: list[tuple[Path, Path | None]] = []
+    swaps: list[_Swap] = []
     succeeded = False
     try:
         staged_state = _stage_sqlite(root / "state.db", state_target)
@@ -610,19 +689,19 @@ def restore_backup(
                     "restored config portal.db_path does not match the restore target"
                 )
 
-        swaps.append((state_target, _swap_in(staged_state, state_target, sqlite=True)))
+        swaps.append(_swap_in(staged_state, state_target, sqlite=True))
         staged.remove(staged_state)
         if staged_intake is not None and intake_target is not None:
-            swaps.append((intake_target, _swap_in(staged_intake, intake_target, sqlite=True)))
+            swaps.append(_swap_in(staged_intake, intake_target, sqlite=True))
             staged.remove(staged_intake)
         if staged_portal is not None and portal_target is not None:
-            swaps.append((portal_target, _swap_in(staged_portal, portal_target, sqlite=True)))
+            swaps.append(_swap_in(staged_portal, portal_target, sqlite=True))
             staged.remove(staged_portal)
         if staged_spool is not None and spool_target is not None:
-            swaps.append((spool_target, _swap_in(staged_spool, spool_target)))
+            swaps.append(_swap_in(staged_spool, spool_target))
             staged.remove(staged_spool)
         if staged_config is not None:
-            swaps.append((config_dir, _swap_in(staged_config, config_dir)))
+            swaps.append(_swap_in(staged_config, config_dir))
             staged.remove(staged_config)
 
         if not _force_maintenance(state_target):
