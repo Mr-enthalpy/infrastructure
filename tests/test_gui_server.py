@@ -19,6 +19,9 @@ class FakeRunner:
         self.admin_alias = admin_alias
         # None = the fake server reports no capabilities block (old server).
         self.vscode_capability: bool | None = None
+        self.server_protocol: int | None = None
+        self.min_client_protocol: int | None = None
+        self.server_version = ""
         self.calls: list[tuple[str, list[str]]] = []
 
     async def run(self, alias: str, args: list[str]) -> dict[str, Any]:
@@ -58,6 +61,10 @@ class FakeRunner:
                     "vscode": self.vscode_capability,
                     "file_transfer": False,
                 }
+            if self.server_protocol is not None:
+                data["version"] = self.server_version
+                data["protocol"] = self.server_protocol
+                data["min_client_protocol"] = self.min_client_protocol
         elif args[:1] == ["apply"]:
             data = {
                 "id": "alloc-1",
@@ -316,6 +323,38 @@ async def test_config_falls_back_to_local_policy_without_capabilities(monitor_co
         payload = await response.json()
         assert payload["data"]["vscode_enabled"] is False
         assert payload["data"]["capability_source"] == "local"
+    finally:
+        await client.close()
+
+
+async def test_config_reports_protocol_compatibility(monitor_config):
+    runner = FakeRunner()
+    runner.server_version = "0.1.0"
+    runner.server_protocol = 1
+    runner.min_client_protocol = 1
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.get("/api/config", headers=_headers())
+        payload = await response.json()
+        compatibility = payload["data"]["compatibility"]
+        assert compatibility["status"] == "ok"
+        assert compatibility["server_protocol"] == 1
+        assert payload["data"]["compatibility_warning"] == ""
+    finally:
+        await client.close()
+
+
+async def test_config_warns_when_client_must_update(monitor_config):
+    runner = FakeRunner()
+    runner.server_version = "9.0.0"
+    runner.server_protocol = 2
+    runner.min_client_protocol = 2
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.get("/api/config", headers=_headers())
+        payload = await response.json()
+        assert payload["data"]["compatibility"]["status"] == "client_update_required"
+        assert "update" in payload["data"]["compatibility_warning"].lower()
     finally:
         await client.close()
 

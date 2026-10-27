@@ -205,7 +205,7 @@ def _ssh_fingerprint_probe(host: str, config: LabConfig) -> tuple[bool, str]:
 def _remote_me(config: LabConfig, host: str) -> dict:
     """Read member state through the real SSH path used by everyday commands."""
     if Path(config.server.broker_socket).exists():
-        return BrokerClient(config.server.broker_socket).request("me")
+        return _unwrap_me_envelope(BrokerClient(config.server.broker_socket).request("me"))
     ssh = _check_program("ssh")
     if ssh is None:
         raise CitespecError("本机没有 ssh 客户端")
@@ -229,7 +229,22 @@ def _remote_me(config: LabConfig, host: str) -> dict:
         raise CitespecError("服务器返回的成员状态不是有效 JSON") from exc
     if not isinstance(data, dict):
         raise CitespecError("服务器返回的成员状态格式无效")
-    return data
+    return _unwrap_me_envelope(data)
+
+
+def _unwrap_me_envelope(data: object) -> dict:
+    if not isinstance(data, dict):
+        raise CitespecError("member status response is not an object")
+    if data.get("ok") is False:
+        error = data.get("error")
+        error_detail = error.get("message") if isinstance(error, dict) else None
+        if not isinstance(error_detail, str) or not error_detail:
+            error_detail = "member status request failed"
+        raise CitespecError(error_detail)
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        raise CitespecError("member status envelope has no data object")
+    return payload
 
 
 def _managed_fragment_lines(config: LabConfig, host: str) -> list[str]:

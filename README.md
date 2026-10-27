@@ -19,7 +19,7 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 | 范围 | 状态 | 证据 |
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
-| 自动化验证 | 完成 | 本地 `448 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
+| 自动化验证 | 完成 | 本地 `475 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
 | CI | 完成 | GitHub Actions 运行 `40461434609`（当前分支，含 Portal 与 P0-2）通过 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
@@ -185,6 +185,8 @@ uv.lock              # 锁定依赖版本
 - [docs/reports/member-onboarding-and-ux.md](docs/reports/member-onboarding-and-ux.md)：
   本轮实现、实际测试结果与 D1/D2/D3 结论。
 
+- [docs/client-distribution.md](docs/client-distribution.md)：Windows/Linux 客户端安装、
+  签名自动更新、构建发布和回滚。
 ## 8. 实现里程碑
 
 > 以下 M0–M5 是初始实现阶段；历史文档中的 P0–P5 指同一组里程碑。后续变更优先级

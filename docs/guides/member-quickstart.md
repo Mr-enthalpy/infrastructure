@@ -2,6 +2,19 @@
 
 本指南覆盖三种入口：没有账号的新成员、已有账号的老成员、以及日常自助使用。
 
+## 0. 安装打包客户端（推荐）
+
+不要从仓库手动复制 Python 脚本。维护者发布带签名的客户端后，从 GitHub Release
+下载对应平台的 `citespec-resource-<version>-<platform>-full.zip`：
+
+- Windows x64：解压并运行 `install.ps1`，然后打开新的 PowerShell。
+- Linux x64：解压后运行 `bash install.sh`。
+
+启动器会自动检查并安装签名更新；也可以手动运行
+`citespec-resource update --check` 或 `citespec-resource update`。
+客户端只更新本机 payload，不会修改服务器、Portal 或实验室网络。
+完整的构建、签名、镜像和回滚说明见 `docs/client-distribution.md`。
+
 ## 1. 新成员：从申请到首次使用
 
 1. **获取邀请**：向管理员（见下方联系方式）索取邀请编号与邀请密钥。

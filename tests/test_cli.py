@@ -817,6 +817,101 @@ def _no_socket_config(tmp_path):
     )
 
 
+def test_version_json_reports_protocol_handshake():
+    result = runner.invoke(cli.app, ["version", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["version"]
+    assert payload["data"]["protocol"] >= 1
+    assert payload["data"]["min_client_protocol"] >= 1
+
+
+def test_update_check_json_uses_packaged_root(tmp_path, monkeypatch):
+    from citespec_resource import update
+
+    monkeypatch.setattr(update, "find_app_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        update,
+        "check_for_update",
+        lambda **kwargs: update.UpdateInfo(
+            available=True,
+            current_version="0.1.0",
+            latest_version="0.2.0",
+            reason="new version available",
+        ),
+    )
+    result = runner.invoke(cli.app, ["update", "--check", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["data"]["available"] is True
+    assert payload["data"]["latest"] == "0.2.0"
+
+
+def test_update_installs_and_reports_previous(tmp_path, monkeypatch):
+    from citespec_resource import update
+
+    monkeypatch.setattr(update, "find_app_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        update,
+        "check_for_update",
+        lambda **kwargs: update.UpdateInfo(
+            available=True,
+            current_version="0.1.0",
+            latest_version="0.2.0",
+            reason="new version available",
+        ),
+    )
+    monkeypatch.setattr(
+        update,
+        "install_update",
+        lambda info, **kwargs: update.UpdateResult("0.2.0", tmp_path / "versions", "0.1.0"),
+    )
+    result = runner.invoke(cli.app, ["update", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["data"] == {
+        "previous": "0.1.0",
+        "updated": True,
+        "version": "0.2.0",
+    }
+
+
+def test_update_requires_packaged_app_root(monkeypatch):
+    from citespec_resource import update
+
+    monkeypatch.setattr(update, "find_app_root", lambda: None)
+    result = runner.invoke(cli.app, ["update", "--check"])
+    assert result.exit_code != 0
+    assert "packaged client" in result.output
+
+
+def test_client_profile_still_relays_start(tmp_path, monkeypatch):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    recorded = {}
+
+    def fake_run(argv, **kwargs):
+        recorded["argv"] = list(argv)
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    def missing_hardware(path):
+        raise ValueError("missing [hardware] section")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", missing_hardware)
+    monkeypatch.setattr(cli, "load_client_config", lambda path: _no_socket_config(tmp_path))
+    monkeypatch.setattr(
+        sys_module,
+        "argv",
+        ["citespec-resource", "start", "--gpu-count", "1", "--json"],
+    )
+    result = runner.invoke(cli.app, ["start", "--gpu-count", "1", "--json"])
+    assert result.exit_code == 0
+    assert recorded["argv"][-1] == "citespec-resource start --gpu-count 1 --json"
+
+
 def test_workstation_defaults_to_relay_without_socket(tmp_path, monkeypatch):
     import subprocess as subprocess_module
     import sys as sys_module

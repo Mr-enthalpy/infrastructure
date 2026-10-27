@@ -111,6 +111,10 @@
     if (!payload.ok) throw new Error(payload?.error?.message || "config failed");
     state.config = payload.data;
     $("#server-name").textContent = payload.data.server_name;
+    const compatBanner = $("#compat-banner");
+    const compatWarning = String(payload.data.compatibility_warning || "");
+    compatBanner.textContent = compatWarning;
+    compatBanner.hidden = !compatWarning;
     if (payload.data.admin_enabled) {
       try {
         const admin = await api("/api/admin/users");

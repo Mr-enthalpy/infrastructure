@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
-from .. import store
+from .. import store, version_info
 from ..config import LabConfig, validate_active_mode_policy
 from ..db import connect, init_db
 from ..enrollment import store as intake_store
@@ -2720,6 +2720,7 @@ class Broker:
                 "message": self._storage_failure or "",
             },
             "capabilities": self._capabilities(),
+            **version_info(),
         }
         self._add_member_identity(data)
         return data
@@ -2930,6 +2931,7 @@ class Broker:
                         connection, owner_uid=identity.uid, now=self._now()
                     ),
                     "capabilities": self._capabilities(),
+                    **version_info(),
                 }
             allocation = store.get_allocation(connection, allocation_id, now=self._now())
             if allocation["owner_uid"] != identity.uid and not identity.is_admin:
@@ -2938,6 +2940,7 @@ class Broker:
                 "allocation": allocation,
                 "events": store.list_allocation_events(connection, allocation_id),
                 "capabilities": self._capabilities(),
+                **version_info(),
             }
 
     async def _apply(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:

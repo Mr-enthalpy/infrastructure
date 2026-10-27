@@ -23,6 +23,7 @@ import aiohttp
 import asyncssh
 from aiohttp import WSMsgType, web
 
+from ..compat import check_server_handshake
 from ..config import LabConfig
 
 logger = logging.getLogger(__name__)
@@ -229,7 +230,7 @@ async def _index(request: web.Request) -> web.Response:
     )
 
 
-async def _server_capabilities(runner: SSHRunner) -> dict[str, Any]:
+async def _server_status(runner: SSHRunner) -> dict[str, Any]:
     try:
         payload = await runner.run(runner.member_alias, ["status"])
     except Exception:
@@ -237,7 +238,12 @@ async def _server_capabilities(runner: SSHRunner) -> dict[str, Any]:
     if not payload.get("ok"):
         return {}
     data = payload.get("data")
-    capabilities = data.get("capabilities") if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+async def _server_capabilities(runner: SSHRunner) -> dict[str, Any]:
+    data = await _server_status(runner)
+    capabilities = data.get("capabilities")
     return capabilities if isinstance(capabilities, dict) else {}
 
 
@@ -246,11 +252,15 @@ async def _api_config(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
     vscode_enabled = config.policy.vscode_enabled
     capability_source = "local"
-    capabilities = await _server_capabilities(runner)
+    status_data = await _server_status(runner)
+    capabilities = status_data.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
     if "vscode" in capabilities:
         # The server decides; the member's local config may be stale.
         vscode_enabled = bool(capabilities["vscode"])
         capability_source = "server"
+    compatibility = check_server_handshake(status_data)
     return _json(
         {
             "ok": True,
@@ -260,6 +270,10 @@ async def _api_config(request: web.Request) -> web.Response:
                 "admin_enabled": bool(runner.admin_alias),
                 "vscode_enabled": vscode_enabled,
                 "capability_source": capability_source,
+                "compatibility": compatibility.as_dict(),
+                "compatibility_warning": (
+                    compatibility.message if compatibility.status != "ok" else ""
+                ),
             },
         }
     )
@@ -480,9 +494,14 @@ async def _api_vscode(request: web.Request) -> web.Response:
     if "vscode" not in capabilities and not config.policy.vscode_enabled:
         return _json(_error("forbidden", "VS Code support is disabled by policy"), 403)
     executable = shutil.which("citespec-resource")
-    base = (
-        [executable] if executable is not None else [sys.executable, "-m", "citespec_resource.cli"]
-    )
+    if executable is not None:
+        base = [executable]
+    elif getattr(sys, "frozen", False):
+        # Inside a packaged onedir client there is no separate interpreter or
+        # launcher on PATH. The payload executable accepts the same CLI args.
+        base = [sys.executable]
+    else:
+        base = [sys.executable, "-m", "citespec_resource.cli"]
     argv = [*base]
     # Pass the config path explicitly: the GUI may have been started with a
     # --config flag that the child would not otherwise see.

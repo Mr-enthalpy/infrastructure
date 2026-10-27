@@ -183,7 +183,11 @@
   tests/test_backup.py tests/test_deploy_scripts.py -q
 ```
 
-本地验收至少覆盖：登录/TOTP、错误密码限速、CSRF、注册提交、审批生成一次性
+2026-10-27 本地预验收结果：`tests/test_portal.py tests/test_backup.py` 共
+`25 passed`；使用临时数据库和 fake broker，未启动对外 vhost，未修改
+DNS/VPN/防火墙。完整测试为 `475 passed, 21 skipped`。
+
+本地预验收至少覆盖：登录/TOTP、错误密码限速、CSRF、注册提交、审批生成一次性
 激活码、激活设置密码/TOTP、成员只能看本人、成员不能访问管理员路由、管理员
 暂停/恢复、CLI 创建首个管理员与角色变更、最后管理员保护、`pending_activation`
 不被 `resume` 激活、只读状态、禁止路由返回
@@ -259,3 +263,104 @@ server {
 ## 附录 B：微信沟通话术（可直接复制）
 
 > 老师您好，Citespec 想改成只走校园网/NJU VPN 的 HTTPS 访问，不开公网入口。需要您协助确认内网 DNS、VPN 路由/DNS、443 防火墙和证书方式。具体需求和待确认项我整理在一页文档里，方便时请您看一下；主要想先确认 DNS、VPN 和证书这三项是否可行。谢谢！
+
+## 附录 C：现场实施与回滚顺序
+
+> 仅在批准的维护窗口执行。任何一步失败先回滚该步，不要叠加变更；不要在本窗口内
+> 停止/删除现有 GPU 容器、训练任务或无关数据。
+
+### C.1 变更前快照
+
+```bash
+sudo nginx -T > /root/citespec-nginx-before.txt
+sudo cp -a /etc/nginx /root/citespec-nginx-before
+sudo nft list ruleset > /root/citespec-firewall-before.txt  # 或 iptables-save
+systemctl status citespec-resource-broker citespec-resource-intake --no-pager
+ss -ltnp | grep -E ':(443|8765|8770)\b' || true
+docker ps -a --format '{{.Names}} {{.Status}}' > /root/citespec-containers-before.txt
+```
+
+同时由网络管理导出 DNS 记录，记录证书序列号/指纹和续期方式。备份只读保存，
+不改动现有备份。
+
+### C.2 DNS、VPN、防火墙
+
+1. 添加 `citespec-portal.<lab-domain>` 和 `citespec-apply.<lab-domain>` 的内网
+   A 记录，指向 `<host-private-ip>`；不发布公网 A/AAAA。
+2. 确认校园网和 NJU VPN 客户端能解析两个域名；TTL 先设 300。
+3. 443 只允许校园网/VPN 源地址段；不新增公网 443 NAT；8765/8770 不对外。
+4. 从校外普通网络确认两个域名不可达；从 VPN 确认可达。
+
+### C.3 TLS 证书
+
+优先使用学校通配证书或公共 CA DNS-01；不要用自签 IP 证书作为成员入口。若由
+学校 CA 签发，CSR 的 SAN 必须同时包含两个域名：
+
+```bash
+openssl req -new -newkey rsa:3072 -nodes \
+  -keyout citespec-portal.key -out citespec-portal.csr \
+  -subj "/CN=citespec-portal.<lab-domain>" \
+  -addext "subjectAltName=DNS:citespec-portal.<lab-domain>,DNS:citespec-apply.<lab-domain>"
+chmod 0600 citespec-portal.key
+```
+
+安装 fullchain 后验证：
+
+```bash
+openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
+  /etc/ssl/citespec/citespec-portal.fullchain.pem
+```
+
+证书私钥 `0600`，仅 root/nginx 可读；确认续期后 reload nginx 的机制和到期告警。
+
+### C.4 nginx vhost
+
+1. 以 `deploy/nginx/citespec-portal.conf.example` 和 apply 示例为基础，替换
+   `<host-private-ip>`、域名、证书路径。
+2. 私网地址监听 443；未知 Host 返回 `444`；不配置 `/ws/`、`/shell`、
+   `/vscode`、`/file` 等 Web 终端/文件路由。
+3. `proxy_set_header X-Citespec-Client-IP $remote_addr;` 必须由 nginx 覆盖写入，
+   不信任客户端自带值。
+4. 先 `sudo nginx -t`，通过后 `sudo systemctl reload nginx`；失败立即恢复旧配置。
+
+### C.5 Portal 安装与启用
+
+先用 `[portal].enabled = false` 安装；`deploy/install_server.sh` 不会自动启动 Portal。
+网络/证书验收通过后，才在维护窗口内：
+
+```bash
+# 将 [portal].enabled 改为 true，确认 db_path 在 /var/lib/citespec-resource-portal 下
+sudo systemctl enable --now citespec-resource-portal
+sudo systemctl status citespec-resource-portal --no-pager
+curl -fsS http://127.0.0.1:8770/healthz
+```
+
+首个管理员只通过 CLI 创建/改角色，不把 `citespec-portal` 加入
+`citespec-admins`；管理员密码/TOTP 不写入文档、日志或命令行历史。
+
+### C.6 现场验收
+
+```bash
+# 从校园网或 VPN 客户端执行
+curl -fsS --resolve citespec-portal.<lab-domain>:443:<host-private-ip> \
+  https://citespec-portal.<lab-domain>/healthz
+openssl s_client -connect <host-private-ip>:443 \
+  -servername citespec-portal.<lab-domain> </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+ss -ltnp | grep -E ':(443|8765|8770)\b'
+```
+
+必须确认：证书链无警告、手机可登录/TOTP、注册与审批可用、成员只能看本人、
+管理员操作需密码+TOTP、审计含真实客户端 IP、无危险 Web 路由、8765/8770 从
+非 loopback 不可达、校外普通网络超时。
+
+### C.7 回滚
+
+```bash
+sudo systemctl stop citespec-resource-portal
+sudo cp -a /root/citespec-nginx-before/. /etc/nginx/
+sudo nginx -t && sudo systemctl reload nginx
+# 恢复防火墙/DNS 到 C.1 记录；保留 portal.db、备份和容器数据
+```
+
+回滚只撤销网络/nginx/Portal 服务变更，不删除数据库、备份、GPU 容器或成员数据。
+记录失败步骤、时间、操作者和恢复结果。

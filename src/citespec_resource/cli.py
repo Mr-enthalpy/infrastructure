@@ -25,7 +25,7 @@ from typing import Any, NoReturn
 
 import typer
 
-from . import __version__
+from . import __version__, version_info
 from .client import BrokerClient
 from .config import (
     HardwareConfig,
@@ -1035,9 +1035,18 @@ def app_callback(
         return
     # Workstation default: without a local broker socket, talk to the
     # configured server over SSH instead of failing on a missing socket.
+    # ``setup`` writes the minimal client profile (no [hardware]), so fall
+    # back to it instead of silently disabling relay on member workstations.
     try:
         cfg = load_config(ctx.obj)
-    except (OSError, ValueError):
+    except ValueError as exc:
+        if "missing [hardware] section" not in str(exc):
+            return
+        try:
+            cfg = load_client_config(ctx.obj)
+        except (OSError, ValueError):
+            return
+    except OSError:
         return
     if Path(cfg.server.broker_socket).exists():
         return
@@ -1078,6 +1087,10 @@ AUTO_RELAY_COMMANDS = {
     "admin",
     "job",
     "me",
+    # ``start`` only needs server configuration and the broker. It used to run
+    # locally, which made a stale workstation package silently use old presets
+    # and fail when no local broker socket existed.
+    "start",
 }
 
 
@@ -1125,9 +1138,91 @@ def _dispatch_remote(alias: str, rest: list[str]) -> NoReturn:
 
 
 @app.command()
-def version() -> None:
-    """Print package version."""
+def version(
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Print package version and the client/server protocol handshake."""
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {"ok": True, "data": version_info()},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
     typer.echo(__version__)
+    typer.echo(f"protocol: {version_info()['protocol']}")
+    typer.echo(f"min client protocol: {version_info()['min_client_protocol']}")
+
+
+@app.command("update")
+def update_command(
+    check: bool = typer.Option(False, "--check", help="只检查更新，不安装。"),
+    manifest: str = typer.Option("", "--manifest", help="覆盖更新清单 URL（测试/镜像）。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """检查并安装打包客户端的签名更新（仅打包客户端可用）。"""
+
+    from .update import (
+        UpdateError,
+        check_for_update,
+        find_app_root,
+        install_update,
+    )
+
+    root = find_app_root()
+    if root is None:
+        _fail(
+            "bad_request",
+            "update is only available in the packaged client; "
+            "set CITESPEC_RESOURCE_APP_ROOT for a local test",
+            json_output,
+        )
+    allow_insecure = os.environ.get("CITESPEC_UPDATE_ALLOW_HTTP", "").strip() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        info = check_for_update(
+            manifest_url=manifest or None,
+            allow_insecure=allow_insecure,
+        )
+        if check or not info.available:
+            data = {
+                "available": info.available,
+                "current": info.current_version,
+                "latest": info.latest_version,
+                "reason": info.reason,
+            }
+            if json_output:
+                typer.echo(json.dumps({"ok": True, "data": data}, indent=2, sort_keys=True))
+            else:
+                typer.echo(
+                    f"current: {info.current_version}  latest: {info.latest_version}  {info.reason}"
+                )
+            return
+        result = install_update(
+            info,
+            app_root=root,
+            allow_insecure=allow_insecure,
+        )
+        data = {
+            "updated": True,
+            "previous": result.previous_version,
+            "version": result.version,
+        }
+        if json_output:
+            typer.echo(json.dumps({"ok": True, "data": data}, indent=2, sort_keys=True))
+        else:
+            typer.echo(
+                f"updated: {result.previous_version or 'none'} -> {result.version}; "
+                "restart the client to use it"
+            )
+    except (OSError, UpdateError) as exc:
+        _fail("protocol_error", str(exc), json_output)
 
 
 @config_app.command("show")

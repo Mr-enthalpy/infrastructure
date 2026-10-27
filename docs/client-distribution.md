@@ -1,0 +1,150 @@
+# 客户端分发与自动更新
+
+本文面向维护者和成员，说明打包客户端的安装、更新、发布和回滚。Portal 仍只允许
+VPN 内访问；客户端更新不改变 Portal 的启用状态。
+
+## 1. 设计
+
+客户端由两部分组成：
+
+- `citespec-resource`：稳定的 PyInstaller 启动器（Windows 为
+  `citespec-resource.exe`），负责检查签名更新并启动当前版本。
+- `versions/<version>/citespec-resource-app`：真正的 CLI/GUI payload。
+
+启动器最多每 24 小时检查一次更新。更新清单和 payload 都使用 HTTPS；清单使用
+Ed25519 签名，payload 使用 SHA-256 校验。新版本先解压到临时目录，确认包含
+payload 后再原子替换 `current.json`，旧版本保留用于回滚。
+
+本仓库固定嵌入更新公钥：
+
+```
+LcxxIJY0DcCdDVzMcuk5pIJ4jaTz2hSJ6I50n2E9MvU=
+```
+
+签名私钥只保存在维护者的本地忽略文件 `lab/update-signing.local.json`，并应存入
+GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY`（base64 的 32 字节原始种子）。
+不要把私钥、PEM 文件或带私钥的清单提交到仓库。
+
+## 2. Windows x64 首次安装
+
+1. 从 GitHub Release 下载
+   `citespec-resource-<version>-windows-x64-full.zip`。
+2. 解压后运行 `install.ps1`。默认安装到
+   `%LOCALAPPDATA%\CitespecResource`，并把该目录加入当前用户的 `PATH`。
+3. 打开新的 PowerShell，运行：
+
+   ```powershell
+   citespec-resource setup --server <服务器地址> --user <Linux 用户名>
+   citespec-resource start --gpu-count 1
+   citespec-resource gui
+   ```
+
+`setup` 只写入工作站连接片段和
+`%USERPROFILE%\.config\citespec-resource\client.toml`；不会上传私钥，也不会修改
+服务器。
+
+## 3. Linux x64 首次安装
+
+```bash
+unzip citespec-resource-<version>-linux-x64-full.zip -d citespec-resource
+cd citespec-resource
+bash install.sh
+```
+
+脚本默认安装到 `~/.local/opt/citespec-resource`，并在 `~/.local/bin` 建立
+`citespec-resource` 软链接。确认 `~/.local/bin` 在 `PATH` 中后运行 `setup`。
+
+## 4. 更新、检查与回滚
+
+启动器会自动更新。手动操作：
+
+```bash
+citespec-resource update --check
+citespec-resource update
+```
+
+可用环境变量：
+
+| 变量 | 用途 |
+|---|---|
+| `CITESPEC_UPDATE_MANIFEST` | 覆盖更新清单 URL（例如内部镜像） |
+| `CITESPEC_SKIP_UPDATE=1` | 本次不检查更新 |
+| `CITESPEC_UPDATE_TIMEOUT` | 清单请求超时秒数（默认 5） |
+| `CITESPEC_UPDATE_DOWNLOAD_TIMEOUT` | payload 下载超时秒数（默认 120） |
+| `CITESPEC_UPDATE_ALLOW_HTTP=1` | 仅用于本地/CI 测试的 HTTP 或 `file://` 清单；生产不要设置 |
+| `CITESPEC_RESOURCE_APP_ROOT` | 覆盖应用根目录（本地测试） |
+
+回滚：关闭客户端，把 `current.json` 的 `version` 改回 `versions/` 中保留的旧版本，
+或删除 `current.json` 后重新下载 full zip。启动器只执行 `versions/` 下存在的
+payload，不会从任意路径执行文件。
+
+## 5. 构建与发布
+
+预览构建（Windows 或 Linux 上分别执行）：
+
+```bash
+python -m pip install -e ".[gui,portal]" pyinstaller
+python packaging/build_client.py --platform windows-x64 --output dist
+python packaging/build_client.py --platform linux-x64 --output dist
+```
+
+输出：
+
+- `citespec-resource-<version>-<platform>.zip`：更新 payload。
+- `citespec-resource-<version>-<platform>-full.zip`：首次安装包。
+
+版本必须同时与 `pyproject.toml`、`src/citespec_resource/__init__.py` 和
+`uv.lock` 中的项目版本一致。发布前运行：
+
+```bash
+python packaging/check_version.py --tag v<version>
+```
+
+发布流程 `.github/workflows/release.yml` 在 `v*` tag 上构建两个平台的 artifact，
+下载后生成并签名 `citespec-resource-manifest.json`，再上传到 Release。若
+`CITESPEC_UPDATE_SIGNING_KEY` 未配置或与嵌入公钥不匹配，发布会失败，不会生成
+无法验证的清单。
+
+本地检查清单（不用于生产）可用：
+
+```bash
+python packaging/make_manifest.py \
+  --artifacts-dir dist \
+  --version <version> \
+  --output dist/citespec-resource-manifest.json \
+  --unsigned
+```
+
+生产签名应始终由 CI secret 完成，避免私钥出现在命令历史或构建日志中。
+
+## 6. 验收
+
+```bash
+python -m pytest -q
+python -m ruff check src packaging tests
+python -m mypy src
+```
+
+2026-10-27 本地结果（Windows 10/11，Python 3.13）：
+
+- 完整测试：`475 passed, 21 skipped`；Ruff check/format、mypy、`node --check`
+  和 Bash 语法检查通过。
+- Portal 本地 loopback 验收：`tests/test_portal.py tests/test_backup.py` 共
+  `25 passed`；使用临时数据库和 fake broker，未启动对外 vhost、未修改 DNS/
+  VPN/防火墙、未启用生产 Portal。
+- Windows x64 payload 和 full zip 构建成功；启动器 `version --json` 返回
+  `protocol=1`、`min_client_protocol=1`。
+- 本地签名清单自动更新 `0.1.0 -> 0.1.1` 成功；篡改清单和不可达更新源均被拒绝
+  且回退到现有 payload。
+- Linux x64 构建由 `.github/workflows/release.yml` 在 Ubuntu runner 上完成；
+  本地 Windows 主机不能替代 Linux 运行验收。首次 Linux 验收应在 CI artifact
+  或受控 Linux 主机上执行，并确认 `install.sh`、payload 执行位和自动更新路径。
+
+Windows 手工验收至少覆盖：
+
+1. 首次运行 full zip 启动器，确认自动下载并启动 payload。
+2. 发布带新版本号的 manifest 后，确认启动器更新且 `current.json` 指向新版本。
+3. 篡改 manifest 或 payload 后，确认客户端拒绝更新并继续使用旧版本。
+4. 断网启动，确认旧版本仍可用；删除当前 payload 时给出明确错误。
+5. 运行 `citespec-resource version --json`，确认 `version`、`protocol`、
+   `min_client_protocol` 字段存在。

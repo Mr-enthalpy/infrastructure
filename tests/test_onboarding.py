@@ -82,6 +82,61 @@ def test_ssh_probe_never_uses_accept_new(monkeypatch, config, tmp_path):
     assert f"UserKnownHostsFile={onboarding._known_hosts_path(config)}" in flat
 
 
+def test_remote_me_unwraps_local_broker_envelope(tmp_path, monkeypatch, config):
+    from dataclasses import replace
+
+    socket_path = tmp_path / "broker.sock"
+    socket_path.write_bytes(b"")
+    local_config = replace(
+        config,
+        server=replace(config.server, broker_socket=str(socket_path)),
+    )
+
+    class FakeBroker:
+        def __init__(self, path):
+            self.path = path
+
+        def request(self, name):
+            assert name == "me"
+            return {
+                "ok": True,
+                "data": {
+                    "username": "alice",
+                    "membership": {"status": "active", "valid_until": ""},
+                },
+            }
+
+    monkeypatch.setattr(onboarding, "BrokerClient", FakeBroker)
+    data = onboarding._remote_me(local_config, "192.0.2.5")
+    assert data["username"] == "alice"
+    assert data["membership"]["status"] == "active"
+
+
+def test_remote_me_rejects_error_envelope(tmp_path, monkeypatch, config):
+    from dataclasses import replace
+
+    socket_path = tmp_path / "broker.sock"
+    socket_path.write_bytes(b"")
+    local_config = replace(
+        config,
+        server=replace(config.server, broker_socket=str(socket_path)),
+    )
+
+    class FakeBroker:
+        def __init__(self, path):
+            self.path = path
+
+        def request(self, name):
+            return {
+                "ok": False,
+                "error": {"code": "not_found", "message": "member not found"},
+            }
+
+    monkeypatch.setattr(onboarding, "BrokerClient", FakeBroker)
+    with pytest.raises(onboarding.CitespecError, match="member not found"):
+        onboarding._remote_me(local_config, "192.0.2.5")
+
+
 def test_first_use_requires_explicit_confirmation(monkeypatch, config, tmp_path):
     known_hosts = tmp_path / "known_hosts"
     monkeypatch.setattr(onboarding, "_known_hosts_path", lambda _config: known_hosts)

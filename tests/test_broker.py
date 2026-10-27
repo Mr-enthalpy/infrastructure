@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from citespec_resource import store
+from citespec_resource import PROTOCOL_VERSION, store
 from citespec_resource.broker import workspace_io
 from citespec_resource.broker.docker_driver import ContainerInfo, GPUProcess
 from citespec_resource.broker.server import Broker
@@ -182,6 +182,8 @@ async def test_gpu_audit_failure_blocks_new_allocations(tmp_path, active_config)
     assert "GPU permission audit" in second["error"]["message"]
     status = await _call(broker, "status", {"id": first["data"]["id"]}, ALICE)
     assert status["data"]["allocation"]["status"] == "active"
+    assert status["data"]["protocol"] == PROTOCOL_VERSION
+    assert status["data"]["min_client_protocol"] >= 1
 
 
 async def test_gpu_audit_failure_at_startup_forces_monitor(tmp_path, active_config):
