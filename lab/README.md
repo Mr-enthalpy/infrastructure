@@ -27,7 +27,7 @@ lab owner has approved deployment.
 | Data volume | `/data1` (shared volume; usage changes) |
 | Docker | 28.1.1 observed previously |
 | Python | 3.10.12 observed previously; deployment baseline is 3.12 |
-| Workspace root | `/data1/citespec-users`; created by the installer |
+| Workspace root | `/home/data1/citespec-users`; created by the installer |
 | Broker socket | `/run/citespec-resource/broker.sock` |
 | Broker state | `/var/lib/citespec-resource/state.db` |
 | Base image | `citespec-base:2026.10` |

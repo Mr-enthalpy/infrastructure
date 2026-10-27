@@ -356,6 +356,73 @@ def test_admin_portal_list_formats_accounts(monkeypatch):
     assert "role=admin" in result.output
 
 
+def test_admin_portal_auth_list_and_remove_use_cli_commands(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "admins": [
+                    {
+                        "username": "labadmin",
+                        "enabled": True,
+                        "last_used_at": "",
+                        "locked_until": "",
+                    }
+                ]
+            },
+        }
+    )
+    result = _invoke(monkeypatch, fake, ["admin", "portal-auth", "list"])
+    assert result.exit_code == 0
+    assert "labadmin" in result.output
+    assert fake.calls == [("admin_portal_auth_list", {})]
+
+    fake.response = {"ok": True, "data": {"username": "labadmin", "removed": True}}
+    result = _invoke(
+        monkeypatch,
+        fake,
+        ["admin", "portal-auth", "remove", "--username", "labadmin", "--json"],
+    )
+    assert result.exit_code == 0
+    assert fake.calls[-1] == ("admin_portal_auth_remove", {"username": "labadmin"})
+
+
+def test_admin_portal_auth_enroll_prompts_without_exposing_password(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "username": "labadmin",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+                "otp_uri": "otpauth://totp/example",
+            },
+        }
+    )
+    monkeypatch.setattr(cli, "_make_client", lambda config: fake)
+    result = runner.invoke(
+        cli.app,
+        [
+            "--config",
+            str(CONFIG),
+            "admin",
+            "portal-auth",
+            "enroll",
+            "--username",
+            "labadmin",
+            "--json",
+        ],
+        input="broker admin password 123\n",
+    )
+    assert result.exit_code == 0, result.output
+    command, args = fake.calls[0]
+    assert command == "admin_portal_auth_enroll"
+    assert args == {
+        "username": "labadmin",
+        "password": "broker admin password 123",
+    }
+    assert "broker admin password 123" not in result.output
+
+
 def test_release_command(monkeypatch):
     fake = FakeClient({"ok": True, "data": {"id": "alloc-1", "status": "released"}})
     result = _invoke(monkeypatch, fake, ["release", "alloc-1", "--json"])

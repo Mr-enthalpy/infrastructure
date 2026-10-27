@@ -3327,6 +3327,86 @@ def admin_portal(
     )
 
 
+@admin_app.command("portal-auth")
+def admin_portal_auth(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="list / enroll / remove"),
+    username: str = typer.Option("", "--username", help="Broker administrator username"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Manage Broker-side credentials used for Portal admin attestations.
+
+    These credentials and TOTP enrollments are intentionally separate from the
+    Portal login/reauth TOTP.  The Broker verifies them independently before it
+    accepts a Portal admin mutation.
+    """
+
+    config = _load(ctx)
+    if action == "list":
+        data = _request(_make_client(config), "admin_portal_auth_list", json_output)
+        if json_output:
+            return
+        for admin in data.get("admins", []):
+            typer.echo(
+                f"{admin.get('username')}  enabled={admin.get('enabled')}  "
+                f"last_used={admin.get('last_used_at') or '-'}  "
+                f"locked_until={admin.get('locked_until') or '-'}"
+            )
+        return
+    if action == "enroll":
+        if not username:
+            _fail("bad_request", "enroll requires --username", json_output)
+        if not json_output:
+            typer.confirm(
+                f"Enroll Broker administrator credentials for {username}? "
+                "This replaces any existing Broker credential.",
+                abort=True,
+            )
+        password = typer.prompt(
+            "Broker administrator password",
+            hide_input=True,
+            confirmation_prompt=not json_output,
+        )
+        data = _request(
+            _make_client(config),
+            "admin_portal_auth_enroll",
+            json_output,
+            username=username,
+            password=password,
+        )
+        if json_output:
+            return
+        typer.echo(f"Broker administrator: {data.get('username')}")
+        typer.echo("Broker TOTP secret (show once; separate from Portal TOTP):")
+        typer.echo(str(data.get("totp_secret", "")))
+        typer.echo(f"OTP URI: {data.get('otp_uri', '')}")
+        return
+    if action == "remove":
+        if not username:
+            _fail("bad_request", "remove requires --username", json_output)
+        if not json_output:
+            typer.confirm(
+                f"Remove Broker administrator credentials for {username}? "
+                "Portal admin mutations by this account will fail closed.",
+                abort=True,
+            )
+        data = _request(
+            _make_client(config),
+            "admin_portal_auth_remove",
+            json_output,
+            username=username,
+        )
+        if json_output:
+            return
+        typer.echo(f"Removed Broker administrator credentials: {data.get('username')}")
+        return
+    _fail(
+        "bad_request",
+        f"unknown action {action}; use list/enroll/remove",
+        json_output,
+    )
+
+
 @admin_app.command("resources")
 def admin_resources(
     ctx: typer.Context,

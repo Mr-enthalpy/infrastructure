@@ -65,7 +65,7 @@ def _chmod(path: Path, mode: int) -> None:
 def _read_config_paths(
     config_path: Path,
     state_db_override: Path | None = None,
-) -> tuple[Path, Path | None, Path | None, Path | None, Path]:
+) -> tuple[Path, Path | None, Path | None, Path | None, bool, Path]:
     try:
         with config_path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -98,7 +98,8 @@ def _read_config_paths(
     portal_db = (
         Path(portal_value).expanduser() if isinstance(portal_value, str) and portal_value else None
     )
-    return state_db, intake_db, spool_dir, portal_db, config_path.parent
+    portal_enabled = bool(portal.get("enabled", False))
+    return state_db, intake_db, spool_dir, portal_db, portal_enabled, config_path.parent
 
 
 def _sqlite_backup(source: Path, destination: Path) -> None:
@@ -207,7 +208,7 @@ def create_backup(
 
     config = Path(config_path)
     root = Path(backup_root)
-    state_db, intake_db, spool_dir, portal_db, config_dir = _read_config_paths(
+    state_db, intake_db, spool_dir, portal_db, portal_enabled, config_dir = _read_config_paths(
         config,
         Path(state_db_override) if state_db_override is not None else None,
     )
@@ -219,7 +220,11 @@ def create_backup(
         raise BackupError(f"intake database does not exist: {intake_db}")
     if spool_dir is not None and not spool_dir.is_dir():
         raise BackupError(f"provisioning spool does not exist: {spool_dir}")
+    if portal_enabled and portal_db is None:
+        raise BackupError("Portal is enabled but portal.db_path is not configured")
     if portal_db is not None and not portal_db.is_file():
+        if portal_enabled:
+            raise BackupError(f"Portal is enabled but its database does not exist: {portal_db}")
         portal_db = None
 
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -264,6 +269,7 @@ def create_backup(
                 "state_db": str(state_db),
                 "intake_db": str(intake_db) if intake_db is not None else None,
                 "portal_db": str(portal_db) if portal_db is not None else None,
+                "portal_enabled": portal_enabled,
                 "spool_dir": str(spool_dir) if spool_dir is not None else None,
             },
             "files": _manifest_files(temporary),
@@ -322,6 +328,8 @@ def verify_backup(backup_dir: str | Path) -> dict[str, Any]:
         raise BackupError(f"backup manifest has no intake.db: {manifest_path}")
     if sources.get("portal_db") is not None and "portal.db" not in seen:
         raise BackupError(f"backup manifest has no portal.db: {manifest_path}")
+    if sources.get("portal_enabled") is True and "portal.db" not in seen:
+        raise BackupError(f"backup manifest has no portal.db for enabled Portal: {manifest_path}")
     config_value = sources.get("config")
     config_dir_value = sources.get("config_dir")
     if not isinstance(config_value, str) or not isinstance(config_dir_value, str):
@@ -507,10 +515,19 @@ def restore_backup(
     root = Path(backup_dir)
     payload = verify_backup(root)
     config = Path(config_path)
-    state_target, intake_target, spool_target, portal_target, config_dir = _read_config_paths(
+    (
+        state_target,
+        intake_target,
+        spool_target,
+        portal_target,
+        portal_enabled,
+        config_dir,
+    ) = _read_config_paths(
         config,
         Path(state_db) if state_db is not None else None,
     )
+    if not restore_config and portal_enabled and not (root / "portal.db").is_file():
+        raise BackupError("Portal is enabled but the backup has no portal.db")
     if not skip_service_check:
         _stop_writer_units()
 
@@ -569,8 +586,13 @@ def restore_backup(
                 restored_intake,
                 restored_spool,
                 restored_portal,
+                restored_portal_enabled,
                 _,
             ) = _read_config_paths(staged_config / config.name)
+            if restored_portal_enabled and not (root / "portal.db").is_file():
+                raise BackupError(
+                    "restored config enables the Portal but the backup has no portal.db"
+                )
             if restored_state != state_target:
                 raise BackupError(
                     "restored config server.state_db does not match the restore target"

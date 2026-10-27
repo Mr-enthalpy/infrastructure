@@ -2,9 +2,11 @@
 
 The portal process belongs to ``citespec-portal`` and ``citespec-cli`` but never
 ``citespec-admins``.  The broker recognizes it through ``is_portal`` and accepts
-only the commands listed below.  The portal performs its own RBAC; the broker
-re-validates that the asserted portal actor is an admin before any mutation and
-records the actor in the broker event log.
+only the commands listed below.  The portal performs its own UI RBAC, but every
+privileged mutation also requires a broker-issued, short-lived, one-use
+attestation created after the broker independently verifies the administrator's
+broker-side password and TOTP.  A portal-supplied ``role=admin`` alone is never
+sufficient for a mutation.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ PORTAL_COMMANDS = frozenset(
         "portal_registration_submit",
         "portal_requests_list",
         "portal_requests_show",
+        "portal_admin_attest",
         "portal_requests_approve",
         "portal_requests_reject",
         "portal_members_list",

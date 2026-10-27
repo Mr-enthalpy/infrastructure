@@ -121,7 +121,7 @@ server = data.get("server", {})
 print(f"container_profile={policy.get('container_profile', 'restricted')}")
 print(f"writable_layer_gb={policy.get('writable_layer_gb', 0)}")
 print(f"mode={policy.get('mode', 'monitor')}")
-print(f"workspace_root={server.get('workspace_root', '/data1/citespec-users')}")
+print(f"workspace_root={server.get('workspace_root', '/home/data1/citespec-users')}")
 print(f"max_workspace_gb={policy.get('max_workspace_gb', 0)}")
 print(
     "workspace_quota_required="
@@ -253,8 +253,16 @@ if have nvidia-smi; then
     else
         fail "nvidia-smi query failed"
     fi
-    if nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null | grep -q .; then
-        warn "one or more GPUs currently have compute processes; do not deploy during training"
+    COMPUTE_APPS=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null)
+    COMPUTE_QUERY=$?
+    if [ "$COMPUTE_QUERY" -ne 0 ]; then
+        fail "could not query GPU compute processes"
+    elif [ -n "$COMPUTE_APPS" ]; then
+        if [ "${MODE:-monitor}" = "active" ]; then
+            fail "active mode requires no GPU compute processes; stop training first"
+        else
+            warn "one or more GPUs currently have compute processes; do not deploy during training"
+        fi
     else
         ok "no compute processes currently reported"
     fi
@@ -349,7 +357,7 @@ if have df; then
     df -h /data1 /var/lib 2>/dev/null || warn "could not read disk usage"
 fi
 if [ "${MAX_WORKSPACE_GB:-0}" -gt 0 ] || [ "$WORKSPACE_QUOTA_REQUIRED" = "true" ]; then
-    QUOTA_TARGET=${WORKSPACE_ROOT:-/data1/citespec-users}
+    QUOTA_TARGET=${WORKSPACE_ROOT:-/home/data1/citespec-users}
     while [ ! -e "$QUOTA_TARGET" ] && [ "$QUOTA_TARGET" != "/" ]; do
         QUOTA_TARGET=$(dirname "$QUOTA_TARGET")
     done

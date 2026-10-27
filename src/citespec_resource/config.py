@@ -21,10 +21,12 @@ class ServerConfig:
     ssh_user: str = ""
     known_hosts: str = ""
     data_root: str = "/data1"
-    workspace_root: str = "/data1/citespec-users"
+    workspace_root: str = "/home/data1/citespec-users"
     broker_socket: str = "/run/citespec-resource/broker.sock"
     state_db: str = "/var/lib/citespec-resource/state.db"
     members_file: str = "/etc/citespec-resource/members.toml"
+    admin_auth_key_file: str = "/etc/citespec-resource/broker-admin.key"
+    admin_attestation_ttl_seconds: int = 120
 
 
 @dataclass(frozen=True)
@@ -273,10 +275,14 @@ def load_config(path: str | Path) -> LabConfig:
         ssh_user=str(server_raw.get("ssh_user", "")),
         known_hosts=str(server_raw.get("known_hosts", "")),
         data_root=str(server_raw.get("data_root", "/data1")),
-        workspace_root=str(server_raw.get("workspace_root", "/data1/citespec-users")),
+        workspace_root=str(server_raw.get("workspace_root", "/home/data1/citespec-users")),
         broker_socket=str(server_raw.get("broker_socket", "/run/citespec-resource/broker.sock")),
         state_db=str(server_raw.get("state_db", "/var/lib/citespec-resource/state.db")),
         members_file=str(server_raw.get("members_file", "/etc/citespec-resource/members.toml")),
+        admin_auth_key_file=str(
+            server_raw.get("admin_auth_key_file", "/etc/citespec-resource/broker-admin.key")
+        ),
+        admin_attestation_ttl_seconds=int(server_raw.get("admin_attestation_ttl_seconds", 120)),
     )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:\[\]-]{0,254}", server.ssh_alias):
         raise ValueError("server.ssh_alias contains unsupported characters")
@@ -289,6 +295,15 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("server.workspace_root must not contain '..'")
     if str(workspace_path) == "/":
         raise ValueError("server.workspace_root must not be the filesystem root")
+    admin_key_path = PurePosixPath(server.admin_auth_key_file)
+    if not admin_key_path.is_absolute() or ".." in admin_key_path.parts:
+        raise ValueError("server.admin_auth_key_file must be an absolute path without '..'")
+    if server.admin_auth_key_file.startswith("//"):
+        raise ValueError("server.admin_auth_key_file must not be a UNC path")
+    if str(admin_key_path) == "/":
+        raise ValueError("server.admin_auth_key_file must not be the filesystem root")
+    if not 30 <= server.admin_attestation_ttl_seconds <= 600:
+        raise ValueError("server.admin_attestation_ttl_seconds must be between 30 and 600")
     hardware = HardwareConfig(
         gpu_count=int(_require(hardware_raw, "gpu_count", "hardware")),
         gpu_model=str(_require(hardware_raw, "gpu_model", "hardware")),
@@ -566,6 +581,13 @@ def load_config(path: str | Path) -> LabConfig:
             raise ValueError(f"{field_name} must be an absolute path without '..'")
         if raw_path.startswith("//"):
             raise ValueError(f"{field_name} must not be a UNC path")
+    if portal.enabled:
+        if not portal.base_url:
+            raise ValueError("portal.enabled requires portal.base_url")
+        if not portal.base_url.startswith("https://"):
+            raise ValueError("portal.enabled requires an https portal.base_url")
+        if not portal.cookie_secure:
+            raise ValueError("portal.enabled requires portal.cookie_secure=true")
     if portal.base_url:
         if not portal.base_url.startswith(("https://", "http://")):
             raise ValueError("portal.base_url must start with http:// or https://")

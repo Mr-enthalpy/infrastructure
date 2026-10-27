@@ -108,7 +108,7 @@ def approve_request(
     quota_gb: int = 200,
     review_note: str = "",
     internal_note: str = "",
-    workspace_root: str = "/data1/citespec-users",
+    workspace_root: str = "/home/data1/citespec-users",
     provisioning: ProvisioningClient,
     expected_version: str = "",
     now: datetime | None = None,

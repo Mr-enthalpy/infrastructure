@@ -64,7 +64,7 @@ def test_example_config_is_valid():
 def test_workspace_root_must_be_absolute(tmp_path):
     path = _variant(
         tmp_path,
-        ('workspace_root = "/data1/citespec-users"', 'workspace_root = "citespec-users"'),
+        ('workspace_root = "/home/data1/citespec-users"', 'workspace_root = "citespec-users"'),
     )
     with pytest.raises(ValueError, match="workspace_root"):
         load_config(path)
@@ -73,10 +73,81 @@ def test_workspace_root_must_be_absolute(tmp_path):
 def test_workspace_root_must_not_be_filesystem_root(tmp_path):
     path = _variant(
         tmp_path,
-        ('workspace_root = "/data1/citespec-users"', 'workspace_root = "/"'),
+        ('workspace_root = "/home/data1/citespec-users"', 'workspace_root = "/"'),
     )
     with pytest.raises(ValueError, match="workspace_root"):
         load_config(path)
+
+
+def test_admin_auth_key_must_be_absolute_and_contained(tmp_path):
+    path = _variant(
+        tmp_path,
+        (
+            'admin_auth_key_file = "/etc/citespec-resource/broker-admin.key"',
+            'admin_auth_key_file = "relative/broker-admin.key"',
+        ),
+    )
+    with pytest.raises(ValueError, match="admin_auth_key_file"):
+        load_config(path)
+
+
+def test_admin_auth_key_must_not_be_filesystem_root(tmp_path):
+    path = _variant(
+        tmp_path,
+        (
+            'admin_auth_key_file = "/etc/citespec-resource/broker-admin.key"',
+            'admin_auth_key_file = "/"',
+        ),
+    )
+    with pytest.raises(ValueError, match="filesystem root"):
+        load_config(path)
+
+
+def test_admin_attestation_ttl_is_bounded(tmp_path):
+    path = _variant(
+        tmp_path,
+        ("admin_attestation_ttl_seconds = 120", "admin_attestation_ttl_seconds = 3600"),
+    )
+    with pytest.raises(ValueError, match="admin_attestation_ttl_seconds"):
+        load_config(path)
+
+
+def test_enabled_portal_requires_base_url(tmp_path):
+    path = _variant(tmp_path, ("enabled = false", "enabled = true"))
+    with pytest.raises(ValueError, match="portal.base_url"):
+        load_config(path)
+
+
+def test_enabled_portal_requires_https_base_url(tmp_path):
+    path = _variant(
+        tmp_path,
+        ("enabled = false", "enabled = true"),
+        ('base_url = ""', 'base_url = "http://portal.example.invalid"'),
+    )
+    with pytest.raises(ValueError, match="https portal.base_url"):
+        load_config(path)
+
+
+def test_enabled_portal_requires_secure_cookie(tmp_path):
+    path = _variant(
+        tmp_path,
+        ("enabled = false", "enabled = true"),
+        ('base_url = ""', 'base_url = "https://portal.example.invalid"'),
+        ("cookie_secure = true", "cookie_secure = false"),
+    )
+    with pytest.raises(ValueError, match="cookie_secure"):
+        load_config(path)
+
+
+def test_enabled_portal_accepts_https_and_secure_cookie(tmp_path):
+    path = _variant(
+        tmp_path,
+        ("enabled = false", "enabled = true"),
+        ('base_url = ""', 'base_url = "https://portal.example.invalid"'),
+    )
+    cfg = load_config(path)
+    assert cfg.portal.enabled is True
+    assert cfg.portal.cookie_secure is True
 
 
 def test_invalid_duration_is_rejected(tmp_path):
@@ -234,7 +305,7 @@ def test_vscode_requires_development_profile(tmp_path):
 def test_workspace_root_rejects_normalized_root(tmp_path, value):
     path = _variant(
         tmp_path,
-        ('workspace_root = "/data1/citespec-users"', f'workspace_root = "{value}"'),
+        ('workspace_root = "/home/data1/citespec-users"', f'workspace_root = "{value}"'),
     )
     with pytest.raises(ValueError, match="workspace_root"):
         load_config(path)

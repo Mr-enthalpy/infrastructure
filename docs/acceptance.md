@@ -67,7 +67,7 @@ modify host state and must be retained as evidence:
   with `prjquota` or `pquota`; `xfs_quota` is available; workspace project quotas
   are enabled; and the workspace filesystem is mounted `nosuid`.
 - Confirm the `nosuid` mount directly with
-  `findmnt -no OPTIONS -T /data1/citespec-users`. Without a user namespace, container
+  `findmnt -no OPTIONS -T /home/data1/citespec-users`. Without a user namespace, container
   root is host root; a setuid file written through the workspace bind must not
   be honored by the host.
 - The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`

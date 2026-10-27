@@ -16,6 +16,10 @@ VENV=$PREFIX/.venv
 CONFIG_DIR=/etc/citespec-resource
 CONFIG_FILE=$CONFIG_DIR/config.toml
 STATE_DIR=/var/lib/citespec-resource
+# The static unit templates below grant access to this exact workspace.  P1-06:
+# reject a different workspace instead of warning and installing units that
+# would create a split directory or a systemd write-permission mismatch.
+SYSTEMD_WORKSPACE_ROOT=/home/data1/citespec-users
 SYSTEMD_UNIT=/etc/systemd/system/citespec-resource-broker.service
 UDEV_RULE=/etc/udev/rules.d/99-citespec-gpu.rules
 SSHD_DROPIN=/etc/ssh/sshd_config.d/60-citespec-resource.conf
@@ -570,11 +574,27 @@ else
     WORKSPACE_ROOT=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
         'import os; from citespec_resource.config import load_config; print(load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).server.workspace_root)') \
         || fail "could not read workspace_root from config"
+    WORKSPACE_MATCH=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" - "$SYSTEMD_WORKSPACE_ROOT" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from citespec_resource.config import load_config
+
+actual = Path(load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).server.workspace_root)
+expected = Path(sys.argv[1])
+if actual.exists() and expected.exists():
+    same = os.path.samefile(actual, expected)
+else:
+    same = actual.resolve() == expected.resolve()
+print("true" if same else "false")
+PY
+) || fail "could not validate workspace_root against the systemd unit path"
+    if [ "$WORKSPACE_MATCH" != "true" ]; then
+        fail "server.workspace_root '$WORKSPACE_ROOT' does not match the static systemd workspace '$SYSTEMD_WORKSPACE_ROOT'; update deploy/systemd units for the new path before installing"
+    fi
     run install -d -o root -g root -m 0755 "$WORKSPACE_ROOT"
     ok "workspace root ready: $WORKSPACE_ROOT"
-    if [ "$WORKSPACE_ROOT" != "/home/data1/citespec-users" ]; then
-        warn "systemd unit ReadWritePaths expects /home/data1/citespec-users; update the unit for $WORKSPACE_ROOT"
-    fi
 fi
 
 run install -d -o root -g root -m 0750 "$STATE_DIR"
@@ -608,6 +628,50 @@ PY
     run chown root:"$PORTAL_USER" "$PORTAL_SECRET_FILE"
     run chmod 0640 "$PORTAL_SECRET_FILE"
     ok "portal secret ready: $PORTAL_SECRET_FILE (root:$PORTAL_USER 0640)"
+fi
+
+# Broker administrator TOTP secrets are encrypted with this root-only key.  The
+# portal service must never be able to read or replace it.  Preserve an existing
+# key on reinstall; rotating it would make enrolled administrator credentials
+# undecryptable.
+if [ "$DRY_RUN" -eq 1 ]; then
+    note "would create/secure ${ADMIN_AUTH_KEY_FILE:-/etc/citespec-resource/broker-admin.key} (root:root 0600)"
+else
+    ADMIN_AUTH_KEY_FILE=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
+        'import os; from citespec_resource.config import load_config; print(load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).server.admin_auth_key_file)') \
+        || fail "could not read server.admin_auth_key_file from config"
+    case "$ADMIN_AUTH_KEY_FILE" in
+        /etc/citespec-resource/*) ;;
+        *) fail "server.admin_auth_key_file must be under /etc/citespec-resource" ;;
+    esac
+    if [ -d "$ADMIN_AUTH_KEY_FILE" ]; then
+        fail "server.admin_auth_key_file must name a file, not a directory: $ADMIN_AUTH_KEY_FILE"
+    fi
+    if [ -L "$ADMIN_AUTH_KEY_FILE" ]; then
+        fail "server.admin_auth_key_file must not be a symbolic link: $ADMIN_AUTH_KEY_FILE"
+    fi
+    ADMIN_AUTH_KEY_DIR=$(dirname "$ADMIN_AUTH_KEY_FILE")
+    if [ ! -d "$ADMIN_AUTH_KEY_DIR" ]; then
+        run install -d -o root -g root -m 0700 "$ADMIN_AUTH_KEY_DIR"
+    fi
+    backup_file "$ADMIN_AUTH_KEY_FILE"
+    if [ ! -f "$ADMIN_AUTH_KEY_FILE" ]; then
+        (umask 077; "$VENV/bin/python" - "$ADMIN_AUTH_KEY_FILE" <<'PY'
+import base64
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    raise SystemExit(0)
+path.write_text(base64.urlsafe_b64encode(os.urandom(32)).decode("ascii") + "\n", encoding="ascii")
+PY
+        ) || fail "could not create broker administrator key: $ADMIN_AUTH_KEY_FILE"
+    fi
+    run chown root:root "$ADMIN_AUTH_KEY_FILE"
+    run chmod 0600 "$ADMIN_AUTH_KEY_FILE"
+    ok "broker administrator key ready: $ADMIN_AUTH_KEY_FILE (root:root 0600)"
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then

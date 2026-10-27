@@ -328,12 +328,25 @@ def set_totp_counter(
     *,
     counter: int,
     now: datetime | None = None,
-) -> None:
-    connection.execute(
-        "UPDATE portal_users SET totp_last_counter = ?, updated_at = ? WHERE user_id = ?",
-        (counter, _now(now), user_id),
+) -> bool:
+    """Consume a TOTP counter exactly once.
+
+    The conditional UPDATE is the authorization check: two concurrent requests
+    that verified the same code both try to advance the stored counter, but only
+    the first can match ``totp_last_counter < counter``.  Callers must treat a
+    false return as a replay and reject the request.
+    """
+
+    cursor = connection.execute(
+        """
+        UPDATE portal_users
+        SET totp_last_counter = ?, updated_at = ?
+        WHERE user_id = ? AND totp_last_counter < ?
+        """,
+        (counter, _now(now), user_id, counter),
     )
     connection.commit()
+    return cursor.rowcount == 1
 
 
 def set_password(
@@ -375,7 +388,6 @@ def record_login_success(
     connection: sqlite3.Connection,
     user_id: str,
     *,
-    totp_counter: int | None = None,
     now: datetime | None = None,
 ) -> None:
     timestamp = _now(now)
@@ -383,11 +395,10 @@ def record_login_success(
         """
         UPDATE portal_users
         SET failed_login_count = 0, locked_until = '', last_login_at = ?,
-            totp_last_counter = CASE WHEN ? IS NULL THEN totp_last_counter ELSE ? END,
             updated_at = ?
         WHERE user_id = ?
         """,
-        (timestamp, totp_counter, totp_counter or 0, timestamp, user_id),
+        (timestamp, timestamp, user_id),
     )
     connection.commit()
 

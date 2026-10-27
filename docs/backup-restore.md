@@ -17,14 +17,21 @@ own quota/retention policy.
   A configured but missing database fails the backup;
 - `portal.db`: the portal account/session/activation/audit database when
   `portal.db_path` is configured and the file exists. The installer initializes
-  it even while the portal is disabled, so a normal installation includes it;
+  it even while the portal is disabled, so a normal installation includes it.
+  A backup fails when `[portal].enabled = true` but the database is missing;
 - `etc/<config-dir>/`: the complete root-owned configuration directory,
-  including `/etc/citespec-resource/authorized-keys.d/` and
-  `/etc/citespec-resource/portal-secret.key`;
+  including `/etc/citespec-resource/authorized-keys.d/`,
+  `/etc/citespec-resource/portal-secret.key`, and the root-only
+  `/etc/citespec-resource/broker-admin.key`;
 - `provision/`: the complete provisioning spool, including `requests/`,
   `processing/`, `results/`, and the executor lock file;
 - `manifest.json`: schema version, source paths, file sizes, and SHA-256
   checksums.
+
+The `broker-admin.key` decrypts the Broker administrator TOTP secrets in
+`state.db`. Restore the matching key and state database together; restoring a
+state database under a different key makes every enrolled Broker administrator
+fail closed and requires re-enrollment.
 
 Backup schema 2 is the supported recovery format. It includes the intake,
 portal, and provisioning state so a restored broker cannot silently diverge

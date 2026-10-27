@@ -45,7 +45,9 @@ except ImportError:  # Windows test host
 
 CREATE_USER_SCRIPT = Path("/usr/local/libexec/citespec-resource/create_user.sh")
 CENTRAL_KEY_DIR = Path("/etc/citespec-resource/authorized-keys.d")
-WORKSPACE_ROOT = Path(os.environ.get("CITESPEC_RESOURCE_WORKSPACE_ROOT", "/data1/citespec-users"))
+WORKSPACE_ROOT = Path(
+    os.environ.get("CITESPEC_RESOURCE_WORKSPACE_ROOT", "/home/data1/citespec-users")
+)
 QUOTA_GB_DEFAULT = 200
 
 FORBIDDEN_NAMES = {
@@ -262,7 +264,10 @@ def _is_sshd_executable(pid: int) -> bool:
         executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
     except OSError:
         return False
-    return executable.name == "sshd"
+    # OpenSSH 9.8+ splits the per-connection process into ``sshd-session``.
+    # Accept both names so key revocation still closes old ControlMaster
+    # sessions on current OpenSSH releases.
+    return executable.name in {"sshd", "sshd-session"}
 
 
 def _member_ssh_monitor_pids(username: str, proc_root: Path = Path("/proc")) -> list[int]:
@@ -275,7 +280,7 @@ def _member_ssh_monitor_pids(username: str, proc_root: Path = Path("/proc")) -> 
     """
     if not proc_root.is_dir():
         raise StageError("session_close", "/proc is unavailable; cannot verify SSH sessions")
-    prefix = f"sshd: {username}"
+    prefixes = (f"sshd: {username}", f"sshd-session: {username}")
     pids: list[int] = []
     inspected = 0
     for entry in proc_root.iterdir():
@@ -289,10 +294,11 @@ def _member_ssh_monitor_pids(username: str, proc_root: Path = Path("/proc")) -> 
         if uid != 0 or not _is_sshd_executable(pid):
             continue
         cmdline = _process_cmdline(pid)
-        if (
+        if any(
             cmdline == prefix
             or cmdline.startswith(prefix + " ")
             or cmdline.startswith(prefix + "@")
+            for prefix in prefixes
         ):
             pids.append(pid)
     if inspected == 0:

@@ -8,10 +8,14 @@ ssh_port = 22
 ssh_user = "admin"
 known_hosts = "~/.ssh/known_hosts"
 data_root = "/data1"
-workspace_root = "/data1/citespec-users"
+workspace_root = "/home/data1/citespec-users"
 broker_socket = "/run/citespec-resource/broker.sock"
 state_db = "/var/lib/citespec-resource/state.db"
 members_file = "/etc/citespec-resource/members.toml"
+# Root-only key that encrypts broker-side administrator TOTP secrets.
+admin_auth_key_file = "/etc/citespec-resource/broker-admin.key"
+# Fresh password + TOTP attestations are single-use and short-lived.
+admin_attestation_ttl_seconds = 120
 
 [hardware]
 gpu_count = 8

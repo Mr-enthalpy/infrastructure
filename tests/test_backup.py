@@ -17,6 +17,7 @@ def _write_config(
     intake_db: Path | None = None,
     spool_dir: Path | None = None,
     portal_db: Path | None = None,
+    portal_enabled: bool = False,
 ) -> None:
     lines = [
         "[server]",
@@ -30,8 +31,12 @@ def _write_config(
         lines.append(f'intake_db = "{intake_db.as_posix()}"')
     if spool_dir is not None:
         lines.append(f'provisioning_spool = "{spool_dir.as_posix()}"')
-    if portal_db is not None:
-        lines += ["", "[portal]", f'db_path = "{portal_db.as_posix()}"']
+    if portal_db is not None or portal_enabled:
+        lines += ["", "[portal]"]
+        if portal_db is not None:
+            lines.append(f'db_path = "{portal_db.as_posix()}"')
+        if portal_enabled:
+            lines.append("enabled = true")
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -267,6 +272,36 @@ def test_backup_fails_if_configured_spool_is_missing(tmp_path):
 
     with pytest.raises(backup.BackupError, match="provisioning spool"):
         backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+
+
+def test_enabled_portal_with_missing_database_fails_closed(tmp_path):
+    config_dir = tmp_path / "etc"
+    config_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    _make_state_db(state_db, "broker")
+    portal_db = tmp_path / "missing-portal.db"
+    config_path = config_dir / "config.toml"
+    _write_config(config_path, state_db, portal_db=portal_db, portal_enabled=True)
+
+    with pytest.raises(backup.BackupError, match="Portal is enabled"):
+        backup.create_backup(config_path, tmp_path / "backups", stamp="20260101-000000")
+    assert not (tmp_path / "backups").exists()
+
+
+def test_backup_marks_enabled_portal_in_manifest(tmp_path):
+    config_dir = tmp_path / "etc"
+    config_dir.mkdir()
+    state_db = tmp_path / "state.db"
+    portal_db = tmp_path / "portal.db"
+    _make_state_db(state_db, "broker")
+    _make_db(portal_db, "portal")
+    config_path = config_dir / "config.toml"
+    _write_config(config_path, state_db, portal_db=portal_db, portal_enabled=True)
+
+    result = backup.create_backup(config_path, tmp_path / "backups", stamp="20260101-000000")
+    manifest = json.loads((result / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sources"]["portal_enabled"] is True
+    assert "portal.db" in {entry["path"] for entry in manifest["files"]}
 
 
 def test_backup_and_restore_include_portal_database(tmp_path):

@@ -38,6 +38,10 @@ The following conditions must be satisfied before installation:
   not be used as the production runtime.
 - `lab/resources.local.toml` contains the target host inventory and remains
   excluded from Git.
+- `server.workspace_root` must resolve to `/home/data1/citespec-users`, the path
+  baked into the static systemd units. The installer fails closed on a different
+  path instead of installing units with mismatched write permissions; update
+  `deploy/systemd/` first if the workspace must move.
 - The read-only checks in Section 3 pass. For the development profile, the
   storage, quota, and `nosuid` requirements in Section 5 are mandatory.
 - For the portal, the internal DNS, campus VPN route/DNS, TLS certificate, and
@@ -163,7 +167,7 @@ these tools is unavailable.
 
    ```bash
    bash deploy/configure_quotas.sh \
-     --workspace-root /data1/citespec-users \
+     --workspace-root /home/data1/citespec-users \
      --limit-gb 200 \
      --yes
    ```

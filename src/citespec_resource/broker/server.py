@@ -69,7 +69,7 @@ from ..workspace_quota import (
     provision_member_quota,
     verify_member_quota,
 )
-from . import workspace_io
+from . import admin_auth, workspace_io
 from .docker_driver import (
     ContainerInfo,
     DockerBackend,
@@ -516,6 +516,61 @@ class Broker:
         }
         if command in admin_only and actor["role"] != "admin":
             raise Forbidden("portal administrator permission required")
+        if command == "portal_admin_attest":
+            self._check_args(
+                args,
+                {"actor", "username", "password", "totp", "action", "target"},
+            )
+            if actor["role"] != "admin":
+                raise Forbidden("portal administrator permission required")
+            username = args.get("username")
+            password = args.get("password")
+            otp = args.get("totp")
+            action = args.get("action")
+            target = args.get("target")
+            if (
+                not isinstance(username, str)
+                or not isinstance(password, str)
+                or not isinstance(otp, str)
+                or not isinstance(action, str)
+                or not isinstance(target, str)
+            ):
+                raise BadRequest("administrator attestation fields must be strings")
+            try:
+                issued = await asyncio.to_thread(
+                    self._issue_portal_admin_attestation,
+                    username=username,
+                    password=password,
+                    otp=otp,
+                    action=action,
+                    target=target,
+                    actor=actor,
+                )
+            except admin_auth.AdminAuthDenied as exc:
+                self._record_portal_event(
+                    identity,
+                    actor,
+                    "portal_admin_attestation_denied",
+                    target=target,
+                    detail={"attestation_action": action},
+                )
+                raise Forbidden(str(exc)) from exc
+            except ValueError as exc:
+                raise BadRequest(str(exc)) from exc
+            self._record_portal_event(
+                identity,
+                actor,
+                "portal_admin_attested",
+                target=target,
+                detail={
+                    "attested_admin": issued["admin"],
+                    "attestation_action": action,
+                    "expires_at": issued["expires_at"],
+                    "nonce": issued["nonce"],
+                },
+            )
+            issued.pop("nonce", None)
+            return issued
         if command == "portal_status":
             self._check_args(args, {"actor"})
             with self._connection() as connection:
@@ -571,16 +626,40 @@ class Broker:
             "portal_members_revoke": "admin_members_revoke",
         }
         if command in mapped_mutations:
+            target_key = "request_id" if command.startswith("portal_requests_") else "member_id"
+            target = args.get(target_key)
+            if not isinstance(target, str) or not target:
+                raise BadRequest(f"{target_key} must be a non-empty string")
+            token = args.get("attestation")
+            if not isinstance(token, str) or not token:
+                raise Forbidden("fresh administrator attestation required")
+            try:
+                attested = await asyncio.to_thread(
+                    self._consume_portal_admin_attestation,
+                    token=token,
+                    action=command,
+                    target=target,
+                    actor=actor,
+                )
+            except admin_auth.AdminAuthDenied as exc:
+                self._record_portal_event(
+                    identity,
+                    actor,
+                    "portal_admin_attestation_denied",
+                    target=target,
+                    detail={"attestation_action": command},
+                )
+                raise Forbidden(str(exc)) from exc
             result = await self._handle_membership_command(
                 mapped_mutations[command],
                 identity,
-                self._without_actor(args),
+                self._without_portal_auth(args),
                 allow_portal=True,
             )
-            target = str(
-                args.get("request_id") or args.get("member_id") or result.get("member_id") or ""
-            )
-            detail: dict[str, Any] = {}
+            detail: dict[str, Any] = {
+                "attested_admin": attested["admin"],
+                "attestation_nonce": attested["nonce"],
+            }
             if isinstance(result, dict):
                 for key in ("request_id", "member_id", "operation_id", "status"):
                     if key in result:
@@ -601,6 +680,107 @@ class Broker:
             with self._connection() as connection:
                 return {"events": store.list_events(connection, limit=limit)}
         raise BadRequest(f"unknown portal command: {command}")
+
+    def _issue_portal_admin_attestation(
+        self,
+        *,
+        username: str,
+        password: str,
+        otp: str,
+        action: str,
+        target: str,
+        actor: dict[str, str],
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            return admin_auth.issue_attestation(
+                connection,
+                username=username,
+                password=password,
+                otp=otp,
+                action=action,
+                target=target,
+                portal_user_id=actor["user_id"],
+                portal_username=actor["username"],
+                key_path=self.config.server.admin_auth_key_file,
+                ttl_seconds=self.config.server.admin_attestation_ttl_seconds,
+                now=self._now(),
+            )
+
+    def _consume_portal_admin_attestation(
+        self,
+        *,
+        token: str,
+        action: str,
+        target: str,
+        actor: dict[str, str],
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            return admin_auth.consume_attestation(
+                connection,
+                token=token,
+                action=action,
+                target=target,
+                portal_user_id=actor["user_id"],
+                portal_username=actor["username"],
+                now=self._now(),
+            )
+
+    def _handle_portal_admin_auth_command(
+        self,
+        command: str,
+        identity: Identity,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Broker-managed credentials for portal administrator attestations."""
+
+        if command == "admin_portal_auth_list":
+            self._check_args(args)
+            with self._connection() as connection:
+                return {"admins": admin_auth.list_admins(connection)}
+        if command == "admin_portal_auth_enroll":
+            self._check_args(args, {"username", "password"})
+            username = self._portal_admin_string(args, "username")
+            password = self._portal_admin_string(args, "password")
+            try:
+                with self._connection() as connection:
+                    result = admin_auth.enroll_admin(
+                        connection,
+                        username=username,
+                        password=password,
+                        key_path=self.config.server.admin_auth_key_file,
+                        now=self._now(),
+                    )
+                    store.record_event(
+                        connection,
+                        actor_uid=identity.uid,
+                        action="admin_portal_auth_enrolled",
+                        detail={"target": result["username"]},
+                        now=self._now(),
+                    )
+                    connection.commit()
+            except admin_auth.AdminAuthDenied as exc:
+                raise InternalError("administrator authentication key is unavailable") from exc
+            except ValueError as exc:
+                raise BadRequest(str(exc)) from exc
+            return result
+        if command == "admin_portal_auth_remove":
+            self._check_args(args, {"username"})
+            username = self._portal_admin_string(args, "username")
+            with self._connection() as connection:
+                removed = admin_auth.remove_admin(connection, username=username)
+            if not removed:
+                raise NotFound(f"portal administrator credential not found: {username}")
+            with self._connection() as connection:
+                store.record_event(
+                    connection,
+                    actor_uid=identity.uid,
+                    action="admin_portal_auth_removed",
+                    detail={"target": username},
+                    now=self._now(),
+                )
+                connection.commit()
+            return {"username": username, "removed": True}
+        raise BadRequest(f"unknown portal auth command: {command}")
 
     def _handle_portal_admin_command(
         self,
@@ -778,6 +958,10 @@ class Broker:
     @staticmethod
     def _without_actor(args: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in args.items() if key != "actor"}
+
+    @staticmethod
+    def _without_portal_auth(args: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in args.items() if key not in {"actor", "attestation"}}
 
     @staticmethod
     def _submit_portal_application(
@@ -2621,6 +2805,20 @@ class Broker:
                 return _ok(
                     await asyncio.to_thread(
                         self._handle_portal_admin_command,
+                        command,
+                        identity,
+                        args,
+                    )
+                )
+            if command in {
+                "admin_portal_auth_list",
+                "admin_portal_auth_enroll",
+                "admin_portal_auth_remove",
+            }:
+                self._require_admin(identity)
+                return _ok(
+                    await asyncio.to_thread(
+                        self._handle_portal_admin_auth_command,
                         command,
                         identity,
                         args,

@@ -22,6 +22,7 @@ from citespec_resource.netutil import trusted_client_ip
 from citespec_resource.portal import security
 from citespec_resource.portal import server as portal_server
 from citespec_resource.portal import store as portal_store
+from citespec_resource.portal.broker import PortalBrokerError
 
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = b"portal-test-secret-material-0123456789abcdef"
@@ -90,6 +91,13 @@ class FakeBroker:
                 },
                 "keys": [],
                 "operations": [],
+            }
+        if command == "portal_admin_attest":
+            return {
+                "attestation": "test-attestation-token-0123456789abcdef",
+                "expires_at": (NOW + timedelta(minutes=2)).isoformat(),
+                "action": args.get("action", ""),
+                "target": args.get("target", ""),
             }
         if command == "portal_requests_list":
             return []
@@ -176,9 +184,14 @@ def _seed_account(
 
 
 def _reset_counter(db: str, user_id: str) -> None:
+    # Test-only setup: production never rewinds a consumed TOTP counter.
     connection = portal_store.connect(db)
     try:
-        portal_store.set_totp_counter(connection, user_id, counter=0)
+        connection.execute(
+            "UPDATE portal_users SET totp_last_counter = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        connection.commit()
     finally:
         connection.close()
 
@@ -205,6 +218,24 @@ async def _login(
     )
     assert response.status == 302
     assert _cookie(client, portal_server.SESSION_COOKIE)
+
+
+def test_totp_counter_can_only_be_consumed_once(tmp_path: Path):
+    db = tmp_path / "portal.db"
+    initialized = portal_store.init_portal_db(db)
+    initialized.close()
+    user_id, totp_secret = _seed_account(str(db), username="alice")
+    code = pyotp.TOTP(totp_secret).now()
+    counter = security.verify_totp(totp_secret, code)
+    assert counter is not None
+    connection = portal_store.connect(db)
+    try:
+        assert portal_store.set_totp_counter(connection, user_id, counter=counter)
+        assert not portal_store.set_totp_counter(connection, user_id, counter=counter)
+        assert not portal_store.set_totp_counter(connection, user_id, counter=counter - 1)
+        assert portal_store.set_totp_counter(connection, user_id, counter=counter + 1)
+    finally:
+        connection.close()
 
 
 def test_security_primitives_round_trip_and_reject_replay(tmp_path: Path):
@@ -684,6 +715,34 @@ async def test_admin_resume_does_not_activate_pending_portal_account(portal):
     finally:
         connection.close()
     assert any(call[0] == "portal_members_resume" for call in broker.calls)
+
+
+async def test_admin_mutation_requires_broker_attestation(portal):
+    client, broker, config = portal
+    admin_id, admin_secret = _seed_account(
+        config.portal.db_path,
+        username="admin",
+        role="admin",
+        member_id="m-admin",
+    )
+    broker.responses["portal_admin_attest"] = PortalBrokerError(
+        "forbidden", "broker administrator verification failed"
+    )
+    await _login(client, "admin", PASSWORD, admin_secret)
+    _reset_counter(config.portal.db_path, admin_id)
+    csrf = _cookie(client, portal_server.CSRF_COOKIE)
+    response = await client.post(
+        "/admin/members/m-pending/resume",
+        data={
+            "_csrf": csrf,
+            "password": PASSWORD,
+            "totp": pyotp.TOTP(admin_secret).now(),
+            "reason": "local credentials must not be enough",
+        },
+        allow_redirects=False,
+    )
+    assert response.status == 403, await response.text()
+    assert not any(call[0] == "portal_members_resume" for call in broker.calls)
 
 
 async def test_admin_approval_creates_pending_account_and_activation_code(portal):

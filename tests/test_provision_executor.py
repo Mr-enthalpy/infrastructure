@@ -227,6 +227,29 @@ def test_session_scan_matches_only_exact_member_root_sshd(monkeypatch, tmp_path)
     assert executor._member_ssh_monitor_pids("alice", proc_root=proc) == [10, 11, 15]
 
 
+def test_session_scan_recognizes_openssh_98_sshd_session(monkeypatch, tmp_path):
+    executor = _load_executor()
+    source = EXECUTOR.read_text(encoding="utf-8")
+    assert '{"sshd", "sshd-session"}' in source
+    assert "sshd-session: " in source
+
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    for pid in (20, 21, 22):
+        (proc / str(pid)).mkdir()
+    real_uids = {20: 0, 21: 0, 22: 0}
+    cmdlines = {
+        20: "sshd-session: alice",
+        21: "sshd-session: alice [priv]",
+        22: "sshd-session: alice2",
+    }
+    monkeypatch.setattr(executor, "_process_uid", lambda pid: real_uids[pid])
+    monkeypatch.setattr(executor, "_is_sshd_executable", lambda pid: True)
+    monkeypatch.setattr(executor, "_process_cmdline", lambda pid: cmdlines[pid])
+
+    assert executor._member_ssh_monitor_pids("alice", proc_root=proc) == [20, 21]
+
+
 def test_session_scan_fails_closed_when_proc_is_unreadable(monkeypatch, tmp_path):
     executor = _load_executor()
     proc = tmp_path / "proc"

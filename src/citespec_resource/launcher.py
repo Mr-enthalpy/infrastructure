@@ -22,8 +22,10 @@ from .update import (
     find_app_root,
     install_update,
     mark_update_checked,
+    payload_for_version,
     resolve_payload,
     update_check_due,
+    write_current,
 )
 
 _COMMANDS_WITHOUT_UPDATE = {"help", "--help", "-h", "version", "update"}
@@ -32,8 +34,9 @@ _COMMANDS_WITHOUT_UPDATE = {"help", "--help", "-h", "version", "update"}
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     root = find_app_root()
+    previous_version = ""
     if root is not None and _should_auto_update(args):
-        _maybe_update(root)
+        previous_version = _maybe_update(root)
 
     payload = resolve_payload(root) if root is not None else None
     if payload is None:
@@ -43,7 +46,18 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    return _run(payload, args)
+    try:
+        return _run(payload, args)
+    except OSError as exc:
+        if root is None:
+            print(f"citespec-resource: cannot start client payload: {exc}", file=sys.stderr)
+            return 1
+        return _rollback_after_start_failure(
+            root,
+            args,
+            previous_version=previous_version,
+            error=exc,
+        )
 
 
 def _should_auto_update(args: list[str]) -> bool:
@@ -54,10 +68,12 @@ def _should_auto_update(args: list[str]) -> bool:
     return True
 
 
-def _maybe_update(root: Path) -> None:
+def _maybe_update(root: Path) -> str:
+    """Install an update if available and return the version to fall back to."""
+
     current = resolve_payload(root)
     if current is not None and not update_check_due(root):
-        return
+        return ""
     timeout = _float_env("CITESPEC_UPDATE_TIMEOUT", 5.0)
     if current is not None and current.parent.parent.name == VERSIONS_DIR:
         current_version = current.parent.name
@@ -71,17 +87,18 @@ def _maybe_update(root: Path) -> None:
         )
         mark_update_checked(root)
         if not info.available:
-            return
+            return ""
         print(
             f"citespec-resource: installing {info.latest_version} (current {info.current_version})",
             file=sys.stderr,
         )
-        install_update(
+        result = install_update(
             info,
             app_root=root,
             allow_insecure=_allow_insecure(),
             timeout=_float_env("CITESPEC_UPDATE_DOWNLOAD_TIMEOUT", 120.0),
         )
+        return result.previous_version or (current_version if current is not None else "")
     except UpdateError as exc:
         mark_update_checked(root)
         if current is None:
@@ -97,14 +114,38 @@ def _maybe_update(root: Path) -> None:
             print(f"citespec-resource: update failed: {exc}", file=sys.stderr)
         else:
             print(f"citespec-resource: update check failed: {exc}", file=sys.stderr)
+    return ""
+
+
+def _rollback_after_start_failure(
+    root: Path,
+    args: list[str],
+    *,
+    previous_version: str,
+    error: OSError,
+) -> int:
+    print(f"citespec-resource: cannot start updated client payload: {error}", file=sys.stderr)
+    previous_payload = payload_for_version(root, previous_version) if previous_version else None
+    if previous_payload is None:
+        print("citespec-resource: no previous client payload is available", file=sys.stderr)
+        return 1
+    try:
+        write_current(root, previous_version)
+    except (OSError, UpdateError) as exc:
+        print(
+            f"citespec-resource: could not restore previous client version: {exc}", file=sys.stderr
+        )
+        return 1
+    print(f"citespec-resource: rolled back to {previous_version}", file=sys.stderr)
+    try:
+        return _run(previous_payload, args)
+    except OSError as exc:
+        print(f"citespec-resource: cannot start previous client payload: {exc}", file=sys.stderr)
+        return 1
 
 
 def _run(payload: Path, args: list[str]) -> int:
-    try:
-        completed = subprocess.run([str(payload), *args], check=False)
-    except OSError as exc:
-        print(f"citespec-resource: cannot start client payload: {exc}", file=sys.stderr)
-        return 1
+    completed = subprocess.run([str(payload), *args], check=False)
     return completed.returncode
 
 

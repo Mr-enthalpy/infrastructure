@@ -33,6 +33,7 @@ from typing import Any
 from . import __version__
 
 MANIFEST_SCHEMA = 1
+_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z][0-9A-Za-z.-]{0,63})?")
 DEFAULT_MANIFEST_URL = (
     "https://github.com/Mr-enthalpy/infrastructure/releases/latest/download/"
     "citespec-resource-manifest.json"
@@ -282,30 +283,35 @@ def install_update(
 ) -> UpdateResult:
     if not info.available or info.manifest is None or info.artifact is None:
         raise UpdateError(info.reason or "no update is available")
+    version = info.manifest.version
+    if _version_key(version) is None:
+        raise UpdateError("update manifest has an unsafe version")
     root = Path(app_root).expanduser().resolve()
     versions = root / VERSIONS_DIR
     updates = root / UPDATES_DIR
     versions.mkdir(parents=True, exist_ok=True)
     updates.mkdir(parents=True, exist_ok=True)
-    destination = versions / info.manifest.version
+    destination = versions / version
+    if not _is_within(destination, versions):
+        raise UpdateError("update version escapes the versions directory")
     previous = installed_version(root)
     if _payload_path(destination).is_file():
-        write_current(root, info.manifest.version)
-        return UpdateResult(info.manifest.version, destination, previous)
+        write_current(root, version)
+        return UpdateResult(version, destination, previous)
 
     lock = updates / ".update.lock"
     lock_handle = _acquire_update_lock(lock)
     try:
         with lock_handle:
             lock_handle.write(str(os.getpid()))
-        archive = updates / f"{info.manifest.version}.zip"
+        archive = updates / f"{version}.zip"
         _download_artifact(
             info.artifact,
             archive,
             timeout=timeout,
             allow_insecure=allow_insecure,
         )
-        temporary = versions / f".{info.manifest.version}.tmp-{os.getpid()}"
+        temporary = versions / f".{version}.tmp-{os.getpid()}"
         if temporary.exists():
             shutil.rmtree(temporary)
         try:
@@ -330,8 +336,8 @@ def install_update(
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
             archive.unlink(missing_ok=True)
-        write_current(root, info.manifest.version)
-        return UpdateResult(info.manifest.version, destination, previous)
+        write_current(root, version)
+        return UpdateResult(version, destination, previous)
     finally:
         lock.unlink(missing_ok=True)
 
@@ -372,6 +378,19 @@ def resolve_payload(app_root: Path | str) -> Path | None:
             return candidate
     fallback = _payload_path(root / VERSIONS_DIR / __version__)
     return fallback if fallback.is_file() else None
+
+
+def payload_for_version(app_root: Path | str, version: str) -> Path | None:
+    """Return the payload for one safe, already-installed version."""
+
+    if not isinstance(version, str) or _version_key(version) is None:
+        return None
+    root = Path(app_root)
+    versions = root / VERSIONS_DIR
+    candidate = _payload_path(versions / version)
+    if _is_within(candidate, versions) and candidate.is_file():
+        return candidate
+    return None
 
 
 def find_app_root() -> Path | None:
@@ -498,10 +517,13 @@ def _extract_zip(archive: Path, destination: Path) -> None:
     with zipfile.ZipFile(archive) as bundle:
         for item in bundle.infolist():
             name = item.filename
-            parts = PurePosixPath(name.replace("\\", "/")).parts
+            normalized = name.replace("\\", "/")
+            if any(ord(character) < 0x20 for character in normalized):
+                raise UpdateError("update artifact contains an unsafe path")
+            parts = PurePosixPath(normalized).parts
             if not parts or any(part in {"", ".", ".."} for part in parts):
                 raise UpdateError("update artifact contains an unsafe path")
-            if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+            if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
                 raise UpdateError("update artifact contains an absolute path")
             mode = (item.external_attr >> 16) & 0o170000
             if mode == 0o120000:
@@ -510,6 +532,8 @@ def _extract_zip(archive: Path, destination: Path) -> None:
             if extracted > MAX_EXTRACTED_BYTES:
                 raise UpdateError("update artifact expands to too much data")
             target = destination.joinpath(*parts)
+            if not _is_within(target, destination):
+                raise UpdateError("update artifact contains an unsafe path")
             if item.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -536,10 +560,14 @@ def _required_int(payload: Mapping[str, Any], key: str) -> int:
 
 
 def _version_key(value: str) -> tuple[int, ...] | None:
-    match = re.fullmatch(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?", value.strip())
+    if not isinstance(value, str) or value != value.strip() or len(value) > 80:
+        return None
+    match = _VERSION_RE.fullmatch(value)
     if not match:
         return None
-    return tuple(int(part or 0) for part in match.groups())
+    core = value.split("-", 1)[0].split("+", 1)[0]
+    parts = [int(part) for part in core.split(".")]
+    return tuple(parts + [0] * (3 - len(parts)))
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -576,6 +604,7 @@ __all__ = [
     "manifest_signing_bytes",
     "mark_update_checked",
     "parse_manifest",
+    "payload_for_version",
     "payload_name",
     "platform_key",
     "read_current",

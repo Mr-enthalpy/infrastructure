@@ -179,6 +179,8 @@ uv.lock              # 锁定依赖版本
   入口的 DNS、VPN、防火墙、TLS 证书问题和验收清单。
 - [docs/handoff.md](docs/handoff.md)：当前实施状态、已验证项、目标机待验证项和
   下一会话的操作边界。
+- [docs/guides/admin-attestation.md](docs/guides/admin-attestation.md): Broker-verified,
+  one-use administrator attestations for Portal admin mutations.
 - [docs/guides/member-quickstart.md](docs/guides/member-quickstart.md)：新成员申请、
   工作站配置、密钥轮换与日常自助。
 - [docs/guides/admin-membership.md](docs/guides/admin-membership.md)：邀请、审批、

@@ -225,6 +225,37 @@ async def _broker_call(
         raise PortalFormError(f"服务暂不可用：{exc.message}", 503) from exc
 
 
+async def _attest_admin(
+    request: web.Request,
+    admin: dict[str, Any],
+    *,
+    action: str,
+    target: str,
+    password: str,
+    otp: str,
+) -> str:
+    """Ask the broker to verify fresh admin credentials for one mutation."""
+
+    try:
+        result = await _broker(request).call(
+            "portal_admin_attest",
+            actor=_actor(admin),
+            username=str(admin["username"]),
+            password=password,
+            totp=otp,
+            action=action,
+            target=target,
+        )
+    except PortalBrokerError as exc:
+        if exc.code in {"forbidden", "unauthorized"}:
+            raise PortalFormError("Broker administrator verification failed", 403) from exc
+        raise PortalFormError("broker service unavailable", 503) from exc
+    token = result.get("attestation") if isinstance(result, dict) else None
+    if not isinstance(token, str) or not token:
+        raise PortalFormError("broker did not issue an administrator attestation", 502)
+    return token
+
+
 async def _public_broker_call(
     request: web.Request,
     command: str,
@@ -529,6 +560,19 @@ async def login_submit(request: web.Request) -> web.Response:
             )
             _audit(request, "login_failed", user=user, detail={"reason": "totp"})
             return _login_error(request, "用户名或凭据不正确", next_url=next_url)
+        if not store.set_totp_counter(
+            connection,
+            user["user_id"],
+            counter=counter,
+            now=now,
+        ):
+            _audit(request, "login_failed", user=user, detail={"reason": "totp_replay"})
+            return _login_error(
+                request,
+                "该验证码已被使用，请等待下一次验证码",
+                403,
+                next_url=next_url,
+            )
         csrf = security.new_csrf_token()
         session = store.create_session(
             connection,
@@ -542,7 +586,6 @@ async def login_submit(request: web.Request) -> web.Response:
         store.record_login_success(
             connection,
             user["user_id"],
-            totp_counter=counter,
             now=now,
         )
         _audit(request, "login_success", user=user)
@@ -1021,12 +1064,19 @@ def _verify_reauth(
     if counter is None:
         _audit(request, "reauth_failed", user=user, detail={"action": action, "reason": "totp"})
         raise PortalFormError("当前密码或 TOTP 不正确", 403)
-    store.set_totp_counter(
+    if not store.set_totp_counter(
         connection,
         user["user_id"],
         counter=counter,
         now=request.app[CLOCK_KEY](),
-    )
+    ):
+        _audit(
+            request,
+            "reauth_failed",
+            user=user,
+            detail={"action": action, "reason": "totp_replay"},
+        )
+        raise PortalFormError("该验证码已被使用，请等待下一次验证码", 403)
 
 
 async def admin_index(request: web.Request) -> web.Response:
@@ -1151,15 +1201,14 @@ async def admin_approve(request: web.Request) -> web.Response:
         return _render(request, "error.html", status=400, error="配额必须是整数")
     if quota_gb <= 0:
         return _render(request, "error.html", status=400, error="配额必须为正整数")
-    with _db(request) as connection:
-        _verify_reauth(
-            request,
-            connection,
-            admin,
-            password=password,
-            otp=otp,
-            action="request_approve",
-        )
+    attestation = await _attest_admin(
+        request,
+        admin,
+        action="portal_requests_approve",
+        target=request_id,
+        password=password,
+        otp=otp,
+    )
     try:
         detail = await _request_detail(request, admin, request_id)
         result = await _broker_call(
@@ -1172,6 +1221,7 @@ async def admin_approve(request: web.Request) -> web.Response:
             review_note=review_note,
             internal_note="",
             expected_version=expected_version,
+            attestation=attestation,
         )
     except PortalFormError as exc:
         return _render(
@@ -1239,15 +1289,14 @@ async def admin_reject(request: web.Request) -> web.Response:
     review_note = _form_text(post, "review_note")
     if not review_note:
         return _render(request, "error.html", status=400, error="拒绝时必须填写申请人可见的原因")
-    with _db(request) as connection:
-        _verify_reauth(
-            request,
-            connection,
-            admin,
-            password=password,
-            otp=otp,
-            action="request_reject",
-        )
+    attestation = await _attest_admin(
+        request,
+        admin,
+        action="portal_requests_reject",
+        target=request_id,
+        password=password,
+        otp=otp,
+    )
     try:
         await _broker_call(
             request,
@@ -1257,6 +1306,7 @@ async def admin_reject(request: web.Request) -> web.Response:
             review_note=review_note,
             internal_note="",
             expected_version=expected_version,
+            attestation=attestation,
         )
     except PortalFormError as exc:
         return _render(request, "error.html", status=409, error=f"拒绝失败：{exc.message}")
@@ -1400,15 +1450,14 @@ async def admin_member_action(request: web.Request) -> web.Response:
     reason = _form_text(post, "reason")
     if not reason:
         return _render(request, "error.html", status=400, error="状态变更必须填写原因")
-    with _db(request) as connection:
-        _verify_reauth(
-            request,
-            connection,
-            admin,
-            password=password,
-            otp=otp,
-            action=f"member_{action}",
-        )
+    attestation = await _attest_admin(
+        request,
+        admin,
+        action=command,
+        target=member_id,
+        password=password,
+        otp=otp,
+    )
     try:
         await _broker_call(
             request,
@@ -1416,6 +1465,7 @@ async def admin_member_action(request: web.Request) -> web.Response:
             command,
             member_id=member_id,
             reason=reason,
+            attestation=attestation,
         )
     except PortalFormError as exc:
         return _render(request, "error.html", status=409, error=f"操作失败：{exc.message}")

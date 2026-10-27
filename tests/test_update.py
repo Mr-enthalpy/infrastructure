@@ -85,6 +85,59 @@ def test_verify_manifest_rejects_tampering():
         update.verify_manifest(manifest, public_key_b64=public)
 
 
+@pytest.mark.parametrize(
+    "version",
+    [
+        "../0.2.0",
+        "0.2.0/../../outside",
+        "0.2.0\\..\\outside",
+        " 0.2.0",
+        "0.2.0 ",
+        "0.2.0/evil",
+        "C:0.2.0",
+        "0.2.0\n",
+    ],
+)
+def test_manifest_rejects_unsafe_versions(version):
+    manifest = {
+        "schema": 1,
+        "version": version,
+        "protocol": 1,
+        "min_client_protocol": 1,
+        "artifacts": {
+            "test": {"url": "https://example.invalid/x.zip", "sha256": "0" * 64, "size": 1}
+        },
+    }
+    with pytest.raises(update.UpdateError, match="invalid version"):
+        update.parse_manifest(manifest)
+
+
+def test_write_current_rejects_unsafe_version(tmp_path):
+    with pytest.raises(update.UpdateError, match="invalid client version"):
+        update.write_current(tmp_path, "../outside")
+    assert not (tmp_path / update.CURRENT_FILE).exists()
+
+
+def test_install_update_rejects_unsafe_version_even_if_info_is_forged(tmp_path):
+    manifest = update.UpdateManifest(
+        version="../outside",
+        protocol=1,
+        min_client_protocol=1,
+        artifacts={"test": update.Artifact("https://example.invalid/x.zip", "0" * 64, 1)},
+    )
+    info = update.UpdateInfo(
+        available=True,
+        current_version="0.1.0",
+        latest_version=manifest.version,
+        reason="forged",
+        manifest=manifest,
+        artifact=manifest.artifacts["test"],
+    )
+    with pytest.raises(update.UpdateError, match="unsafe version"):
+        update.install_update(info, app_root=tmp_path, allow_insecure=True)
+    assert not (tmp_path.parent / "outside").exists()
+
+
 def test_verify_manifest_requires_signature():
     with pytest.raises(update.UpdateError, match="not signed"):
         update.verify_manifest(
@@ -279,6 +332,37 @@ def test_install_update_rejects_zip_slip_and_sha_mismatch(tmp_path):
     )
     with pytest.raises(update.UpdateError, match="SHA-256"):
         update.install_update(info2, app_root=root, allow_insecure=True)
+
+
+def test_install_update_rejects_backslash_absolute_zip_entry(tmp_path):
+    private, public = _keypair()
+    root = tmp_path / "app"
+    root.mkdir()
+    archive = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(update.payload_name(), b"payload")
+        bundle.writestr("\\escaped.txt", b"no")
+    manifest = _signed_manifest(
+        private,
+        version="0.2.0",
+        artifacts={"test": _artifact(archive)},
+    )
+    info = update.check_for_update(
+        current_version="0.1.0",
+        platform="test",
+        manifest_payload=manifest,
+        public_key_b64=public,
+    )
+    with pytest.raises(update.UpdateError, match="absolute path"):
+        update.install_update(info, app_root=root, allow_insecure=True)
+
+
+def test_payload_for_version_rejects_traversal(tmp_path):
+    root = tmp_path / "app"
+    (root / "versions" / "0.1.0").mkdir(parents=True)
+    (root / "versions" / "0.1.0" / update.payload_name()).write_bytes(b"ok")
+    assert update.payload_for_version(root, "0.1.0") is not None
+    assert update.payload_for_version(root, "../0.1.0") is None
 
 
 def test_resolve_payload_ignores_unsafe_current_version(tmp_path):

@@ -105,6 +105,39 @@ def test_installer_has_transactional_backup_and_rollback():
     assert "udevadm verify" in source
 
 
+def test_preflight_fails_active_mode_when_gpu_compute_is_busy():
+    source = (ROOT / "deploy/preflight.sh").read_text(encoding="utf-8")
+    assert 'if [ "${MODE:-monitor}" = "active" ]' in source
+    assert "active mode requires no GPU compute processes" in source
+    assert "could not query GPU compute processes" in source
+
+
+def test_installer_provisions_root_only_broker_admin_key():
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "server.admin_auth_key_file" in source
+    assert "broker-admin.key" in source
+    assert "server.admin_auth_key_file must be under /etc/citespec-resource" in source
+    assert "must name a file, not a directory" in source
+    assert "must not be a symbolic link" in source
+    assert 'chown root:root "$ADMIN_AUTH_KEY_FILE"' in source
+    assert 'chmod 0600 "$ADMIN_AUTH_KEY_FILE"' in source
+
+
+def test_installer_rejects_workspace_root_that_static_units_do_not_cover():
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "SYSTEMD_WORKSPACE_ROOT=/home/data1/citespec-users" in source
+    assert "does not match the static systemd workspace" in source
+    assert 'warn "systemd unit ReadWritePaths' not in source
+    for name in (
+        "citespec-resource-broker.service",
+        "citespec-resource-provision.service",
+        "citespec-resource-disk-check.service",
+        "citespec-resource-logrotate.service",
+    ):
+        unit = (ROOT / "deploy/systemd" / name).read_text(encoding="utf-8")
+        assert "/home/data1/citespec-users" in unit
+
+
 def test_quota_helper_enables_ext4_project_inheritance():
     source = (ROOT / "deploy/configure_quotas.sh").read_text(encoding="utf-8")
     assert "chattr -R -p" in source

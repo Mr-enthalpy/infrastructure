@@ -48,7 +48,7 @@
     {% if request_row.decision and request_row.decision.status == 'approved' and not portal_user %}
       <div class="actions">
         <h3>创建 Portal 账号</h3>
-        <p class="muted">用于 CLI 批准或历史批准后补建账号。激活码只显示一次。</p>
+        <p class="muted">用于 CLI 批准或历史批准后补建账号。激活码只显示一次。此表单使用 Portal 登录密码和 Portal TOTP。</p>
         <form method="post" action="/admin/registrations/{{ request_row.request_id }}/portal-account">
           <input type="hidden" name="_csrf" value="{{ csrf }}">
           <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
@@ -73,9 +73,9 @@
       <input id="quota_gb" name="quota_gb" type="number" min="1" value="200" required>
       <label for="review_note">公开说明（可选）</label>
       <textarea id="review_note" name="review_note"></textarea>
-      <p class="small warning">批准会自动开通 Linux 成员并创建待激活 Portal 账号。需要密码和 TOTP 再次确认。</p>
-      <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
-      <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+      <p class="small warning">批准会自动开通 Linux 成员并创建待激活 Portal 账号。此处必须使用 Broker 管理员密码和独立的 Broker TOTP（不是 Portal 登录 TOTP）。</p>
+      <label>Broker 管理员密码</label><input type="password" name="password" autocomplete="current-password" required>
+      <label>Broker 管理员 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
       <button type="submit">批准并生成激活码</button>
     </form>
   </section>
@@ -86,9 +86,9 @@
       <input type="hidden" name="expected_version" value="{{ request_row.version }}">
       <label for="reject_note">申请人可见的原因</label>
       <textarea id="reject_note" name="review_note" required></textarea>
-      <p class="small warning">拒绝不会创建账号或成员。需要密码和 TOTP 再次确认。</p>
-      <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
-      <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+      <p class="small warning">拒绝不会创建账号或成员。此处必须使用 Broker 管理员密码和独立的 Broker TOTP（不是 Portal 登录 TOTP）。</p>
+      <label>Broker 管理员密码</label><input type="password" name="password" autocomplete="current-password" required>
+      <label>Broker 管理员 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
       <button class="danger" type="submit">拒绝申请</button>
     </form>
   </section>

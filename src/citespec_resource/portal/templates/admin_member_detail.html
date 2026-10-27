@@ -36,6 +36,7 @@
       {% if portal_user.status == 'pending_activation' %}
         <div class="actions">
           <h3>重新生成激活码</h3>
+          <p class="muted">此表单使用 Portal 登录密码和 Portal TOTP。</p>
           <form method="post" action="/admin/members/{{ detail.member.member_id }}/activation-code">
             <input type="hidden" name="_csrf" value="{{ csrf }}">
             <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
@@ -52,26 +53,26 @@
 
 <section class="card">
   <h2>成员状态操作</h2>
-  <p class="muted">每次操作需要填写原因，并用当前密码和 TOTP 再次确认。Web 只能做简单状态管理，不提供资源操作。</p>
+  <p class="muted">每次操作需要填写原因，并使用 Broker 管理员密码和独立的 Broker TOTP 再次确认（不是 Portal 登录 TOTP）。Web 只能做简单状态管理，不提供资源操作。</p>
   <form method="post" action="/admin/members/{{ detail.member.member_id }}/suspend">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <label>暂停原因</label><input type="text" name="reason" required>
-    <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
-    <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <label>Broker 管理员密码</label><input type="password" name="password" autocomplete="current-password" required>
+    <label>Broker 管理员 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
     <button type="submit">暂停成员</button>
   </form>
   <form method="post" action="/admin/members/{{ detail.member.member_id }}/resume">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <label>恢复原因</label><input type="text" name="reason" required>
-    <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
-    <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <label>Broker 管理员密码</label><input type="password" name="password" autocomplete="current-password" required>
+    <label>Broker 管理员 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
     <button type="submit">恢复成员</button>
   </form>
   <form method="post" action="/admin/members/{{ detail.member.member_id }}/revoke">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <label>撤销原因</label><input type="text" name="reason" required>
-    <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
-    <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <label>Broker 管理员密码</label><input type="password" name="password" autocomplete="current-password" required>
+    <label>Broker 管理员 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
     <button class="danger" type="submit">撤销成员</button>
   </form>
 </section>

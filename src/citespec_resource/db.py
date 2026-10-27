@@ -22,7 +22,7 @@ from typing import Final
 # user_version. Fresh installs therefore run the same migration path as
 # existing deployments.
 BASE_SCHEMA_VERSION: Final = 2
-SCHEMA_VERSION: Final = 5
+SCHEMA_VERSION: Final = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -322,6 +322,58 @@ def _apply_key_projection_migration(connection: sqlite3.Connection) -> None:
         )
 
 
+def _apply_portal_admin_auth_migration(connection: sqlite3.Connection) -> None:
+    """Add broker-owned portal administrator credentials and attestations.
+
+    The portal service can write its own database, so its role/password/TOTP
+    records are not an independent authorization source.  These tables live in
+    the broker database and are never opened by the portal service.  The TOTP
+    secret is stored encrypted with a root-only key; the attestation token is
+    stored only as a SHA-256 digest and is consumed exactly once.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS portal_admin_credentials (
+            username TEXT PRIMARY KEY COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            totp_secret_enc TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            totp_last_counter INTEGER NOT NULL DEFAULT 0,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS portal_admin_attestations (
+            token_hash TEXT PRIMARY KEY,
+            nonce TEXT NOT NULL UNIQUE,
+            admin_username TEXT NOT NULL,
+            portal_user_id TEXT NOT NULL,
+            portal_username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_portal_admin_attestations_expiry "
+        "ON portal_admin_attestations(expires_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_portal_admin_attestations_admin "
+        "ON portal_admin_attestations(admin_username, issued_at)"
+    )
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a connection with the PRAGMAs required on every connection."""
     path = Path(path)
@@ -338,6 +390,7 @@ MIGRATIONS: Final[dict[int, Callable[[sqlite3.Connection], object]]] = {
     3: _apply_membership_migration,
     4: _apply_lifecycle_migration,
     5: _apply_key_projection_migration,
+    6: _apply_portal_admin_auth_migration,
 }
 
 

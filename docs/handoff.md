@@ -421,7 +421,7 @@ bash deploy/verify_monitor_only.sh --member <member> --skip-snapshot
 
 ```bash
 docker info --format '{{.Driver}}|{{.DockerRootDir}}'
-findmnt -no TARGET,FSTYPE,OPTIONS -T /data1/citespec-users
+findmnt -no TARGET,FSTYPE,OPTIONS -T /home/data1/citespec-users
 systemctl show citespec-resource-broker \
   -p ProtectHome -p ProtectSystem -p ReadWritePaths -p NoNewPrivileges
 xfs_quota -x -c 'report -p -b -h' /data1
@@ -531,9 +531,9 @@ xfs_quota -x -c 'report -p -b -h' /data1
   restricted profile。
 - development profile 需要 `overlay2` + XFS + `prjquota`/`pquota`、workspace
   `nosuid`，并先通过 5.6。
-- `install_server.sh` 对非默认 `workspace_root`/`state_db` 只发出警告；自定义路径
-  需要同步 systemd `ReadWritePaths`。执行器写路径固定为 `/etc`、`/home`、
-  `/data1/citespec-users` 和 spool。
+- `install_server.sh` 会拒绝与 systemd 模板不一致的 `workspace_root`；`state_db`
+  等自定义路径仍需同步 systemd `ReadWritePaths`。执行器写路径固定为 `/etc`、
+  `/home`、`/home/data1/citespec-users` 和 spool。
 - 旧 `create_user.sh`/home 公钥流程不再用于成员；已有账号通过显式 legacy import
   迁移。
 - 示例配置的 `ssh_user = "admin"` 是管理员示例；成员使用

@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pyotp
 import pytest
 
 from citespec_resource import PROTOCOL_VERSION, store
@@ -105,6 +106,31 @@ async def _call(broker: Broker, command: str, args: dict, identity: Identity) ->
         uid=identity.uid,
         gid=identity.gid,
     )
+
+
+def _portal_admin_config(tmp_path, config):
+    from citespec_resource.portal import security as portal_security
+
+    key_path = tmp_path / "broker-admin.key"
+    portal_security.load_secret(key_path, create=True)
+    return replace(
+        config,
+        server=replace(
+            config.server,
+            admin_auth_key_file=str(key_path),
+        ),
+    )
+
+
+async def _enroll_portal_admin(broker: Broker, username: str = "admin") -> str:
+    enrolled = await _call(
+        broker,
+        "admin_portal_auth_enroll",
+        {"username": username, "password": "broker admin password 123"},
+        ADMIN,
+    )
+    assert enrolled["ok"] is True, enrolled
+    return str(enrolled["data"]["totp_secret"])
 
 
 async def test_startup_audit_failure_falls_back_to_monitor(tmp_path, active_config):
@@ -2065,6 +2091,359 @@ async def test_portal_bridge_is_narrow_and_audits_admin_actor(tmp_path, active_c
     assert "portal_registration_submitted" in actions
 
 
+async def test_portal_forged_admin_role_cannot_mutate_without_attestation(
+    tmp_path,
+    active_config,
+):
+    config = _portal_admin_config(tmp_path, active_config)
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL, ADMIN.uid: ADMIN}),
+    )
+    forged = {
+        "user_id": "forged-admin",
+        "username": "forged-admin",
+        "role": "admin",
+        "member_id": "",
+    }
+    for command, target_key in (
+        ("portal_requests_approve", "request_id"),
+        ("portal_requests_reject", "request_id"),
+        ("portal_members_suspend", "member_id"),
+        ("portal_members_resume", "member_id"),
+        ("portal_members_revoke", "member_id"),
+    ):
+        response = await _call(
+            broker,
+            command,
+            {
+                "actor": forged,
+                target_key: "target-1",
+                "reason": "forged role",
+            },
+            PORTAL,
+        )
+        assert response["ok"] is False, command
+        assert response["error"]["code"] == "forbidden", (command, response)
+
+
+async def test_portal_admin_attestation_is_operation_bound_and_single_use(
+    tmp_path,
+    active_config,
+):
+    config = _portal_admin_config(tmp_path, active_config)
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL, ADMIN.uid: ADMIN}),
+    )
+    secret = await _enroll_portal_admin(broker)
+    admin_actor = {
+        "user_id": "admin-1",
+        "username": "admin",
+        "role": "admin",
+        "member_id": "",
+    }
+    otp = pyotp.TOTP(secret).at(int(FIXED.timestamp()))
+    wrong_admin = await _call(
+        broker,
+        "portal_admin_attest",
+        {
+            "actor": admin_actor,
+            "username": "not-enrolled",
+            "password": "broker admin password 123",
+            "totp": otp,
+            "action": "portal_members_suspend",
+            "target": "m-1",
+        },
+        PORTAL,
+    )
+    assert wrong_admin["ok"] is False
+    assert wrong_admin["error"]["code"] == "forbidden"
+    issued = await _call(
+        broker,
+        "portal_admin_attest",
+        {
+            "actor": admin_actor,
+            "username": "admin",
+            "password": "broker admin password 123",
+            "totp": otp,
+            "action": "portal_members_suspend",
+            "target": "m-1",
+        },
+        PORTAL,
+    )
+    assert issued["ok"] is True, issued
+    token = issued["data"]["attestation"]
+
+    wrong_target = await _call(
+        broker,
+        "portal_members_suspend",
+        {
+            "actor": admin_actor,
+            "member_id": "m-2",
+            "reason": "wrong target",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    assert wrong_target["ok"] is False
+    assert wrong_target["error"]["code"] == "forbidden"
+
+    wrong_action = await _call(
+        broker,
+        "portal_members_resume",
+        {
+            "actor": admin_actor,
+            "member_id": "m-1",
+            "reason": "wrong action",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    assert wrong_action["ok"] is False
+    assert wrong_action["error"]["code"] == "forbidden"
+
+    wrong_session = await _call(
+        broker,
+        "portal_members_suspend",
+        {
+            "actor": {
+                "user_id": "admin-2",
+                "username": "admin2",
+                "role": "admin",
+                "member_id": "",
+            },
+            "member_id": "m-1",
+            "reason": "wrong session",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    assert wrong_session["ok"] is False
+    assert wrong_session["error"]["code"] == "forbidden"
+
+    accepted = await _call(
+        broker,
+        "portal_members_suspend",
+        {
+            "actor": admin_actor,
+            "member_id": "m-1",
+            "reason": "valid attestation",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    # The target member does not exist in this fixture, so the membership
+    # service rejects the request; the important point is that attestation
+    # verification passed instead of returning "forbidden".
+    assert accepted["ok"] is False
+    assert accepted["error"]["code"] != "forbidden", accepted
+
+    replayed = await _call(
+        broker,
+        "portal_members_suspend",
+        {
+            "actor": admin_actor,
+            "member_id": "m-1",
+            "reason": "replay",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    assert replayed["ok"] is False
+    assert replayed["error"]["code"] == "forbidden"
+
+
+async def test_portal_admin_attestation_rejects_expiry_and_wrong_action(
+    tmp_path,
+    active_config,
+):
+    config = _portal_admin_config(tmp_path, active_config)
+    now = [FIXED]
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL, ADMIN.uid: ADMIN}),
+        clock=lambda: now[0],
+    )
+    secret = await _enroll_portal_admin(broker)
+    admin_actor = {
+        "user_id": "admin-1",
+        "username": "admin",
+        "role": "admin",
+        "member_id": "",
+    }
+    issued = await _call(
+        broker,
+        "portal_admin_attest",
+        {
+            "actor": admin_actor,
+            "username": "admin",
+            "password": "broker admin password 123",
+            "totp": pyotp.TOTP(secret).at(int(FIXED.timestamp())),
+            "action": "portal_requests_approve",
+            "target": "request-1",
+        },
+        PORTAL,
+    )
+    assert issued["ok"] is True, issued
+    token = issued["data"]["attestation"]
+
+    wrong_action = await _call(
+        broker,
+        "portal_requests_reject",
+        {
+            "actor": admin_actor,
+            "request_id": "request-1",
+            "review_note": "wrong action",
+            "expected_version": "v1",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    assert wrong_action["ok"] is False
+    assert wrong_action["error"]["code"] == "forbidden"
+
+    now[0] = FIXED + timedelta(seconds=121)
+    expired = await _call(
+        broker,
+        "portal_requests_approve",
+        {
+            "actor": admin_actor,
+            "request_id": "request-1",
+            "valid_until": "",
+            "quota_gb": 200,
+            "review_note": "expired",
+            "internal_note": "",
+            "expected_version": "v1",
+            "attestation": token,
+        },
+        PORTAL,
+    )
+    assert expired["ok"] is False
+    assert expired["error"]["code"] == "forbidden"
+
+
+async def test_portal_admin_totp_cannot_be_replayed_concurrently(tmp_path, active_config):
+    config = _portal_admin_config(tmp_path, active_config)
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL, ADMIN.uid: ADMIN}),
+    )
+    secret = await _enroll_portal_admin(broker)
+    admin_actor = {
+        "user_id": "admin-1",
+        "username": "admin",
+        "role": "admin",
+        "member_id": "",
+    }
+    payload = {
+        "actor": admin_actor,
+        "username": "admin",
+        "password": "broker admin password 123",
+        "totp": pyotp.TOTP(secret).at(int(FIXED.timestamp())),
+        "action": "portal_members_suspend",
+        "target": "m-1",
+    }
+    first, second = await asyncio.gather(
+        _call(broker, "portal_admin_attest", dict(payload), PORTAL),
+        _call(broker, "portal_admin_attest", dict(payload), PORTAL),
+    )
+    results = [first, second]
+    assert sum(1 for result in results if result["ok"]) == 1
+    denied = [result for result in results if not result["ok"]]
+    assert denied[0]["error"]["code"] == "forbidden"
+
+
+async def test_portal_admin_auth_cli_lists_without_secrets_and_can_remove(
+    tmp_path,
+    active_config,
+):
+    config = _portal_admin_config(tmp_path, active_config)
+    broker, _ = _broker(tmp_path, config)
+    secret = await _enroll_portal_admin(broker)
+
+    listed = await _call(broker, "admin_portal_auth_list", {}, ADMIN)
+    assert listed["ok"] is True
+    assert [item["username"] for item in listed["data"]["admins"]] == ["admin"]
+    assert secret not in json.dumps(listed)
+    assert "password_hash" not in json.dumps(listed)
+    assert "totp_secret" not in json.dumps(listed)
+
+    audit = await _call(broker, "admin_audit", {"limit": 50}, ADMIN)
+    dumped = json.dumps(audit)
+    assert "broker admin password 123" not in dumped
+    assert secret not in dumped
+
+    removed = await _call(
+        broker,
+        "admin_portal_auth_remove",
+        {"username": "admin"},
+        ADMIN,
+    )
+    assert removed["ok"] is True
+    missing = await _call(
+        broker,
+        "admin_portal_auth_remove",
+        {"username": "admin"},
+        ADMIN,
+    )
+    assert missing["ok"] is False
+    assert missing["error"]["code"] == "not_found"
+
+
+async def test_portal_admin_reenroll_revokes_outstanding_attestations(
+    tmp_path,
+    active_config,
+):
+    config = _portal_admin_config(tmp_path, active_config)
+    broker, _ = _broker(
+        tmp_path,
+        config,
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL, ADMIN.uid: ADMIN}),
+    )
+    secret = await _enroll_portal_admin(broker)
+    admin_actor = {
+        "user_id": "admin-1",
+        "username": "admin",
+        "role": "admin",
+        "member_id": "",
+    }
+    issued = await _call(
+        broker,
+        "portal_admin_attest",
+        {
+            "actor": admin_actor,
+            "username": "admin",
+            "password": "broker admin password 123",
+            "totp": pyotp.TOTP(secret).at(int(FIXED.timestamp())),
+            "action": "portal_members_suspend",
+            "target": "m-1",
+        },
+        PORTAL,
+    )
+    assert issued["ok"] is True, issued
+    old_token = issued["data"]["attestation"]
+
+    await _enroll_portal_admin(broker)
+    rejected = await _call(
+        broker,
+        "portal_members_suspend",
+        {
+            "actor": admin_actor,
+            "member_id": "m-1",
+            "reason": "old attestation",
+            "attestation": old_token,
+        },
+        PORTAL,
+    )
+    assert rejected["ok"] is False
+    assert rejected["error"]["code"] == "forbidden"
+
+
 async def test_portal_admin_role_changes_are_cli_only_and_audited(tmp_path, active_config):
     config = replace(
         active_config,
@@ -2164,7 +2543,7 @@ async def test_portal_identity_cannot_use_general_admin_commands(tmp_path, activ
     broker, _ = _broker(
         tmp_path,
         active_config,
-        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL}),
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL, ADMIN.uid: ADMIN}),
     )
     admin_actor = {
         "user_id": "admin-1",

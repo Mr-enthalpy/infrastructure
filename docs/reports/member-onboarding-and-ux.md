@@ -194,8 +194,9 @@ node --check src\citespec_resource\gui\static\app.js
 
 - 当前 Docker root 为 ext4，development profile 被存储闸门拒绝。
 - 旧成员必须显式 legacy import；直接切换 sshd 会锁定未导入成员。
-- 自定义 `workspace_root`/`state_db` 需要手工同步 systemd 写路径；执行器写路径固定为
-  `/etc`、`/home`、`/data1/citespec-users` 和 spool。
+- 安装器会拒绝与 systemd 模板不一致的 `workspace_root`；执行器写路径固定为
+  `/etc`、`/home`、`/home/data1/citespec-users` 和 spool。如必须迁移，先同步修改
+  `deploy/systemd/` 单元再安装。
 - 外部反向代理的请求体限制、TLS 和网络 ACL 由实验室运维提供。
 
 ## 7. 数据迁移、恢复和回滚
