@@ -29,9 +29,13 @@
 - CI：`40465970858`（Windows/Linux、Python 3.11/3.12/3.13）通过；
   `40465970936`（Windows/Linux 打包、Linux `install.sh` 与启动器 smoke test）通过。
   GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY` 已配置。
-- 尚未创建 `v0.1.0` tag/Release；生产 Portal 仍未启用。下一步是在获得发布确认后
-  创建首个签名 Release；网络维护窗口完成后再做 DNS/VPN/TLS/防火墙现场验收并
-  启用 Portal。不得在文档或仓库提交私钥、真实 IP/端口/管理员信息。
+- `v0.1.0` 已合并到 `main` 并发布签名 Release：release run `40485285111`，
+  Windows/Linux x64 payload 和 full zip、签名 manifest 均已上传。已下载发布资产，
+  验证 manifest 签名、两个平台 payload 的 SHA-256/大小，并在 Windows full zip 上
+  确认 `version --json`（protocol 1）和默认 GitHub 更新源返回 `already up to date`。
+- 生产 Portal 仍未启用。下一步是网络维护窗口完成 DNS/VPN/TLS/防火墙现场验收并
+  启用 Portal；首个版本由成员安装/更新后记录验收结果。不得在文档或仓库提交私钥、
+  真实 IP/端口/管理员信息。
 
 ## 0. 2026-10-26 <server-instance> 实机部署与 active 验收
 
@@ -513,7 +517,7 @@ xfs_quota -x -c 'report -p -b -h' /data1
 | P0 | 容器 root/宿主 GPU 5.6 | 未验证 | 容器 root 不能修改宿主 `/dev/nvidia*` 并影响他人 |
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |
 | P1 | CI 覆盖 | 测试矩阵和 Windows/Linux 打包 smoke 通过；Playwright 浏览器 job 仍待接入 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
-| P1 | 客户端打包/自动更新 | 代码、Windows smoke、Linux CI 打包完成；首个 Release 未发布 | 发布 `v0.1.0` 签名 Release 并由成员完成安装/更新验收 |
+| P1 | 客户端打包/自动更新 | `v0.1.0` 已发布；Windows/Linux 构建和发布资产校验通过 | 成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
 | P2 | VS Code / 文件传输 | 关闭 | 5.6、容器 sshd、隧道、配额和 TOCTOU 验收通过 |

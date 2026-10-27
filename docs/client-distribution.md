@@ -25,6 +25,10 @@ LcxxIJY0DcCdDVzMcuk5pIJ4jaTz2hSJ6I50n2E9MvU=
 GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY`（base64 的 32 字节原始种子）。
 不要把私钥、PEM 文件或带私钥的清单提交到仓库。
 
+首个签名版本为
+[`v0.1.0`](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0)，
+包含 Windows/Linux x64 payload、full zip 和签名清单。
+
 ## 2. Windows x64 首次安装
 
 1. 从 GitHub Release 下载
@@ -69,8 +73,8 @@ citespec-resource update
 |---|---|
 | `CITESPEC_UPDATE_MANIFEST` | 覆盖更新清单 URL（例如内部镜像） |
 | `CITESPEC_SKIP_UPDATE=1` | 本次不检查更新 |
-| `CITESPEC_UPDATE_TIMEOUT` | 清单请求超时秒数（默认 5） |
-| `CITESPEC_UPDATE_DOWNLOAD_TIMEOUT` | payload 下载超时秒数（默认 120） |
+| `CITESPEC_UPDATE_TIMEOUT` | 启动器清单请求超时秒数（默认 5；手动 `update` 固定 10） |
+| `CITESPEC_UPDATE_DOWNLOAD_TIMEOUT` | 启动器 payload 下载超时秒数（默认 120；手动 `update` 固定 60） |
 | `CITESPEC_UPDATE_ALLOW_HTTP=1` | 仅用于本地/CI 测试的 HTTP 或 `file://` 清单；生产不要设置 |
 | `CITESPEC_RESOURCE_APP_ROOT` | 覆盖应用根目录（本地测试） |
 
@@ -137,8 +141,16 @@ python -m mypy src
 - 本地签名清单自动更新 `0.1.0 -> 0.1.1` 成功；篡改清单和不可达更新源均被拒绝
   且回退到现有 payload。
 - Linux x64 构建由 `.github/workflows/release.yml` 在 Ubuntu runner 上完成；
-  本地 Windows 主机不能替代 Linux 运行验收。首次 Linux 验收应在 CI artifact
-  或受控 Linux 主机上执行，并确认 `install.sh`、payload 执行位和自动更新路径。
+  `client-build` 运行 `40465970936` 已在 Linux runner 执行 `install.sh` 并确认
+  软链接启动器和 payload 的 `version --json` 可用。本地 Windows 主机不能替代
+  Linux 运行验收；成员首次 Linux 实际安装/更新仍应在受控 Linux 主机记录。
+- 2026-10-27 发布验收：release 运行 `40485285111` 成功，发布
+  `citespec-resource-0.1.0-windows-x64.zip`、`...-windows-x64-full.zip`、
+  `...-linux-x64.zip`、`...-linux-x64-full.zip` 和
+  `citespec-resource-manifest.json`。已重新下载全部资产，验证 manifest Ed25519
+  签名、两个 payload 的 SHA-256 和大小；在发布的 Windows full zip 上确认
+  `version --json` 返回 `version=0.1.0`、`protocol=1`、
+  `min_client_protocol=1`，默认 GitHub 更新源返回 `already up to date`。
 
 Windows 手工验收至少覆盖：
 
