@@ -184,11 +184,20 @@ def _make_full_zip(
         source_installer = ROOT / "packaging" / installer
         if source_installer.is_file():
             shutil.copy2(source_installer, staging / installer)
+        # Ship the standalone verifier too, so a user who downloaded the
+        # manifest can re-check this zip and its installer before running it.
+        for name in ("verify_release.py", "verify_release.sh", "verify_release.ps1"):
+            source = ROOT / "packaging" / name
+            if source.is_file():
+                shutil.copy2(source, staging / name)
         (staging / "README.txt").write_text(
             "Citespec Resource client\n"
             "\n"
             f"Version: {version}\n"
-            "Run the platform install script once, then use `citespec-resource`.\n"
+            "Verify the full zip against the signed manifest before installing:\n"
+            "  python verify_release.py --manifest <manifest.json> --package <full.zip>\n"
+            "Then run the platform install script once, passing the signed\n"
+            "installer SHA-256 with --verify (install.sh) or -Verify (install.ps1).\n"
             "The launcher checks signed updates at most once per day.\n",
             encoding="utf-8",
         )

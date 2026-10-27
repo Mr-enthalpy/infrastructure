@@ -1,8 +1,27 @@
+# Install the Citespec Resource client from an extracted full zip.
+#
+# Before running, verify the zip and this script with verify_release.ps1 (or the
+# published SHA-256). Use -Verify <sha256> with the installer_sha256 value from
+# the signed manifest's first_install entry to authenticate this script.
 param(
-  [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "CitespecResource")
+  [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "CitespecResource"),
+  [string]$Verify = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Verify) {
+  $expected = $Verify.ToLowerInvariant()
+  if ($expected -notmatch '^[0-9a-f]{64}$') {
+    throw "-Verify must be a 64-character SHA-256"
+  }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) {
+    throw "install.ps1 SHA-256 mismatch: expected $expected, actual $actual"
+  }
+  Write-Host "Verified install.ps1 SHA-256: $actual"
+}
+
 $source = $PSScriptRoot
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Copy-Item -Path (Join-Path $source "*") -Destination $InstallDir -Recurse -Force

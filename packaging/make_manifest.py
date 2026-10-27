@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tomllib
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -72,6 +73,35 @@ def main() -> int:
     if not artifacts:
         raise SystemExit(f"no client artifacts found in {args.artifacts_dir}")
 
+    # A first install has no launcher to verify an update, so the signed
+    # manifest must also cover the full zip and the install script inside it.
+    first_install: dict[str, dict[str, object]] = {}
+    for platform in PLATFORMS:
+        filename = f"citespec-resource-{version}-{platform}-full.zip"
+        path = args.artifacts_dir / filename
+        if not path.is_file():
+            continue
+        installer = "install.ps1" if platform == "windows-x64" else "install.sh"
+        try:
+            with zipfile.ZipFile(path) as archive:
+                installer_bytes = archive.read(installer)
+        except (KeyError, zipfile.BadZipFile, OSError) as exc:
+            raise SystemExit(f"{filename} does not contain {installer}: {exc}") from exc
+        first_install[platform] = {
+            "url": f"{base_url}/{filename}",
+            "sha256": _sha256(path),
+            "size": path.stat().st_size,
+            "installer": installer,
+            "installer_sha256": hashlib.sha256(installer_bytes).hexdigest(),
+            "installer_size": len(installer_bytes),
+        }
+    missing_full = sorted(set(artifacts) - set(first_install))
+    if missing_full:
+        raise SystemExit(
+            "missing full install package (needed to verify first install) for: "
+            + ", ".join(missing_full)
+        )
+
     manifest: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
         "version": version,
@@ -80,6 +110,7 @@ def main() -> int:
         "published_at": datetime.now(UTC).isoformat(),
         "notes": args.notes,
         "artifacts": artifacts,
+        "first_install": first_install,
     }
     if args.unsigned:
         print(
