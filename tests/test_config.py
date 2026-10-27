@@ -150,6 +150,23 @@ def test_enabled_portal_accepts_https_and_secure_cookie(tmp_path):
     assert cfg.portal.cookie_secure is True
 
 
+def test_portal_service_account_defaults_to_portal_group():
+    cfg = load_config(ROOT / "lab/resources.example.toml")
+    assert cfg.portal.service_account == cfg.groups.portal
+
+
+def test_portal_service_account_must_be_an_account_name(tmp_path):
+    path = _variant(
+        tmp_path,
+        (
+            'service_account = "citespec-portal"',
+            'service_account = "../citespec-portal"',
+        ),
+    )
+    with pytest.raises(ValueError, match="portal.service_account"):
+        load_config(path)
+
+
 def test_invalid_duration_is_rejected(tmp_path):
     text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
     text = text.replace("default_hours = 12", "default_hours = 40")

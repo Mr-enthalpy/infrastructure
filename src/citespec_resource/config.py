@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+# Linux account name used for the portal service identity.  The broker binds
+# portal capability to this account's UID; group membership alone is not
+# sufficient.
+_PORTAL_ACCOUNT_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -142,6 +147,11 @@ class PortalConfig:
     """
 
     enabled: bool = False
+    # Linux account that is allowed to speak the portal broker commands.  The
+    # broker binds this capability to the account UID, never to group
+    # membership alone: a human member added to the portal group must not gain
+    # the portal bridge.
+    service_account: str = "citespec-portal"
     bind_host: str = "127.0.0.1"
     bind_port: int = 8770
     db_path: str = "/var/lib/citespec-resource-portal/portal.db"
@@ -551,6 +561,7 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("gui.connect_timeout must be positive")
     portal = PortalConfig(
         enabled=bool(portal_raw.get("enabled", False)),
+        service_account=str(portal_raw.get("service_account", groups.portal)),
         bind_host=str(portal_raw.get("bind_host", "127.0.0.1")),
         bind_port=int(portal_raw.get("bind_port", 8770)),
         db_path=str(portal_raw.get("db_path", "/var/lib/citespec-resource-portal/portal.db")),
@@ -572,6 +583,8 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("portal.bind_host must be a loopback address")
     if not 1 <= portal.bind_port <= 65535:
         raise ValueError("portal.bind_port must be between 1 and 65535")
+    if not _PORTAL_ACCOUNT_RE.fullmatch(portal.service_account):
+        raise ValueError("portal.service_account must be a Linux account name")
     for field_name, raw_path in (
         ("portal.db_path", portal.db_path),
         ("portal.secret_file", portal.secret_file),

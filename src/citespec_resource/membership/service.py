@@ -1512,6 +1512,7 @@ def import_legacy_member(
             "video",
             "render",
             "citespec-admins",
+            "citespec-portal",
             "root",
         }
         for group in sorted(privileged):

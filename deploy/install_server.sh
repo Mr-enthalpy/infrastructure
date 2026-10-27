@@ -435,6 +435,10 @@ fi
 if id -nG "$PORTAL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-admins; then
     fail "$PORTAL_USER must not be a member of citespec-admins"
 fi
+PORTAL_GROUP_MEMBERS=$(getent group "$PORTAL_USER" 2>/dev/null | cut -d: -f4 || true)
+if [ -n "$PORTAL_GROUP_MEMBERS" ]; then
+    fail "group $PORTAL_USER has human members: $PORTAL_GROUP_MEMBERS; remove them before installing"
+fi
 
 if [ -n "$(effective_members citespec-gpu)" ]; then
     fail "citespec-gpu has effective members; remove them before installing"

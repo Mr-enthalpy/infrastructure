@@ -126,7 +126,7 @@ if [ "$ADMIN" -eq 1 ]; then
     TARGET_SHELL=/bin/bash
 else
     PRIMARY_GROUP=citespec-members
-    FORBIDDEN_GROUPS=(sudo docker citespec-gpu video render citespec-admins)
+    FORBIDDEN_GROUPS=(sudo docker citespec-gpu video render citespec-admins citespec-portal)
     TARGET_SHELL=$MEMBER_SHELL
 fi
 

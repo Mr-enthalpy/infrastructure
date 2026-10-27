@@ -132,6 +132,9 @@ portal_url = ""
 # Keep disabled until the network/certificate prerequisites in
 # docs/server-network-request.md are answered and accepted.
 enabled = false
+# Dedicated service account whose UID may use the portal broker bridge.  The
+# broker binds this to the account UID; group membership alone is not enough.
+service_account = "citespec-portal"
 bind_host = "127.0.0.1"
 bind_port = 8770
 db_path = "/var/lib/citespec-resource-portal/portal.db"

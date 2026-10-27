@@ -41,6 +41,8 @@ from ..identity import (
     IdentityResolver,
     IdentityResolverProtocol,
     peer_credentials,
+    portal_group_extra_members,
+    resolve_portal_account,
 )
 from ..legacy_audit import LegacyAuditResult, LegacyAuditRunner
 from ..members import load_members, public_member_data
@@ -128,9 +130,36 @@ class Broker:
         self.db_path = Path(db_path or config.server.state_db)
         self.socket_path = Path(socket_path or config.server.broker_socket)
         self.docker = docker or DockerDriver(config)
-        self.identity_resolver = identity_resolver or IdentityResolver(
-            config.groups.admins, config.groups.portal
-        )
+        if identity_resolver is None:
+            portal_account = resolve_portal_account(config.portal.service_account)
+            if portal_account is None:
+                logger.warning(
+                    "portal service account %r is not resolvable; portal broker "
+                    "commands will be denied",
+                    config.portal.service_account,
+                )
+                portal_uid: int | None = None
+                portal_username: str | None = None
+            else:
+                portal_uid, portal_username = portal_account
+                extra = portal_group_extra_members(
+                    config.groups.portal, config.portal.service_account
+                )
+                if extra:
+                    logger.warning(
+                        "portal group %r contains non-service accounts: %s; "
+                        "portal capability remains bound to uid %d only",
+                        config.groups.portal,
+                        ", ".join(extra),
+                        portal_uid,
+                    )
+            identity_resolver = IdentityResolver(
+                config.groups.admins,
+                config.groups.portal,
+                portal_uid=portal_uid,
+                portal_username=portal_username,
+            )
+        self.identity_resolver = identity_resolver
         self.legacy_audit = legacy_audit or LegacyAuditRunner(
             config.policy.legacy_audit_script,
             timeout=config.policy.legacy_audit_timeout,
