@@ -334,6 +334,39 @@ def test_install_sh_verify_authenticates_the_script(tmp_path):
     assert (bin_dir / "citespec-resource").exists()
 
 
+@pytest.mark.skipif(BASH is None, reason="bash is required")
+def test_installers_refuse_to_run_without_a_verified_hash(tmp_path):
+    assert BASH is not None
+    result = subprocess.run(
+        [BASH, str(PACKAGING / "install.sh")],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "CITESPEC_CLIENT_HOME": str(tmp_path / "install"),
+            "CITESPEC_CLIENT_BIN": str(tmp_path / "bin"),
+        },
+    )
+    assert result.returncode == 2
+    assert "--verify SHA256 is required" in result.stderr
+    assert not (tmp_path / "install").exists()
+
+    malformed = subprocess.run(
+        [BASH, str(PACKAGING / "install.sh"), "--verify", "not-a-hash"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert malformed.returncode == 2
+    assert "64-character SHA-256" in malformed.stderr
+
+    source = (PACKAGING / "install.ps1").read_text(encoding="utf-8")
+    assert 'throw "-Verify SHA256 is required' in source
+    assert "must be a 64-character SHA-256" in source
+
+
 def test_install_ps1_can_verify_its_own_hash():
     source = (PACKAGING / "install.ps1").read_text(encoding="utf-8")
     assert "[string]$Verify" in source

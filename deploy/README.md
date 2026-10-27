@@ -38,10 +38,12 @@ The following conditions must be satisfied before installation:
   not be used as the production runtime.
 - `lab/resources.local.toml` contains the target host inventory and remains
   excluded from Git.
-- `server.workspace_root` must resolve to `/home/data1/citespec-users`, the path
-  baked into the static systemd units. The installer fails closed on a different
-  path instead of installing units with mismatched write permissions; update
-  `deploy/systemd/` first if the workspace must move.
+- `server.workspace_root` may differ from the static amax path. The installer
+  generates `10-workspace.conf` drop-ins for the broker, log-rotation,
+  disk-check, and provisioning units so every sandbox path list, `ExecStart`,
+  and the provisioning `CITESPEC_RESOURCE_WORKSPACE_ROOT` use the configured
+  root. Stale drop-ins are removed when the configured root matches the static
+  path again.
 - The read-only checks in Section 3 pass. For the development profile, the
   storage, quota, and `nosuid` requirements in Section 5 are mandatory.
 - For the portal, the internal DNS, campus VPN route/DNS, TLS certificate, and
@@ -62,12 +64,13 @@ bash deploy/audit_legacy.sh --production
 groups, cgroup configuration, disk capacity, `/dev/nvidia*` permissions, and the
 development-profile storage requirements. `audit_legacy.sh` inventories legacy
 root, sudo, SSH, Docker, GPU, and privileged-container access. Both scripts are
-read-only except for one NVIDIA detail: `preflight.sh` invokes `nvidia-smi`,
-which as root resets `/dev/nvidia*` to `0666 root:root` unless the Citespec
-wrapper is installed. The script records device mode/owner before and after the
-probe, warns on an unwrapped host, and fails if the wrapper is installed but the
-probe still changes the devices. Pass `--skip-nvidia` when a maintenance window
-must not touch GPU state; this also skips the compute-process query.
+read-only: `preflight.sh` does not invoke `nvidia-smi` by default, because as root
+it resets `/dev/nvidia*` to `0666 root:root` unless the Citespec wrapper is
+installed. Pass `--probe-nvidia` only after the wrapper exists; the script then
+records device mode/owner before and after and fails if the probe changes them.
+`--skip-nvidia` is the explicit form of the default. The installer runs
+`preflight.sh --probe-nvidia --nvidia-only` itself after installing the wrapper
+and applying the GPU permission policy.
 
 After installing a Portal/apply vhost, run the read-only network audit:
 

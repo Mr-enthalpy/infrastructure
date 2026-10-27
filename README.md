@@ -19,15 +19,15 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 | 范围 | 状态 | 证据 |
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
-| 自动化验证 | 完成 | 本地 `475 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
+| 自动化验证 | 完成 | 本地 `557 passed, 27 skipped`；Ruff、mypy、JS、Bash 通过 |
 | CI | 完成 | GitHub Actions `40465970858`（测试矩阵）和 `40465970936`（Windows/Linux 打包）通过 |
-| 客户端分发 | 完成 | [v0.1.0](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0) 已发布 Windows/Linux x64；签名清单、自动更新、篡改拒绝和回退已验证 |
+| 客户端分发 | 完成 | [v0.1.0](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0) 已发布 Windows/Linux x64；签名清单、自动更新、篡改拒绝和回退已验证。`0.1.1` 是 PR #1 的部署候选版本，尚未发布 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
 | 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
-| VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；等待内网 DNS/VPN/证书答复 |
-| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现，CI `40465970858` 通过；实机部署与恢复演练待维护窗口 |
-| 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
+| VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；安装器不会启用 Portal，需 `enable_portal.sh` 在网络/证书验收后写标记并启动；等待内网 DNS/VPN/证书答复 |
+| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现；安装器在维护窗口内先停写入者，再用 `backup.py` 取一致快照并支持回滚；实机部署与恢复演练待维护窗口 |
+| 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭；development + container sudo 需要真机 GPU 隔离标记 |
 | example-gpu | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
 
 - 生产基线为 Python 3.12；本地开发可使用 Python 3.13。
@@ -456,11 +456,12 @@ NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-
 `nvidia-smi` 以 root 运行时会把 `/dev/nvidia*` 重置为 `0666 root:root`。安装器因此
 保留真实 helper 为 `/usr/bin/nvidia-smi.real`（去掉 setuid/setgid），安装
 `/usr/bin/nvidia-smi` wrapper、`/usr/bin/nvidia-modprobe` wrapper 和窄 LD_PRELOAD
-shim，使 wrapper 调用真实 helper 时不再修改节点权限。`preflight.sh` 会在调用 `nvidia-smi` 前后比较每个节点的
-mode/owner：未安装 wrapper 时探测本身可能改权限，因此只报告 warning；wrapper 已
-安装却仍发生变化则报告 failure。若维护窗口内完全不能触碰 GPU 状态，使用
-`--skip-nvidia`；它会同时跳过 compute process 查询，其余静态 wrapper/设备审计仍
-执行。
+shim，使 wrapper 调用真实 helper 时不再修改节点权限。`preflight.sh` **默认不调用**
+`nvidia-smi`，只做静态 wrapper/设备审计；需要探测时显式使用 `--probe-nvidia`，
+脚本会在调用前后比较每个节点的 mode/owner，wrapper 未安装或 `.real` 缺失时拒绝
+探测。安装器只在 wrapper 和权限修复完成后执行一次
+`preflight.sh --probe-nvidia --nvidia-only`。`--skip-nvidia` 保留为显式跳过（与默认
+行为一致），也会跳过 compute process 查询。
 
 预算拆分为 `global_max_cpus` / `global_max_memory_gb`、每分配上限
 `max_cpus_per_allocation` / `max_memory_gb_per_allocation`、每用户上限

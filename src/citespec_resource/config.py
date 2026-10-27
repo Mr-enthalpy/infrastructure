@@ -228,6 +228,21 @@ def validate_active_mode_policy(policy: PolicyConfig) -> None:
             raise ValueError(
                 "active mode with the development profile requires docker_storage_budget_gb > 0"
             )
+        if policy.container_sudo:
+            # Container root with sudo and host-visible GPU nodes is only
+            # approved after the real-host isolation drill (acceptance §5.6).
+            # The marker is written by deploy/verify_gpu_isolation.sh.
+            marker = Path(
+                os.environ.get(
+                    "CITESPEC_GPU_ISOLATION_MARKER",
+                    "/etc/citespec-resource/gpu-isolation.ok",
+                )
+            )
+            if not marker.is_file():
+                raise ValueError(
+                    "active mode with development containers and sudo requires a "
+                    f"passing GPU isolation test ({marker})"
+                )
 
 
 def _require(data: dict[str, Any], key: str, section: str) -> Any:

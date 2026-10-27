@@ -32,7 +32,10 @@ GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY`（base64 的 32 字节原始
 
 首个签名版本为
 [`v0.1.0`](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0)，
-包含 Windows/Linux x64 payload、full zip 和签名清单。
+包含 Windows/Linux x64 payload、full zip 和签名清单。`v0.1.0` 的 tag 和资产保持
+不变；当前分支的下一个客户端版本为 `0.1.1`，发布前不得替换或重发 `v0.1.0`。
+`--verify`/`-Verify` 是强制参数：缺失、格式错误或摘要不匹配都会在写入任何文件前
+退出。
 
 ## 2. Windows x64 首次安装
 

@@ -444,3 +444,22 @@ def test_active_development_profile_requires_storage_protection(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="docker_storage_budget_gb"):
         load_config(path)
+
+
+def test_active_development_sudo_requires_a_passing_gpu_isolation_test(tmp_path, monkeypatch):
+    text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
+    text = text.replace('mode = "monitor"', 'mode = "active"')
+    text = text.replace("deployment_allowed = false", "deployment_allowed = true")
+    path = tmp_path / "active.toml"
+    path.write_text(text, encoding="utf-8")
+
+    marker = tmp_path / "gpu-isolation.ok"
+    monkeypatch.setenv("CITESPEC_GPU_ISOLATION_MARKER", str(marker))
+    with pytest.raises(ValueError, match="GPU isolation test"):
+        load_config(path)
+
+    marker.write_text("created_at=test\n", encoding="utf-8")
+    config = load_config(path)
+    assert config.policy.mode == "active"
+    assert config.policy.container_profile == "development"
+    assert config.policy.container_sudo is True

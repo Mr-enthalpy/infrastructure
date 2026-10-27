@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
 # Read-only network audit for the Portal and legacy apply front ends.
 #
-# It answers three questions without changing host state:
+# Static (default) mode answers three questions without changing host state:
 #   1. Do the nginx vhosts bind a specific private address (never 0.0.0.0/[::])?
 #   2. Do they restrict sources with allow/deny instead of relying on the
 #      firewall alone, and proxy only to loopback?
 #   3. Does the portal/apply upstream listen on loopback only, and what is the
 #      portal unit's current state?
 #
-# Exit status: 0 when no failures, 1 when any check failed.  Warnings do not
-# fail the audit (for example, Portal is intentionally disabled in P0).
+# --acceptance is the fail-closed gate used by deploy/enable_portal.sh.  It
+# inspects `nginx -T` (not just the on-disk snippets), requires an approved
+# campus/VPN CIDR, validates TLS certificate/key/protocols, and fails on a
+# missing vhost or an already-enabled Portal unit without the acceptance marker.
+#
+# Exit status: 0 when no failures, 1 when any check failed.
 set -u
 set -o pipefail
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 FAIL=0
 WARN=0
 NGINX_ROOT=/etc/nginx
 PORTAL_PORT=8770
 APPLY_PORT=8765
+PORTAL_HTTPS_PORT=443
 PORTAL_UNIT=citespec-resource-portal.service
+PORTAL_MARKER=/etc/citespec-resource/portal-network-accepted
 EXPECT_PORTAL_LISTENER=0
+ACCEPTANCE=0
+APPROVED_CIDRS=()
+APPROVED_CIDR_FILE=""
 
 section() { printf '\n== %s ==\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
@@ -31,14 +41,73 @@ have() { command -v "$1" >/dev/null 2>&1; }
 usage() {
     cat <<EOF
 usage: $0 [--nginx-root PATH] [--portal-port PORT] [--apply-port PORT]
+          [--acceptance [--approved-cidr CIDR]... [--approved-cidr-file PATH]]
+          [--portal-https-port PORT]
 
 Read-only audit of nginx -> Portal/apply listeners and source restrictions.
 
-  --nginx-root PATH   nginx configuration root (default: $NGINX_ROOT)
-  --portal-port PORT  Portal upstream port (default: $PORTAL_PORT)
-  --apply-port PORT   Legacy apply upstream port (default: $APPLY_PORT)
-  -h, --help          Show this help.
+  --nginx-root PATH       nginx configuration root (default: $NGINX_ROOT)
+  --portal-port PORT      Portal upstream port (default: $PORTAL_PORT)
+  --apply-port PORT       Legacy apply upstream port (default: $APPLY_PORT)
+  --acceptance            Fail-closed gate for enabling the Portal.  Reads
+                          nginx -T, requires TLS and an approved source range,
+                          and refuses an already-enabled unit without a marker.
+  --approved-cidr CIDR    Approved campus/VPN source range (repeatable).
+  --approved-cidr-file P  File with one approved CIDR per line (# comments ok).
+  --portal-https-port P   Public TLS port (default: $PORTAL_HTTPS_PORT)
+  -h, --help              Show this help.
 EOF
+}
+
+find_python() {
+    if [ -n "${CITESPEC_PYTHON:-}" ]; then
+        printf '%s\n' "$CITESPEC_PYTHON"
+        return 0
+    fi
+    # Prefer the deployed runtime: the audit needs a Python new enough for the
+    # host's deployment baseline even when the system python3 is older.
+    if [ -x /opt/citespec-resource/.venv/bin/python ]; then
+        printf '%s\n' /opt/citespec-resource/.venv/bin/python
+        return 0
+    fi
+    if have python3; then
+        command -v python3
+        return 0
+    fi
+    if have python; then
+        command -v python
+        return 0
+    fi
+    return 1
+}
+
+run_acceptance() {
+    local audit_py=$SCRIPT_DIR/portal_network_audit.py
+    local python_bin
+    local cidr
+    [ -f "$audit_py" ] || {
+        printf '[fail] portal_network_audit.py is missing next to %s\n' "$0" >&2
+        return 1
+    }
+    python_bin=$(find_python) || {
+        printf '[fail] Python 3 is required for the acceptance audit\n' >&2
+        return 1
+    }
+    local -a command=(
+        "$python_bin" "$audit_py"
+        --nginx-root "$NGINX_ROOT"
+        --portal-port "$PORTAL_PORT"
+        --apply-port "$APPLY_PORT"
+        --portal-https-port "$PORTAL_HTTPS_PORT"
+        --marker "$PORTAL_MARKER"
+    )
+    for cidr in "${APPROVED_CIDRS[@]}"; do
+        command+=(--approved-cidr "$cidr")
+    done
+    if [ -n "$APPROVED_CIDR_FILE" ]; then
+        command+=(--approved-cidr-file "$APPROVED_CIDR_FILE")
+    fi
+    "${command[@]}"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -46,6 +115,24 @@ while [ "$#" -gt 0 ]; do
         -h|--help)
             usage
             exit 0
+            ;;
+        --acceptance)
+            ACCEPTANCE=1
+            ;;
+        --approved-cidr)
+            shift
+            [ "$#" -gt 0 ] || { printf 'missing --approved-cidr value\n' >&2; exit 2; }
+            APPROVED_CIDRS+=("$1")
+            ;;
+        --approved-cidr-file)
+            shift
+            [ "$#" -gt 0 ] || { printf 'missing --approved-cidr-file value\n' >&2; exit 2; }
+            APPROVED_CIDR_FILE=$1
+            ;;
+        --portal-https-port)
+            shift
+            [ "$#" -gt 0 ] || { printf 'missing --portal-https-port value\n' >&2; exit 2; }
+            PORTAL_HTTPS_PORT=$1
             ;;
         --nginx-root)
             shift
@@ -70,6 +157,11 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$ACCEPTANCE" -eq 1 ]; then
+    run_acceptance
+    exit $?
+fi
 
 # Return the local addresses listening on a TCP port, one per line.  Falls back
 # silently when ss is unavailable; the caller reports that as a warning.

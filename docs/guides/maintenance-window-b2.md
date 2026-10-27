@@ -10,7 +10,11 @@
   不改 nginx/DNS/VPN/防火墙、不操作无关容器**。
 - 升级后保持 `policy.mode = "monitor"`、`deployment_allowed = false`、
   `[portal].enabled = false`。
-- 安装使用 `--no-timers`，且不传 `--start`；timer 和 broker 由操作者显式控制。
+- 安装使用 `--no-timers` 和 `--maintenance-window`，且不传 `--start`；timer 和
+  broker 由操作者显式控制。
+- 安装器把新版本装到 `venvs/venv-<version>-<timestamp>-<pid>`，通过 smoke test 后
+  原子切换 `.venv`，旧环境保留；在 `--maintenance-window` 下先停止写入者，再用
+  `backup.py` 生成一致快照。失败时 trap 会恢复旧 venv 和快照。
 - 目标机没有 LVM/文件系统快照；本文的“快照”是**文件级备份**，因此必须先做
   rollback rehearsal，且备份必须校验。
 - 安装失败时让安装器的 `EXIT/HUP/INT/TERM` trap 完成回滚；不要 `kill -9` 安装器。
@@ -64,6 +68,10 @@
       ```
 
 ## 3. 建立文件级备份
+
+> 安装器在 `--maintenance-window` 下会再取一次一致快照，默认写到
+> `/var/backups/citespec-resource/snapshots/`，并校验 `manifest.json`。本节的手动
+> 备份仍应执行：它提供独立的整机恢复点和窗口证据，不依赖安装器成功。
 
 ```bash
 set -euo pipefail
@@ -202,6 +210,8 @@ for p in /usr/bin/nvidia-smi /usr/bin/nvidia-smi.real \
          /usr/local/lib/citespec-resource/libcitespec-nvidia-chmod.so \
          /usr/local/lib/citespec-resource /usr/local/libexec/citespec-resource \
          /etc/citespec-resource/portal-secret.key \
+         /etc/citespec-resource/portal-network-accepted \
+         /etc/citespec-resource/gpu-isolation.ok \
          /var/lib/citespec-resource/portal.db \
          /etc/systemd/system/citespec-resource-portal.service; do
   if [ -e "$p" ]; then stat -c '%n exists %a %U:%G' "$p"; else echo "$p absent"; fi
@@ -276,11 +286,11 @@ PY
 
 ## 6. 升级命令
 
-先手动跑 preflight，**跳过 nvidia probe**，因为 wrapper 尚未安装：
+先手动跑 preflight。默认不调用 `nvidia-smi`，因为 wrapper 尚未安装：
 
 ```bash
 cd <repo-root>
-bash deploy/preflight.sh --config "$B/config.monitor.toml" --skip-nvidia
+bash deploy/preflight.sh --config "$B/config.monitor.toml"
 ```
 
 记录任何 failure；有 failure 就停止，不要继续安装。安装器本身仍会运行
@@ -289,27 +299,32 @@ bash deploy/preflight.sh --config "$B/config.monitor.toml" --skip-nvidia
 
 ```bash
 bash deploy/install_server.sh \
-  --dry-run --skip-preflight --no-timers \
+  --dry-run --skip-preflight --no-timers --maintenance-window \
   --config-source "$B/config.monitor.toml" --force-config
 ```
 
-确认 dry-run 输出的 config、workspace、unit 和“不启用 timer”符合预期后执行：
+确认 dry-run 输出的 config、workspace、unit、版本化 venv 和“不启用 timer”
+符合预期后执行：
 
 ```bash
 bash deploy/install_server.sh \
-  --yes --skip-preflight --no-timers \
+  --yes --skip-preflight --no-timers --maintenance-window \
   --config-source "$B/config.monitor.toml" --force-config
 ```
 
 说明：
 
-- 不传 `--start`；安装器只 enable，不启动。
+- 不传 `--start`；安装器只 enable 非 Portal unit，不启动。
+- `--maintenance-window` 允许安装器停止仍 active 的受管写入者（如果第 3.1 节已
+  停止，则确认它们仍停止），随后用 `backup.py --no-quiesce` 取一致快照；快照失败
+  会中止安装。
+- 新 venv 先 staging、smoke test，再原子切换 `.venv`；旧 venv 保留在
+  `/opt/citespec-resource/venvs/legacy-*`。
 - `--no-timers` 不会自动 disable 旧 timer；第 3.1 节已停止它们，回滚时按记录的
   原状态恢复。
 - 若安装器失败，**不要手动清理**，先读它的 `[rollback]` 输出并确认
-  `/var/backups/citespec-resource/<timestamp>/`；其 EXIT trap 会恢复文件、unit/
-  timer 状态和 NVIDIA 路径。安装器捕获的是“安装开始时”的状态，而我们在第 3.1 节
-  已停止 broker/intake/provision，因此它不会自动重新启动这些服务；确认回滚成功后，
+  `/var/backups/citespec-resource/<timestamp>/` 和 `snapshots/`；其 EXIT trap 会
+  恢复文件、unit/timer 状态、NVIDIA 路径、旧 venv 和一致快照。确认回滚成功后，
   按第 7 节的启动顺序启动旧服务并验收。
 
 ## 7. 启动与验收
@@ -338,12 +353,18 @@ done
       可连接 broker。
 - [ ] `citespec-resource admin mode monitor` 成功；若因既有 lease 被拒绝，停止，
       不要强行切换，按第 8 节回滚或改用 maintenance 方案重新审批。
-- [ ] `preflight.sh --config /etc/citespec-resource/config.toml` 正常执行（此时
-      wrapper 应已安装，nvidia 探测不应再改设备权限）。
+- [ ] `preflight.sh --config /etc/citespec-resource/config.toml --probe-nvidia
+      --nvidia-only` 正常执行（此时 wrapper 应已安装；探测不应改设备权限）。
+- [ ] 完整 `preflight.sh --config /etc/citespec-resource/config.toml` 通过（默认不再
+      重复调用 `nvidia-smi`）。
 - [ ] `bash deploy/verify_gpu_permissions.sh --json` 通过；`stat`/`getfacl` 显示
       `/dev/nvidia*` 为成员不可用的安全状态。
 - [ ] `bash deploy/verify_portal_network.sh --nginx-root /etc/nginx` 只报告预期
-      warning（Portal 未启用）。
+      warning（Portal 未启用）；Portal unit 未 enable，且
+      `/etc/citespec-resource/portal-network-accepted` 不存在。
+- [ ] 未开放 development profile：`/etc/citespec-resource/gpu-isolation.ok` 不存在，
+      active + development + container sudo 会被拒绝。只有真机
+      `verify_gpu_isolation.sh` PASS 后才评估是否写标记。
 - [ ] `systemctl is-enabled` 三个 timer 均为 disabled；`systemctl is-active` 均非
       active。
 - [ ] 容器基线未变：`docker ps -a` 的 ID/状态与 `containers.tsv` 一致；exited
@@ -351,6 +372,30 @@ done
 - [ ] `journalctl -u citespec-resource-broker -u citespec-resource-intake --since`
       无持续错误。
 - [ ] 记录升级后的 `pip freeze`、unit 状态、DB `user_version` 和备份路径。
+
+### 7.1 Portal 网络验收后启用（本窗口外）
+
+本窗口**不启用 Portal**。只有在 DNS、证书、VPN 路由和防火墙由网络管理方验收后，
+才运行唯一入口：
+
+```bash
+install -d -m 0755 /etc/citespec-resource
+bash /usr/local/libexec/citespec-resource/enable_portal.sh \
+  --yes \
+  --approved-cidr <campus-or-vpn-cidr> \
+  [--approved-cidr <additional-cidr>]...
+```
+
+该脚本先要求 `[portal].enabled = true`，再运行
+`verify_portal_network.sh --acceptance`（读取 `nginx -T`、校验 TLS、源限制、loopback
+反代和 listener）；全部通过后才写
+`/etc/citespec-resource/portal-network-accepted` 并 `systemctl enable --now`。任一步
+失败会删除标记并回滚 enablement。撤销：
+
+```bash
+systemctl disable --now citespec-resource-portal.service
+rm -f /etc/citespec-resource/portal-network-accepted
+```
 
 保留 `/home/data2`（或实际数据盘）上的备份至少到下一次成功备份/验收，不要在同一
 窗口删除。
@@ -372,7 +417,8 @@ systemctl stop citespec-resource-logrotate.timer \
   citespec-resource-disk-check.timer citespec-resource-backup.timer 2>/dev/null || true
 ```
 
-1. 恢复安装前缀（先确认备份中的 venv 可执行）：
+1. 恢复安装前缀（备份包含版本化 `venvs/` 和旧 `.venv` 符号链接；先确认旧 venv
+   可执行）：
 
    ```bash
    test -x "$B/opt-citespec-resource/.venv/bin/python" || {
@@ -397,6 +443,8 @@ systemctl stop citespec-resource-logrotate.timer \
             /usr/local/lib/citespec-resource/libcitespec-nvidia-chmod.so \
             /usr/local/lib/citespec-resource /usr/local/libexec/citespec-resource \
             /etc/citespec-resource/portal-secret.key \
+            /etc/citespec-resource/portal-network-accepted \
+            /etc/citespec-resource/gpu-isolation.ok \
             /var/lib/citespec-resource/portal.db \
             /etc/systemd/system/citespec-resource-portal.service; do
      if grep -Fqx "$p absent" "$B/meta/pre-paths.txt"; then
@@ -431,6 +479,19 @@ systemctl stop citespec-resource-logrotate.timer \
    restore_db "$B/db/portal.db" /var/lib/citespec-resource/portal.db 0
    # 按 meta/db-owners.txt 恢复 owner/mode
    ```
+
+   如果保留安装器生成的
+   `/var/backups/citespec-resource/snapshots/<timestamp>/manifest.json`，优先用它
+   恢复同一时点的全部数据库、配置和 spool：
+
+   ```bash
+   "$VENV/bin/python" -m citespec_resource.backup restore \
+     /var/backups/citespec-resource/snapshots/<timestamp> \
+     --config /etc/citespec-resource/config.toml --yes
+   ```
+
+   `restore` 会自行停止写入者、强制 maintenance、校验每个文件，并在失败时回滚
+   整组替换；手动 `restore_db` 仅作为没有可用快照时的后备。
 
 5. 恢复服务状态并重载：
 

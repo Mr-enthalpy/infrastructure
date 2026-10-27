@@ -2,7 +2,8 @@
 
 - 分支：`fix/p1-pre-deploy`，基于 `main@e987c7e`
 - 范围：仅修复审计确认的 P1 项；未连接、未修改生产主机
-- 本地验证：**544 passed / 26 skipped**；Ruff check/format、mypy、`bash -n deploy/*.sh` 通过
+- 本地验证：**557 passed / 27 skipped**；Ruff check/format、mypy、`bash -n deploy/*.sh` 通过
+- 客户端版本：`0.1.1`（部署候选）；`v0.1.0` 已发布内容不变，未替换、未重发
 - 真实主机验证：**未执行**（按本轮要求，P1 阶段不触碰目标机）
 - Git 历史：未改写；未替换或重新发布 `v0.1.0`
 
@@ -134,8 +135,8 @@ wrapper 恢复且 `.real` 被移除，以及备份被篡改时报告 mismatch。
   以及 zip 内 `install.sh`/`install.ps1` 的 SHA-256 和大小。
 - 新增独立 `packaging/verify_release.py`、`.sh`、`.ps1`：校验 Ed25519 签名、
   full zip 摘要、zip 内安装脚本摘要，并可选校验已解压脚本。
-- `install.sh --verify <sha256>` 与 `install.ps1 -Verify <sha256>` 在安装前认证
-  自身；不匹配直接退出。
+- `install.sh --verify <sha256>` 与 `install.ps1 -Verify <sha256>` 是强制参数；
+  缺失、格式错误或摘要不匹配都会在写入任何文件前退出。
 - release workflow 用签名清单自检两个平台的 full zip，并把验证器作为 Release
   资产发布；缺少 full zip 或安装脚本时发布失败。
 - 客户端文档说明首次安装步骤和残余信任缺口。
@@ -168,8 +169,11 @@ wrapper 恢复且 `.real` 被移除，以及备份被篡改时报告 mismatch。
   wrapper 时告警“探测本身可能改权限”，wrapper 已安装但仍变化时失败。
 - 校验 `nvidia-smi` 和 `nvidia-modprobe` wrapper 的 `.real` 目标、`.real` 存在且无
   setuid/setgid、shim 可读；`.real` 已存在但 wrapper/shim 缺失时失败。
-- 新增 `--skip-nvidia`：完全跳过 `nvidia-smi` 查询和 compute-process 检查，其余
-  静态审计继续执行。
+- preflight 默认**不再调用** `nvidia-smi`：未安装 wrapper 时探测本身可能把
+  `/dev/nvidia*` 重置为 `0666 root:root`。显式 `--probe-nvidia` 才执行前后
+  mode/owner 快照；wrapper 未安装或 `.real` 缺失时拒绝探测。
+- 保留 `--skip-nvidia` 作为显式跳过（与默认行为一致），并新增 `--nvidia-only`
+  只跑 NVIDIA helper/设备检查。
 - 两个 nginx 示例加入 `allow <vpn-source-cidr>; deny all;`，并保留
   `X-Citespec-Client-IP $remote_addr` 覆盖。
 - 新增只读 `deploy/verify_portal_network.sh`：检查 vhost 是否绑定具体私有地址、
@@ -182,19 +186,101 @@ wildcard/缺 allow/公共上游/伪造头的拒绝行为。
 
 **残余风险**：
 
-- `--skip-nvidia` 不同时检查 compute process；使用后必须另找时点确认无训练。
-- 未安装 wrapper 的主机上，preflight 的探测仍可能改权限，只是现在会明确告警；
-  首次安装前应尽量避免在成员可登录时运行。
+- 默认不做 NVIDIA 探测，因此也不检查 compute process；需要探测时必须先安装
+  wrapper，再显式使用 `--probe-nvidia`。
+- 未安装 wrapper 的主机上，任何 root `nvidia-smi` 调用仍可能改权限；首次安装前
+  应尽量避免在成员可登录时运行，安装器只在 wrapper/权限修复完成后做一次
+  `--probe-nvidia --nvidia-only`。
 - `verify_portal_network.sh` 只审计配置和当前 listener，不替代防火墙/VPN；`allow`
   范围仍是占位符，必须由网络管理方填写。
 - 路径按 `/usr/bin/nvidia-smi`、`/usr/local/lib/citespec-resource/` 固定；发行版
   路径不同会导致告警而非自动适配。
 
+### 追加修复：单机测试服务器部署阻断项
+
+在不改写 Git 历史、不替换 `v0.1.0` 的前提下，本轮把测试服务器部署前发现的阻断项
+并入同一 PR：
+
+**B-1 安装事务、版本化 venv 与一致快照**
+
+- 新环境先安装到 `venvs/.staging-<version>-<timestamp>-<pid>`，通过
+  `import citespec_resource`、两个入口点和 `version` smoke test 后，才提升为
+  `venvs/venv-<version>-<timestamp>-<pid>`，再用临时符号链接原子切换
+  `/opt/citespec-resource/.venv`。旧目录/旧符号链接保留，供回滚恢复。
+- 已存在 active unit/timer 时，安装器拒绝继续，除非显式
+  `--maintenance-window`；该选项先停止受管写入者，再取快照。
+- 快照复用 `backup.py backup --no-quiesce --keep 0`，覆盖 state/intake/portal
+  SQLite、配置和 spool，并校验 `manifest.json`；不再在写入者运行时直接复制
+  数据库文件。
+- 回滚先恢复旧 venv，再恢复快照；失败时保留旧环境、数据库和 spool 的一致状态。
+
+**B-2 备份 unit 的可写路径**
+
+- `citespec-resource-backup.service` 增加 `/var/lib/citespec-resource`、
+  `/var/lib/citespec-resource-intake`、`/var/lib/citespec-resource-portal` 的
+  `ReadWritePaths`，使 `ProtectSystem=strict` 下的
+  `wal_checkpoint(TRUNCATE)` 和 `-wal/-shm` 截断能够完成。
+
+**B-3 客户端安装自校验改为强制**
+
+- `packaging/install.sh` 必须提供 `--verify SHA256`，`install.ps1` 必须提供
+  `-Verify SHA256`；缺失、格式错误或摘要不匹配都在写入任何文件前退出。
+- 版本号提升为 `0.1.1`；`v0.1.0` 的已发布资产和 tag 不变。
+
+**B-4 非默认 workspace_root**
+
+- 安装器不再因为 `server.workspace_root` 与静态 unit 的 amax 路径不同而硬失败；
+  改为生成四份 `10-workspace.conf` drop-in（broker、logrotate、disk-check、
+  provision），分别覆盖 `ReadWritePaths`/`ReadOnlyPaths`、`ExecStart` 和
+  `CITESPEC_RESOURCE_WORKSPACE_ROOT`，确保所有引用该路径的 unit 与配置一致；旧的
+  drop-in 在路径重新匹配静态值时删除，并纳入备份/回滚。
+
+**B-5 Portal 网络验收门**
+
+- 安装器**永不 enable** Portal unit；unit 增加
+  `ConditionPathExists=/etc/citespec-resource/portal-network-accepted`，即使被
+  手工 enable，没有验收标记也不会在启动时拉起。
+- 新增 `deploy/portal_network_audit.py`：解析 `nginx -T` 的**生效配置**，要求
+  唯一 Portal vhost、私网地址绑定、TLS 端口、批准 CIDR 内的 `allow`、末尾
+  `deny all`、只反代 loopback、`X-Citespec-Client-IP` 由 `$remote_addr` 覆盖、
+  证书/私钥匹配且未过期、TLS 1.2/1.3、上游只监听 loopback，并拒绝在没有标记时
+  已经 enable/active 的 unit。
+- `deploy/verify_portal_network.sh --acceptance` 是该审计的 fail-closed 入口；
+  `deploy/enable_portal.sh --yes --approved-cidr ...` 是唯一 enable 入口：审计
+  通过后才写标记并 `systemctl enable --now`，任一步失败会删除标记并回滚启用。
+
+**B-6 GPU 设备节点隔离门**
+
+- 新增 `deploy/verify_gpu_isolation.sh`：记录 `/dev/nvidia*` 的 inode/mode/owner，
+  以成员身份经容器 sudo 尝试 `stat`/`chmod 0666`/`chown 1000:1000`，再次 diff；
+  失败时自动恢复原 mode/owner 并保留
+  `/var/log/citespec-resource/gpu-isolation-<UTC>/` 证据。
+- 只有同时提供 `--bystander` 且旁路成员无法读写设备、完整 PASS 时，
+  `--write-marker` 才会写 `/etc/citespec-resource/gpu-isolation.ok`。
+- `config.py` 的 `validate_active_mode_policy`、preflight 和 Broker 启动/切换
+  共用该门：active + development + container sudo 在标记缺失时一律拒绝。
+- preflight 默认不探测 NVIDIA；安装器在 wrapper 和权限修复完成后执行
+  `--probe-nvidia --nvidia-only`。若真机测试失败，优先尝试 user namespace
+  remap；不可接受时关闭 development profile / container sudo，不写标记。
+
+**证据**：`tests/test_deploy_scripts.py` 覆盖版本化 venv/原子切换、维护窗口与
+`backup.py` 快照、workspace drop-in、Portal 审计与 enable 顺序、GPU 隔离脚本
+fail-closed；`tests/test_config.py` 覆盖 active dev+sudo 在标记缺失/存在时的
+行为；`tests/test_packaging.py` 覆盖强制自校验；`tests/test_backup.py` 及既有
+stub 回滚测试继续覆盖备份/恢复与回滚状态。
+
+**残余风险**：
+
+- Portal 审计读取的是主机当前生效的 nginx 配置；DNS、证书签发、VPN 路由和
+  防火墙仍由网络管理方负责，本仓库不修改。
+- GPU 隔离结论只能在真实 NVIDIA 主机上得出；标记是验收记录，不是隔离机制本身。
+- 版本化 venv 会保留旧环境；需要后续保留/清理策略，磁盘不足应在维护窗口前检查。
+
 ## 3. 验证汇总
 
 | 检查 | 结果 |
 |---|---|
-| `python -m pytest -q` | 544 passed, 26 skipped（Windows 本地） |
+| `python -m pytest -q` | 557 passed, 27 skipped（Windows 本地） |
 | `python -m ruff check .` | 通过 |
 | `python -m ruff format --check .` | 通过 |
 | `python -m mypy src` | 通过（45 个源文件） |
@@ -202,23 +288,31 @@ wildcard/缺 allow/公共上游/伪造头的拒绝行为。
 | 真实 Linux/Docker/descriptor-relative 测试 | 本地跳过，由 Ubuntu CI 覆盖 |
 | 真实主机修改 | 未执行 |
 
-26 个 skip 主要是 Linux-only（descriptor-relative 文件操作、Unix socket、POSIX
-执行位、stub 回滚）和 Docker 集成测试；需要在推送后的 Ubuntu CI 或目标机验证。
+27 个 skip 主要是 Linux-only（descriptor-relative 文件操作、Unix socket、POSIX
+执行位、stub 回滚、stub nginx/openssl 验收）和 Docker 集成测试；需要在推送后的
+Ubuntu CI 或目标机验证。
 
 ## 4. 部署前仍需完成
 
-1. 推送分支并等待 Ubuntu CI；确认 Linux-only 回滚、WAL、执行位测试通过。
-2. 在一次性 VM 上做安装器回滚演练（至少包含 unit/timer 与 NVIDIA 路径故障）。
-3. 目标机维护窗口内先执行手动 SQLite `.backup` + checkpoint，再做变更前快照；
-   安装使用 `--no-timers`，验收后再启用 timer。
-4. 目标机首次安装后运行 `preflight.sh` 与 `verify_portal_network.sh`，确认
-   `service_account`、NVIDIA wrapper/shim、设备权限和 Portal 网络边界。
-5. Portal 仍保持禁用；nginx 模板的 `allow` 范围、证书、DNS、防火墙由网络管理方
-   填写并复核。
+1. 推送分支并等待 Ubuntu CI；确认 Linux-only 回滚、WAL、执行位和 Portal 验收
+   测试通过。
+2. 在一次性 VM 上做安装器回滚演练（至少包含 unit/timer、版本化 venv 切换、
+   一致快照和 NVIDIA 路径故障）。
+3. 目标机维护窗口内先记录现状；安装时使用 `--maintenance-window` 让安装器自动
+   停止写入者并取一致快照。`--no-timers` 仍可用于 monitor 部署，验收后再启用。
+4. 首次安装后运行 `preflight.sh`（默认不探测 NVIDIA）与
+   `verify_portal_network.sh`；确认 `service_account`、NVIDIA wrapper/shim 和
+   设备权限。需要探测时先安装 wrapper，再用 `--probe-nvidia`。
+5. Portal 保持禁用；DNS/VPN/TLS/防火墙验收完成后，才运行
+   `enable_portal.sh --yes --approved-cidr <CIDR>` 写标记并启用。
+6. development profile + container sudo 保持关闭；先运行
+   `verify_gpu_isolation.sh --write-marker` 取得真机 PASS，再评估是否开放。
 
 ## 5. 结论
 
-七项 P1 均已在代码和自动化测试层面修复，未触碰生产主机，未改写 Git 历史，未替换
-`v0.1.0`。P1-4 的静默备份和 P1-5 的真实 systemd 回滚仍需要在 Linux 环境做一次
-部署前演练；P1-6 的首次安装信任仍存在 HTTPS 通道 + 指纹比对的残余缺口，已在文档
-中明确。
+七项 P1 和本轮测试服务器部署阻断项均已在代码和自动化测试层面修复，未触碰生产
+主机，未改写 Git 历史，未替换 `v0.1.0`。P1-4 的静默备份、P1-5 的真实 systemd
+回滚、版本化 venv 切换和一致快照仍需在 Linux/一次性 VM 上做部署前演练；Portal
+必须在网络验收后由 `enable_portal.sh` 启用；development profile/container sudo
+必须在 `verify_gpu_isolation.sh` 真机 PASS 并写入标记后才可评估开放。P1-6 的
+首次安装信任仍存在 HTTPS 通道 + 指纹比对的残余缺口，已在文档中明确。

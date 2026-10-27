@@ -8,6 +8,21 @@ from citespec_resource.config import LabConfig, load_config
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(scope="session")
+def gpu_isolation_marker(tmp_path_factory) -> Path:
+    # CI cannot run the real-host P0 drill from docs/acceptance.md §5.6.
+    # Production still requires the default marker; the dedicated gate test
+    # overrides this variable with a missing path to prove the failure.
+    path = tmp_path_factory.mktemp("gpu-isolation") / "gpu-isolation.ok"
+    path.write_text("created_at=test\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _test_gpu_isolation_marker(gpu_isolation_marker: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CITESPEC_GPU_ISOLATION_MARKER", str(gpu_isolation_marker))
+
+
 @pytest.fixture
 def monitor_config() -> LabConfig:
     return load_config(ROOT / "lab/resources.example.toml")

@@ -12,14 +12,30 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 PREFIX=/opt/citespec-resource
+VENVS_DIR=$PREFIX/venvs
 VENV=$PREFIX/.venv
+VENV_STAGING=""
+VENV_TARGET=""
+VENV_PREVIOUS=""
+VENV_PREVIOUS_LINK=""
+VENV_PREVIOUS_KIND="none"
+VENV_SWITCHED=0
 CONFIG_DIR=/etc/citespec-resource
 CONFIG_FILE=$CONFIG_DIR/config.toml
 STATE_DIR=/var/lib/citespec-resource
-# The static unit templates below grant access to this exact workspace.  P1-06:
-# reject a different workspace instead of warning and installing units that
-# would create a split directory or a systemd write-permission mismatch.
+# The static unit templates below default to the amax workspace.  A host with a
+# different server.workspace_root gets generated drop-ins for every unit that
+# names the path; the installer no longer rejects a different root.
 SYSTEMD_WORKSPACE_ROOT=/home/data1/citespec-users
+# Every unit that names the workspace is overridden when server.workspace_root
+# differs from the static amax path.  The broker alone is not enough: the
+# log-rotation, disk-check, and provisioning units also embed the path in
+# ExecStart/Environment and in their sandbox path lists.
+WORKSPACE_DROPIN_ROOT=/etc/systemd/system
+BROKER_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-broker.service.d/10-workspace.conf
+LOG_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-logrotate.service.d/10-workspace.conf
+DISK_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-disk-check.service.d/10-workspace.conf
+PROVISION_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-provision.service.d/10-workspace.conf
 SYSTEMD_UNIT=/etc/systemd/system/citespec-resource-broker.service
 UDEV_RULE=/etc/udev/rules.d/99-citespec-gpu.rules
 SSHD_DROPIN=/etc/ssh/sshd_config.d/60-citespec-resource.conf
@@ -56,6 +72,10 @@ MEMBER_SHELL_INSTALL=$LIBEXEC_DIR/member-shell
 CREATE_USER_INSTALL=$LIBEXEC_DIR/create_user.sh
 PROVISION_EXECUTOR_INSTALL=$LIBEXEC_DIR/provision_executor.py
 GPU_FIX_INSTALL=$LIBEXEC_DIR/fix_gpu_permissions.sh
+PORTAL_AUDIT_INSTALL=$LIBEXEC_DIR/verify_portal_network.sh
+PORTAL_AUDIT_PY_INSTALL=$LIBEXEC_DIR/portal_network_audit.py
+ENABLE_PORTAL_INSTALL=$LIBEXEC_DIR/enable_portal.sh
+GPU_ISOLATION_INSTALL=$LIBEXEC_DIR/verify_gpu_isolation.sh
 GPU_SHIM_DIR=/usr/local/lib/citespec-resource
 GPU_SHIM="$GPU_SHIM_DIR/libcitespec-nvidia-chmod.so"
 GPU_SHIM_SRC="$GPU_SHIM_DIR/citespec_nvidia_chmod_shim.c"
@@ -71,6 +91,8 @@ ASSUME_YES=0
 SKIP_PREFLIGHT=0
 START=0
 ALLOW_ACTIVE=0
+MAINTENANCE_WINDOW=0
+SERVICES_STOPPED=0
 FORCE_CONFIG=0
 ENABLE_TIMERS=1
 AUDIT_FAILED=0
@@ -84,6 +106,7 @@ BACKED_UP=()
 STATE_DB=""
 STATE_DB_BACKUP=""
 STATE_DB_EXISTED=0
+SNAPSHOT_DIR=""
 # Unit/timer state recorded before the installer touches anything.  Rollback
 # restores both enablement and active state, not just the broker.
 UNIT_NAMES=(
@@ -135,6 +158,10 @@ Options:
   --allow-active        Allow an active-mode config after training and approval.
                         A fresh database still starts in monitor; existing active
                         leases are preserved only when deployment_allowed=true.
+  --maintenance-window  Required when an existing Citespec unit is active. Stops
+                        the managed writers before replacing the Python venv and
+                        taking the database snapshot; they remain stopped unless
+                        --start is also given.
   --force-config        Overwrite an existing /etc/citespec-resource/config.toml.
   --no-timers           Do not enable the disk-alert, backup, and log-rotation timers.
   --config-source PATH  TOML config to install (default: lab/resources.local.toml
@@ -399,6 +426,191 @@ reload_sshd() {
     fi
 }
 
+write_workspace_dropin() {
+    local destination=$1
+    shift
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/citespec-workspace.XXXXXX") \
+        || fail "could not create workspace drop-in temp file: $destination"
+    {
+        printf '[Service]\n'
+        printf '%s\n' "$@"
+    } > "$tmp" || fail "could not write workspace drop-in: $destination"
+    install_file 0644 "$tmp" "$destination"
+    rm -f -- "$tmp"
+}
+
+# The static units hard-code the amax workspace.  When this host uses another
+# server.workspace_root, override every place the path appears: the sandbox
+# path lists, the log-rotation and disk-check ExecStart, and the provisioning
+# executor's managed-root variable.
+install_workspace_dropins() {
+    local root=$1
+    local dropin
+    for dropin in "$BROKER_WORKSPACE_DROPIN" "$LOG_WORKSPACE_DROPIN" \
+                  "$DISK_WORKSPACE_DROPIN" "$PROVISION_WORKSPACE_DROPIN"; do
+        run install -d -o root -g root -m 0755 "$(dirname "$dropin")"
+    done
+    write_workspace_dropin "$BROKER_WORKSPACE_DROPIN" \
+        "ReadWritePaths=$root"
+    write_workspace_dropin "$LOG_WORKSPACE_DROPIN" \
+        "ExecStart=" \
+        "ExecStart=/usr/local/sbin/citespec-rotate-job-logs --workspace-root $root --max-bytes 104857600 --keep 3" \
+        "ReadWritePaths=" \
+        "ReadWritePaths=$root"
+    write_workspace_dropin "$DISK_WORKSPACE_DROPIN" \
+        "ExecStart=" \
+        "ExecStart=/usr/local/sbin/citespec-check-disk --path $root --warn-percent 85 --crit-percent 95 --min-free-gb 200" \
+        "ReadOnlyPaths=" \
+        "ReadOnlyPaths=$root"
+    write_workspace_dropin "$PROVISION_WORKSPACE_DROPIN" \
+        "Environment=CITESPEC_RESOURCE_WORKSPACE_ROOT=$root" \
+        "ReadWritePaths=" \
+        "ReadWritePaths=/etc /home $root /var/lib/citespec-resource/provision"
+}
+
+remove_workspace_dropins() {
+    local dropin
+    for dropin in "$BROKER_WORKSPACE_DROPIN" "$LOG_WORKSPACE_DROPIN" \
+                  "$DISK_WORKSPACE_DROPIN" "$PROVISION_WORKSPACE_DROPIN"; do
+        if [ -e "$dropin" ] || [ -L "$dropin" ]; then
+            note "removing obsolete workspace drop-in: $dropin"
+            backup_file "$dropin"
+            run rm -f -- "$dropin"
+        fi
+    done
+}
+
+restore_venv() {
+    [ "$VENV_SWITCHED" -eq 1 ] || return 0
+    printf '[rollback] restoring previous Python environment\n' >&2
+    case "$VENV_PREVIOUS_KIND" in
+        link)
+            ln -sfn -- "$VENV_PREVIOUS_LINK" "$VENV" \
+                || warn "could not restore the previous .venv symlink"
+            ;;
+        dir)
+            rm -f -- "$VENV" || true
+            mv -- "$VENV_PREVIOUS" "$VENV" \
+                || warn "could not restore the previous .venv directory"
+            ;;
+        none)
+            rm -f -- "$VENV" || true
+            ;;
+    esac
+    # The newly built environment is no longer referenced; keep the previous
+    # one (restored above) and discard only the failed release.
+    if [ -n "$VENV_TARGET" ] && [ -d "$VENV_TARGET" ]; then
+        rm -rf -- "$VENV_TARGET" || true
+    fi
+    VENV_SWITCHED=0
+}
+
+cleanup_venv_staging() {
+    if [ -n "$VENV_STAGING" ] && [ -d "$VENV_STAGING" ]; then
+        rm -rf -- "$VENV_STAGING" || true
+    fi
+    # A failure between promoting the staging directory and switching .venv
+    # leaves an unreferenced release directory behind.  It can never be the
+    # active environment in that state, so discard it.
+    if [ "$VENV_SWITCHED" -eq 0 ] && [ -n "$VENV_TARGET" ] && [ -d "$VENV_TARGET" ]; then
+        rm -rf -- "$VENV_TARGET" || true
+    fi
+}
+
+# Replace /opt/citespec-resource/.venv only after the new environment passed its
+# smoke test.  A real directory is moved aside; an existing symlink target is
+# recorded and recreated on rollback.  Services must already be stopped.
+switch_venv() {
+    local tmp_link=$VENV.tmp-$$
+    if [ -L "$VENV" ]; then
+        VENV_PREVIOUS_LINK=$(readlink "$VENV") \
+            || fail "could not read the existing .venv symlink"
+        VENV_PREVIOUS_KIND=link
+    elif [ -d "$VENV" ]; then
+        VENV_PREVIOUS="$VENVS_DIR/legacy-$(date +%Y%m%d%H%M%S)-$$"
+        mv -- "$VENV" "$VENV_PREVIOUS" \
+            || fail "could not move the previous Python environment aside"
+        VENV_PREVIOUS_KIND=dir
+        VENV_SWITCHED=1
+    else
+        VENV_PREVIOUS_KIND=none
+    fi
+    if ! ln -s -- "$VENV_TARGET" "$tmp_link"; then
+        restore_venv
+        fail "could not create the new .venv symlink"
+    fi
+    if ! mv -T -- "$tmp_link" "$VENV"; then
+        rm -f -- "$tmp_link" || true
+        restore_venv
+        fail "could not activate the new Python environment"
+    fi
+    VENV_SWITCHED=1
+}
+
+# Read server.state_db from an already-installed config without importing the
+# package (the old venv may predate this release).
+existing_state_db() {
+    local config=$1
+    [ -f "$config" ] || return 0
+    "$PYTHON_BIN" - "$config" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        data = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(0)
+value = data.get("server", {}).get("state_db", "")
+print(value if isinstance(value, str) else "")
+PY
+}
+
+# One consistent, verified snapshot of every database and the spool, created
+# with the same code path as the scheduled backup.  Writers must already be
+# stopped; --no-quiesce prevents this invocation from restarting them.
+take_preupgrade_snapshot() {
+    local state_db=$1
+    local parent="$BACKUP_DIR/snapshots"
+    local output
+    [ -n "$state_db" ] && [ -f "$state_db" ] || return 0
+    [ -n "${SNAPSHOT_PYTHON:-}" ] && [ -x "$SNAPSHOT_PYTHON" ] \
+        || fail "cannot take a consistent pre-upgrade snapshot: installed Python environment is missing"
+
+    run install -d -o root -g root -m 0700 "$parent"
+    note "taking consistent pre-upgrade snapshot (state, intake, portal, spool)"
+    output=$(PYTHONPATH="$REPO_ROOT/src" "$SNAPSHOT_PYTHON" -m citespec_resource.backup backup \
+        --config "$CONFIG_FILE" \
+        --backup-root "$parent" \
+        --keep 0 \
+        --no-quiesce \
+        --json) || fail "pre-upgrade snapshot failed; refusing to continue"
+    SNAPSHOT_DIR=$(printf '%s' "$output" | "$PYTHON_BIN" -c \
+        'import json, sys; print(json.load(sys.stdin)["backup"])') \
+        || fail "could not parse pre-upgrade snapshot output"
+    [ -f "$SNAPSHOT_DIR/manifest.json" ] \
+        || fail "pre-upgrade snapshot has no manifest: $SNAPSHOT_DIR"
+    ok "pre-upgrade snapshot: $SNAPSHOT_DIR"
+}
+
+restore_preupgrade_snapshot() {
+    [ -n "${SNAPSHOT_DIR:-}" ] || return 0
+    [ -f "$SNAPSHOT_DIR/manifest.json" ] || {
+        warn "pre-upgrade snapshot is missing its manifest: $SNAPSHOT_DIR"
+        return 0
+    }
+    printf '[rollback] restoring databases and spool from %s\n' "$SNAPSHOT_DIR" >&2
+    # Use the restored (old) environment for its dependencies; the source tree
+    # supplies this release's restore implementation.
+    PYTHONPATH="$REPO_ROOT/src" "$VENV/bin/python" -m citespec_resource.backup restore \
+        "$SNAPSHOT_DIR" \
+        --config "$CONFIG_FILE" \
+        --yes \
+        --json >/dev/null \
+        || warn "could not restore the pre-upgrade snapshot automatically; restore manually with: PYTHONPATH=$REPO_ROOT/src $VENV/bin/python -m citespec_resource.backup restore $SNAPSHOT_DIR --config $CONFIG_FILE --yes"
+}
+
 rollback() {
     local code=${1:-$?}
     local path
@@ -413,6 +625,11 @@ rollback() {
     # this a newly enabled timer/service keeps running against restored files.
     stop_managed_units
     disable_new_units
+    # Put the old interpreter back before restoring files that its service
+    # units point at.  A failed upgrade must never leave old units running a
+    # partially updated environment.
+    restore_venv
+    cleanup_venv_staging
     for path in "${BACKED_UP[@]}"; do
         rel=${path#/}
         if [ -f "$BACKUP_DIR/$rel.absent" ]; then
@@ -425,7 +642,13 @@ rollback() {
     if unit_is_active citespec-resource-broker.service; then
         broker_active=1
     fi
-    if [ -n "$STATE_DB" ] && [ "$broker_active" -eq 0 ]; then
+    if [ -n "$SNAPSHOT_DIR" ]; then
+        if [ "$broker_active" -eq 0 ]; then
+            restore_preupgrade_snapshot
+        else
+            warn "broker is still running; leaving the consistent snapshot unrestored"
+        fi
+    elif [ -n "$STATE_DB" ] && [ "$broker_active" -eq 0 ]; then
         if [ "$STATE_DB_EXISTED" -eq 1 ] && [ -f "$STATE_DB_BACKUP" ]; then
             rm -f -- "$STATE_DB-wal" "$STATE_DB-shm" || true
             cp -a -- "$STATE_DB_BACKUP" "$STATE_DB" || true
@@ -479,6 +702,7 @@ while [ "$#" -gt 0 ]; do
         --skip-preflight) SKIP_PREFLIGHT=1 ;;
         --start) START=1 ;;
         --allow-active) ALLOW_ACTIVE=1 ;;
+        --maintenance-window) MAINTENANCE_WINDOW=1 ;;
         --force-config) FORCE_CONFIG=1 ;;
         --no-timers) ENABLE_TIMERS=0 ;;
         --config-source)
@@ -684,30 +908,79 @@ while IFS= read -r username; do
 done < <(effective_members citespec-admins)
 
 if [ "$DRY_RUN" -eq 0 ]; then
+    # An upgrade replaces the interpreter and migrates databases.  Refuse to do
+    # that behind the back of a running broker: the operator must acknowledge a
+    # maintenance window, and every writer is stopped before the snapshot.
+    if [ "${#UNIT_WAS_ACTIVE[@]}" -gt 0 ] || [ "${#TIMER_WAS_ACTIVE[@]}" -gt 0 ]; then
+        if [ "$MAINTENANCE_WINDOW" -ne 1 ]; then
+            fail "existing Citespec units are active; re-run with --maintenance-window to stop writers and take a consistent snapshot"
+        fi
+        note "maintenance window: stopping managed writers before replacing the environment"
+        stop_managed_units
+        SERVICES_STOPPED=1
+    fi
+    if [ -f "$CONFIG_FILE" ]; then
+        EXISTING_STATE_DB=$(existing_state_db "$CONFIG_FILE") \
+            || fail "could not read server.state_db from $CONFIG_FILE"
+        if [ -n "$EXISTING_STATE_DB" ] && [ -f "$EXISTING_STATE_DB" ]; then
+            SNAPSHOT_PYTHON="$VENV/bin/python"
+            take_preupgrade_snapshot "$EXISTING_STATE_DB"
+        fi
+    fi
+
     run install -d -o root -g root -m 0755 "$PREFIX"
+    run install -d -o root -g root -m 0755 "$VENVS_DIR"
+    RELEASE_VERSION=$("$PYTHON_BIN" - "$REPO_ROOT/pyproject.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    print(tomllib.load(handle)["project"]["version"])
+PY
+    ) || fail "could not read the project version"
+    VENV_TARGET="$VENVS_DIR/venv-$RELEASE_VERSION-$(date +%Y%m%d%H%M%S)-$$"
+    VENV_STAGING="$VENVS_DIR/.staging-$RELEASE_VERSION-$(date +%Y%m%d%H%M%S)-$$"
     if have uv; then
-        note "installing package with uv sync --frozen --no-dev --no-editable --extra gui --extra portal"
-        run env UV_PROJECT_ENVIRONMENT="$VENV" uv sync \
+        note "installing package into $VENV_STAGING with uv sync --frozen --no-dev --no-editable --extra gui --extra portal"
+        run env UV_PROJECT_ENVIRONMENT="$VENV_STAGING" uv sync \
             --frozen --no-dev --no-editable --extra gui --extra portal --project "$REPO_ROOT" --python "$PYTHON_BIN"
     else
         warn "uv is not installed; falling back to pip (versions may drift)"
-        if [ ! -x "$VENV/bin/python" ]; then
-            run "$PYTHON_BIN" -m venv "$VENV"
-        fi
-        run "$VENV/bin/python" -m pip install --upgrade pip
-        run "$VENV/bin/python" -m pip install "$REPO_ROOT[gui,portal]"
+        run "$PYTHON_BIN" -m venv "$VENV_STAGING"
+        run "$VENV_STAGING/bin/python" -m pip install --upgrade pip
+        run "$VENV_STAGING/bin/python" -m pip install "$REPO_ROOT[gui,portal]"
     fi
-    [ -x "$VENV/bin/python" ] || fail "venv was not created: $VENV"
+    # Smoke-test the release before it becomes visible through .venv.  A failed
+    # dependency sync must leave the previous environment and services intact.
+    [ -x "$VENV_STAGING/bin/python" ] || fail "venv was not created: $VENV_STAGING"
+    "$VENV_STAGING/bin/python" -c 'import citespec_resource' \
+        || fail "new Python environment cannot import citespec_resource"
+    [ -x "$VENV_STAGING/bin/citespec-resource" ] || fail "citespec-resource entry point is missing"
+    [ -x "$VENV_STAGING/bin/citespec-resource-login" ] || fail "citespec-resource-login entry point is missing"
+    "$VENV_STAGING/bin/citespec-resource" version >/dev/null \
+        || fail "new Python environment failed its version smoke test"
+    if [ -x "$VENV_STAGING/bin/python" ] && "$VENV_STAGING/bin/python" -m pip --version >/dev/null 2>&1; then
+        "$VENV_STAGING/bin/python" -m pip check >/dev/null \
+            || fail "new Python environment has an inconsistent dependency set"
+    fi
+    mv -- "$VENV_STAGING" "$VENV_TARGET" \
+        || fail "could not promote the new Python environment"
+    VENV_STAGING=""
+    switch_venv
+    ok "activated Python environment: $VENV_TARGET"
+    [ -x "$VENV/bin/python" ] || fail "venv was not activated: $VENV"
     [ -x "$VENV/bin/citespec-resource" ] || fail "citespec-resource entry point is missing"
     [ -x "$VENV/bin/citespec-resource-login" ] || fail "citespec-resource-login entry point is missing"
 else
     run_shell "install -d -o root -g root -m 0755 $PREFIX"
+    run_shell "install -d -o root -g root -m 0755 $VENVS_DIR"
     if have uv; then
-        run_shell "UV_PROJECT_ENVIRONMENT=$VENV uv sync --frozen --no-dev --no-editable --extra gui --extra portal --project $REPO_ROOT --python $PYTHON_BIN"
+        run_shell "UV_PROJECT_ENVIRONMENT=$VENVS_DIR/venv-<version> uv sync --frozen --no-dev --no-editable --extra gui --extra portal --project $REPO_ROOT --python $PYTHON_BIN"
+        run_shell "ln -sfn $VENVS_DIR/venv-<version> $VENV"
     else
-        run_shell "$PYTHON_BIN -m venv $VENV"
-        run_shell "$VENV/bin/python -m pip install --upgrade pip"
-        run_shell "$VENV/bin/python -m pip install $REPO_ROOT[gui,portal]"
+        run_shell "$PYTHON_BIN -m venv $VENVS_DIR/venv-<version>"
+        run_shell "$VENVS_DIR/venv-<version>/bin/python -m pip install $REPO_ROOT[gui,portal]"
+        run_shell "ln -sfn $VENVS_DIR/venv-<version> $VENV"
     fi
 fi
 
@@ -724,6 +997,12 @@ install_file 0755 "$SCRIPT_DIR/membership/provision_executor.py" "$PROVISION_EXE
 ok "root provisioning executor installed: $PROVISION_EXECUTOR_INSTALL"
 install_file 0755 "$SCRIPT_DIR/fix_gpu_permissions.sh" "$GPU_FIX_INSTALL"
 ok "GPU device permission fixer installed: $GPU_FIX_INSTALL"
+install_file 0755 "$SCRIPT_DIR/verify_gpu_isolation.sh" "$GPU_ISOLATION_INSTALL"
+ok "GPU isolation verifier installed: $GPU_ISOLATION_INSTALL"
+install_file 0755 "$SCRIPT_DIR/verify_portal_network.sh" "$PORTAL_AUDIT_INSTALL"
+install_file 0644 "$SCRIPT_DIR/portal_network_audit.py" "$PORTAL_AUDIT_PY_INSTALL"
+install_file 0755 "$SCRIPT_DIR/enable_portal.sh" "$ENABLE_PORTAL_INSTALL"
+ok "Portal network acceptance tooling installed: $ENABLE_PORTAL_INSTALL"
 
 # NVIDIA's nodes on this host are not udev-managed and nvidia-smi chmods them
 # back to 0666 root:root on every invocation.  Install the narrow LD_PRELOAD
@@ -790,7 +1069,7 @@ else
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    note "would validate $CONFIG_FILE and create its workspace_root"
+    note "would validate $CONFIG_FILE, create its workspace_root, and install workspace unit drop-ins if it differs"
 else
     CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
         'from citespec_resource.config import load_config; load_config(__import__("os").environ["CITESPEC_RESOURCE_CONFIG"])' \
@@ -824,7 +1103,11 @@ print("true" if same else "false")
 PY
 ) || fail "could not validate workspace_root against the systemd unit path"
     if [ "$WORKSPACE_MATCH" != "true" ]; then
-        fail "server.workspace_root '$WORKSPACE_ROOT' does not match the static systemd workspace '$SYSTEMD_WORKSPACE_ROOT'; update deploy/systemd units for the new path before installing"
+        note "workspace root '$WORKSPACE_ROOT' differs from the static systemd path; installing unit drop-ins"
+        install_workspace_dropins "$WORKSPACE_ROOT"
+        ok "workspace systemd drop-ins installed for broker, logrotate, disk-check, and provision"
+    else
+        remove_workspace_dropins
     fi
     run install -d -o root -g root -m 0755 "$WORKSPACE_ROOT"
     ok "workspace root ready: $WORKSPACE_ROOT"
@@ -1063,14 +1346,24 @@ run systemctl enable citespec-resource-intake.service
 run systemctl enable citespec-resource-provision.path
 run systemctl enable citespec-gpu-permissions.service
 if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
-    run systemctl enable citespec-resource-portal.service
-    note "portal unit enabled but not started; start it only after DNS/VPN/TLS acceptance"
+    # Never enable the unit here: enablement alone makes it start on the next
+    # boot, before DNS/TLS/nginx/VPN acceptance.  The unit also has a
+    # ConditionPathExists gate; deploy/enable_portal.sh writes the marker only
+    # after a fail-closed audit.
+    note "portal unit installed but NOT enabled; run $ENABLE_PORTAL_INSTALL --yes --approved-cidr <CIDR> after DNS/VPN/TLS acceptance"
 else
     note "portal unit installed but left disabled because [portal].enabled=false"
 fi
 ok "broker, intake, provisioning, GPU-permission, and portal units installed"
 run "$GPU_FIX_INSTALL"
 ok "current GPU device permissions applied"
+if [ "$DRY_RUN" -eq 0 ]; then
+    # Safe probe point: the wrapper/shim exist and the broker-only policy has
+    # been applied.  The probe fails if nvidia-smi changes device mode/owner.
+    bash "$SCRIPT_DIR/preflight.sh" --probe-nvidia --nvidia-only \
+        || fail "post-install NVIDIA probe failed; do not start the broker"
+    ok "post-install NVIDIA probe passed"
+fi
 
 run install -d -m 0755 /usr/local/bin
 backup_file "$LOGIN_WRAPPER"
@@ -1186,12 +1479,15 @@ if [ "$START" -eq 1 ]; then
         ok "broker and intake started (${MODE:-unknown} mode)"
     fi
     if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
-        note "portal is enabled but was not started; start it after DNS/VPN/TLS acceptance"
+        note "portal remains disabled until the network acceptance gate is passed"
     fi
 else
     note "broker installed but not started; use: systemctl start citespec-resource-broker"
+    if [ "$SERVICES_STOPPED" -eq 1 ]; then
+        note "previously active Citespec units remain stopped; start them explicitly after verification"
+    fi
     if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
-        note "portal enabled; use: systemctl start citespec-resource-portal"
+        note "portal is not enabled; run $ENABLE_PORTAL_INSTALL after network acceptance"
     else
         note "portal disabled; use: systemctl start citespec-resource-portal after enabling [portal]"
     fi

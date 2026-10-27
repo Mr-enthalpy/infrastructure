@@ -2,6 +2,10 @@
 Description=Citespec VPN-only membership portal (loopback HTTP behind nginx)
 After=network.target citespec-resource-broker.service
 OnFailure=citespec-resource-alert@%n.service
+# Fail closed at boot: deploy/enable_portal.sh creates this marker only after a
+# passing network/TLS/source audit.  Enabling the unit without the marker does
+# nothing.  Remove the marker and run `systemctl disable --now` to revoke.
+ConditionPathExists=/etc/citespec-resource/portal-network-accepted
 
 [Service]
 Type=simple

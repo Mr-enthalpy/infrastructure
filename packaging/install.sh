@@ -2,16 +2,16 @@
 # Install the Citespec Resource client from an extracted full zip.
 #
 # Before running, verify the zip and this script with verify_release.sh (or the
-# published SHA-256). Use --verify <sha256> with the installer_sha256 value
-# from the signed manifest's first_install entry to authenticate this script.
+# published SHA-256). --verify <sha256> is required: use the installer_sha256
+# value from the signed manifest's first_install entry.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--verify SHA256]
+usage: install.sh --verify SHA256
 
-  --verify SHA256   Refuse to install unless this script's SHA-256 matches the
-                    value signed in the release manifest
+  --verify SHA256   Required. Refuse to install unless this script's SHA-256
+                    matches the value signed in the release manifest
                     (first_install.<platform>.installer_sha256).
   -h, --help        Show this help.
 
@@ -55,29 +55,32 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ -n "$verify_expected" ]; then
-  expected=$(printf '%s' "$verify_expected" | tr 'A-F' 'a-f')
-  case "$expected" in
-    *[!0-9a-f]* | "")
-      printf 'error: --verify must be a 64-character SHA-256\n' >&2
-      exit 2
-      ;;
-  esac
-  if [ "${#expected}" -ne 64 ]; then
+if [ -z "$verify_expected" ]; then
+  printf 'error: --verify SHA256 is required; obtain it from the signed release manifest\n' >&2
+  exit 2
+fi
+
+expected=$(printf '%s' "$verify_expected" | tr 'A-F' 'a-f')
+case "$expected" in
+  *[!0-9a-f]* | "")
     printf 'error: --verify must be a 64-character SHA-256\n' >&2
     exit 2
-  fi
-  actual=$(sha256_file "${BASH_SOURCE[0]}") || {
-    printf 'error: sha256sum or shasum is required for --verify\n' >&2
-    exit 1
-  }
-  if [ "$actual" != "$expected" ]; then
-    printf 'error: install.sh SHA-256 mismatch\n  expected: %s\n  actual:   %s\n' \
-      "$expected" "$actual" >&2
-    exit 1
-  fi
-  printf 'Verified install.sh SHA-256: %s\n' "$actual"
+    ;;
+esac
+if [ "${#expected}" -ne 64 ]; then
+  printf 'error: --verify must be a 64-character SHA-256\n' >&2
+  exit 2
 fi
+actual=$(sha256_file "${BASH_SOURCE[0]}") || {
+  printf 'error: sha256sum or shasum is required for --verify\n' >&2
+  exit 1
+}
+if [ "$actual" != "$expected" ]; then
+  printf 'error: install.sh SHA-256 mismatch\n  expected: %s\n  actual:   %s\n' \
+    "$expected" "$actual" >&2
+  exit 1
+fi
+printf 'Verified install.sh SHA-256: %s\n' "$actual"
 
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install_dir="${CITESPEC_CLIENT_HOME:-$HOME/.local/opt/citespec-resource}"
