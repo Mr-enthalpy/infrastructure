@@ -2,7 +2,7 @@
 
 - 分支：`fix/p1-pre-deploy`，基于 `main@e987c7e`
 - 范围：仅修复审计确认的 P1 项；未连接、未修改生产主机
-- 本地验证：**543 passed / 26 skipped**；Ruff check/format、mypy、`bash -n deploy/*.sh` 通过
+- 本地验证：**544 passed / 26 skipped**；Ruff check/format、mypy、`bash -n deploy/*.sh` 通过
 - 真实主机验证：**未执行**（按本轮要求，P1 阶段不触碰目标机）
 - Git 历史：未改写；未替换或重新发布 `v0.1.0`
 
@@ -194,7 +194,7 @@ wildcard/缺 allow/公共上游/伪造头的拒绝行为。
 
 | 检查 | 结果 |
 |---|---|
-| `python -m pytest -q` | 543 passed, 26 skipped（Windows 本地） |
+| `python -m pytest -q` | 544 passed, 26 skipped（Windows 本地） |
 | `python -m ruff check .` | 通过 |
 | `python -m ruff format --check .` | 通过 |
 | `python -m mypy src` | 通过（45 个源文件） |

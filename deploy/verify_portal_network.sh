@@ -118,6 +118,8 @@ check_vhost() {
             [ -n "$line" ] || continue
             if printf '%s' "$line" | grep -Eq 'listen[[:space:]]+(0\.0\.0\.0|\[::\]|\*):'; then
                 fail "$name vhost binds a wildcard address: $line"
+            elif printf '%s' "$line" | grep -Eq 'listen[[:space:]]+[0-9]+([[:space:]]|;)'; then
+                fail "$name vhost omits a bind address (wildcard): $line"
             elif printf '%s' "$line" | grep -Eq '<[^>]+>'; then
                 fail "$name vhost still contains an unreplaced listen placeholder: $line"
             else

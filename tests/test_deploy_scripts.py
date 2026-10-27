@@ -156,11 +156,11 @@ EOF
 """
 
 
-def _portal_network_env(tmp_path, wildcard):
+def _portal_network_env(tmp_path, wildcard, vhost=None):
     root = tmp_path / "nginx"
     root.mkdir()
     (root / "portal.conf").write_text(
-        PORTAL_VHOST_WILDCARD if wildcard else PORTAL_VHOST_GOOD,
+        vhost or (PORTAL_VHOST_WILDCARD if wildcard else PORTAL_VHOST_GOOD),
         encoding="utf-8",
     )
     stub = tmp_path / "bin"
@@ -219,6 +219,25 @@ def test_verify_portal_network_rejects_wildcard_and_missing_allow(tmp_path):
     assert "must restrict sources" in output
     assert "exposed beyond loopback" in output
     assert "client-supplied X-Citespec-Client-IP" in output
+
+
+def test_verify_portal_network_rejects_addressless_listen(tmp_path):
+    vhost = PORTAL_VHOST_GOOD.replace("listen 10.20.30.40:443 ssl;", "listen 443 ssl;")
+    env = _portal_network_env(tmp_path, wildcard=False, vhost=vhost)
+    result = subprocess.run(
+        [
+            BASH,
+            str(ROOT / "deploy" / "verify_portal_network.sh"),
+            "--nginx-root",
+            str(tmp_path / "nginx"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "omits a bind address" in result.stdout
 
 
 def test_installer_has_transactional_backup_and_rollback():
