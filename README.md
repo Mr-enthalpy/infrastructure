@@ -20,12 +20,12 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
 | 自动化验证 | 完成 | 本地 `475 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
-| CI | 完成 | GitHub Actions 运行 `40461434609`（当前分支，含 Portal 与 P0-2）通过 |
+| CI | 完成 | GitHub Actions `40465970858`（测试矩阵）和 `40465970936`（Windows/Linux 打包）通过 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
 | 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
 | VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；等待内网 DNS/VPN/证书答复 |
-| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现，CI `40461434609` 通过；实机部署与恢复演练待维护窗口 |
+| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现，CI `40465970858` 通过；实机部署与恢复演练待维护窗口 |
 | 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
 | amax | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
 

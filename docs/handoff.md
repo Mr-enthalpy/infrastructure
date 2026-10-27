@@ -11,6 +11,28 @@
 > docs/reports/member-onboarding-and-ux.md（含差距表、实际测试结果与
 > **D1=完成 / D2=核心实机验收完成 / D3=未开放** 结论）。
 
+## 0.3 2026-10-27 打包客户端、自动更新与 CI
+
+- 新增 `packaging/`：Windows/Linux x64 的 PyInstaller payload、稳定启动器、full zip、
+  per-user 安装脚本、版本检查和签名清单生成；发布流程在 `v*` tag 上构建并附加
+  GitHub Release 资产。
+- 客户端使用 Ed25519 签名清单、SHA-256、zip-slip/符号链接/解压大小限制和原子
+  `versions/<version>` 安装；保留上一版本并在失败时回退。更新锁在崩溃 6 小时后
+  自动恢复；不完整版本目录只在新 payload 校验通过后替换。
+- 启动器按已安装 payload 版本比较，而不是按稳定启动器自身版本；`start` 自动中继，
+  `version --json` 与 broker `status`/`list` 带协议 handshake；GUI 对协议不兼容显示
+  警告但不阻断文本 CLI。
+- 2026-10-27 本地结果：完整测试 `475 passed, 21 skipped`；Portal loopback
+  `tests/test_portal.py tests/test_backup.py` 为 `25 passed`；Ruff、mypy、JS、Bash
+  和 PowerShell 语法检查通过。Windows x64 包完成 `version --json`、签名更新
+  `0.1.0 -> 0.1.1`、重复检查不重装、篡改清单/离线回退 smoke test。
+- CI：`40465970858`（Windows/Linux、Python 3.11/3.12/3.13）通过；
+  `40465970936`（Windows/Linux 打包、Linux `install.sh` 与启动器 smoke test）通过。
+  GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY` 已配置。
+- 尚未创建 `v0.1.0` tag/Release；生产 Portal 仍未启用。下一步是在获得发布确认后
+  创建首个签名 Release；网络维护窗口完成后再做 DNS/VPN/TLS/防火墙现场验收并
+  启用 Portal。不得在文档或仓库提交私钥、真实 IP/端口/管理员信息。
+
 ## 0. 2026-10-26 <server-instance> 实机部署与 active 验收
 
 > 本节记录实机结果；本轮代码改动见 cutover 提交，文档校准见本次提交；§1–§9
@@ -486,11 +508,12 @@ xfs_quota -x -c 'report -p -b -h' /data1
 | 优先级 | 项目 | 当前状态 | 退出条件 |
 |---|---|---|---|
 | P0 | 文档状态基线 | 本次更新 | README/handoff/report/deploy README 使用同一状态口径 |
-| P0 | 备份、恢复与告警 | 代码实现完成，CI `40315992883` 通过；待实机部署/恢复演练 | 定期备份、恢复演练、失败告警均通过 |
+| P0 | 备份、恢复与告警 | 代码实现完成，CI `40465970858` 通过；待实机部署/恢复演练 | 定期备份、恢复演练、失败告警均通过 |
 | P0 | SSH/管理员/审计基线 | 27 条 warning 待分类 | 无 critical/high；warning 有分类和负责人 |
 | P0 | 容器 root/宿主 GPU 5.6 | 未验证 | 容器 root 不能修改宿主 `/dev/nvidia*` 并影响他人 |
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |
-| P1 | CI 覆盖 | Ubuntu 单元测试已通过 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
+| P1 | CI 覆盖 | 测试矩阵和 Windows/Linux 打包 smoke 通过；Playwright 浏览器 job 仍待接入 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
+| P1 | 客户端打包/自动更新 | 代码、Windows smoke、Linux CI 打包完成；首个 Release 未发布 | 发布 `v0.1.0` 签名 Release 并由成员完成安装/更新验收 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
 | P2 | VS Code / 文件传输 | 关闭 | 5.6、容器 sshd、隧道、配额和 TOCTOU 验收通过 |
