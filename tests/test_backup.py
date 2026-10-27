@@ -155,6 +155,161 @@ def test_backup_contains_state_intake_config_spool_and_verified_manifest(tmp_pat
         assert connection.execute("SELECT value FROM items").fetchone() == ("broker",)
 
 
+def test_backup_quiesces_writers_and_restarts_in_order(tmp_path, monkeypatch):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    active = {
+        "citespec-resource-broker.service",
+        "citespec-resource-intake.service",
+        "citespec-resource-provision.path",
+    }
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(backup, "_should_quiesce", lambda quiesce: quiesce)
+    monkeypatch.setattr(backup, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(backup, "_unit_is_active", lambda unit: unit in active)
+
+    def stop_unit(unit: str) -> bool:
+        active.discard(unit)
+        events.append(("stop", unit))
+        return True
+
+    def start_unit(unit: str) -> None:
+        active.add(unit)
+        events.append(("start", unit))
+
+    monkeypatch.setattr(backup, "_stop_unit", stop_unit)
+    monkeypatch.setattr(backup, "_start_unit", start_unit)
+    original_write = backup._write_backup
+
+    def write_backup(**kwargs: object) -> Path:
+        assert active == set()
+        return original_write(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backup, "_write_backup", write_backup)
+
+    backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+
+    assert [event for event in events if event[0] == "stop"] == [
+        ("stop", "citespec-resource-broker.service"),
+        ("stop", "citespec-resource-intake.service"),
+        ("stop", "citespec-resource-provision.path"),
+    ]
+    assert [event for event in events if event[0] == "start"] == [
+        ("start", "citespec-resource-provision.path"),
+        ("start", "citespec-resource-intake.service"),
+        ("start", "citespec-resource-broker.service"),
+    ]
+    assert active == {
+        "citespec-resource-broker.service",
+        "citespec-resource-intake.service",
+        "citespec-resource-provision.path",
+    }
+
+
+def test_backup_restarts_writers_when_the_copy_fails(tmp_path, monkeypatch):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+    active = {"citespec-resource-broker.service"}
+    monkeypatch.setattr(backup, "_should_quiesce", lambda quiesce: quiesce)
+    monkeypatch.setattr(backup, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(backup, "_unit_is_active", lambda unit: unit in active)
+    monkeypatch.setattr(
+        backup,
+        "_stop_unit",
+        lambda unit: active.discard(unit) or True,
+    )
+    monkeypatch.setattr(backup, "_start_unit", lambda unit: active.add(unit))
+    monkeypatch.setattr(
+        backup,
+        "_write_backup",
+        lambda **kwargs: (_ for _ in ()).throw(backup.BackupError("copy failed")),
+    )
+
+    with pytest.raises(backup.BackupError, match="copy failed"):
+        backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+
+    assert active == {"citespec-resource-broker.service"}
+
+
+def test_backup_no_quiesce_does_not_touch_units(tmp_path, monkeypatch):
+    config_path, _, _, _, backup_root = _fixture(tmp_path)
+
+    def unexpected(unit: str) -> bool:
+        raise AssertionError(f"unit state was queried: {unit}")
+
+    monkeypatch.setattr(backup, "_unit_is_active", unexpected)
+
+    backup.create_backup(
+        config_path,
+        backup_root,
+        stamp="20260101-000000",
+        quiesce=False,
+    )
+
+
+def test_backup_lock_rejects_a_second_run(tmp_path):
+    root = tmp_path / "backups"
+    root.mkdir()
+    if os.name != "posix":
+        pytest.skip("flock is the production lock")
+    with backup._backup_lock(root):
+        with pytest.raises(backup.BackupError, match="already running"):
+            with backup._backup_lock(root):
+                pass
+
+
+def test_restore_reconciles_nonterminal_operations(tmp_path):
+    from citespec_resource.membership import store as member_store
+
+    config_path, state_db, _, _, backup_root = _fixture(tmp_path)
+    connection = sqlite3.connect(state_db)
+    connection.row_factory = sqlite3.Row
+    try:
+        member_id = member_store.create_member(
+            connection,
+            linux_uid=42424,
+            linux_username="legacy",
+            status="provisioning",
+            display_name="Legacy",
+        )
+        operation_id, _ = member_store.create_operation(
+            connection,
+            action="provision_member",
+            frozen_input={"username": "legacy"},
+            member_id=member_id,
+        )
+        member_store.update_operation(connection, operation_id, status="running")
+        connection.commit()
+    finally:
+        connection.close()
+    result = backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+    restore_config, target, _, _ = _make_restore_target(tmp_path, with_intake_and_spool=False)
+
+    restored = backup.restore_backup(
+        result,
+        restore_config,
+        confirmed=True,
+        skip_service_check=True,
+    )
+
+    assert restored["reconciled_operations"] == [
+        {
+            "operation_id": operation_id,
+            "action": "provision_member",
+            "previous_status": "running",
+            "status": "failed",
+        }
+    ]
+    connection = sqlite3.connect(target)
+    connection.row_factory = sqlite3.Row
+    try:
+        operation = member_store.get_operation(connection, operation_id)
+        assert operation["status"] == "failed"
+        assert operation["stage"] == "restore"
+        member = member_store.get_member(connection, member_id)
+        assert member["member"]["status"] == "provision_failed"
+    finally:
+        connection.close()
+
+
 def test_restore_replaces_databases_and_spool_and_forces_maintenance(tmp_path):
     _, _, _, _, backup_root = _fixture(tmp_path)
     result = backup.create_backup(
