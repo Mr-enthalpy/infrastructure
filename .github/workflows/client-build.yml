@@ -1,0 +1,59 @@
+name: client-build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/client-build.yml"
+      - "packaging/**"
+      - "src/citespec_resource/**"
+      - "pyproject.toml"
+      - "uv.lock"
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-latest
+            platform: linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui,portal]" pyinstaller
+      - name: Build client
+        run: python packaging/build_client.py --platform ${{ matrix.platform }} --output dist
+      - name: Smoke test launcher (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem "dist/citespec-resource-*-${{ matrix.platform }}-full.zip" | Select-Object -First 1
+          if (-not $zip) { throw "full zip not found" }
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath smoke
+          & .\smoke\citespec-resource.exe version --json
+      - name: Smoke test install and launcher (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          unzip -q dist/citespec-resource-*-${{ matrix.platform }}-full.zip -d smoke
+          CITESPEC_CLIENT_HOME="$RUNNER_TEMP/citespec-client" \
+            CITESPEC_CLIENT_BIN="$RUNNER_TEMP/citespec-bin" \
+            bash smoke/install.sh
+          "$RUNNER_TEMP/citespec-bin/citespec-resource" version --json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-build-${{ matrix.platform }}
+          path: |
+            dist/citespec-resource-*-${{ matrix.platform }}.zip
+            dist/citespec-resource-*-${{ matrix.platform }}-full.zip
+          if-no-files-found: error
