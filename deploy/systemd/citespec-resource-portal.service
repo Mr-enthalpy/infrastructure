@@ -1,0 +1,48 @@
+[Unit]
+Description=Citespec VPN-only membership portal (loopback HTTP behind nginx)
+After=network.target citespec-resource-broker.service
+OnFailure=citespec-resource-alert@%n.service
+
+[Service]
+Type=simple
+User=citespec-portal
+Group=citespec-portal
+# The portal may connect to the broker's group-owned Unix socket, but it must
+# never be a member of citespec-admins. Admin authority is asserted per request
+# and re-checked by the broker.
+SupplementaryGroups=citespec-cli
+ExecStart=/opt/citespec-resource/.venv/bin/python -m citespec_resource.portal.server
+Environment=CITESPEC_RESOURCE_CONFIG=/etc/citespec-resource/config.toml
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+StateDirectory=citespec-resource-portal
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/citespec-resource-portal
+# Broker socket directory; the directory itself is not writable by the portal.
+ReadWritePaths=-/run/citespec-resource
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

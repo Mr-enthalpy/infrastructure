@@ -1,9 +1,10 @@
 # State backup, restore, and failure alerts
 
 This runbook covers the P0 operational layer: the broker SQLite state, the
-root-owned configuration/key tree, the intake database, the provisioning
-spool, and failure notification. It does not back up member workspaces or
-Docker image layers; those follow their own quota/retention policy.
+root-owned configuration/key tree, the intake database, the portal
+account/audit database, the provisioning spool, and failure notification. It
+does not back up member workspaces or Docker image layers; those follow their
+own quota/retention policy.
 
 ## What is backed up
 
@@ -14,16 +15,21 @@ Docker image layers; those follow their own quota/retention policy.
   backup API;
 - `intake.db`: the intake database when `onboarding.intake_db` is configured.
   A configured but missing database fails the backup;
+- `portal.db`: the portal account/session/activation/audit database when
+  `portal.db_path` is configured and the file exists. The installer initializes
+  it even while the portal is disabled, so a normal installation includes it;
 - `etc/<config-dir>/`: the complete root-owned configuration directory,
-  including `/etc/citespec-resource/authorized-keys.d/`;
+  including `/etc/citespec-resource/authorized-keys.d/` and
+  `/etc/citespec-resource/portal-secret.key`;
 - `provision/`: the complete provisioning spool, including `requests/`,
   `processing/`, `results/`, and the executor lock file;
 - `manifest.json`: schema version, source paths, file sizes, and SHA-256
   checksums.
 
-Backup schema 2 is the supported recovery format. It includes the intake and
-provisioning state so a restored broker cannot silently diverge from member
-keys or a completed operation. The backup is written to a temporary directory,
+Backup schema 2 is the supported recovery format. It includes the intake,
+portal, and provisioning state so a restored broker cannot silently diverge
+from member keys, portal accounts, or a completed operation. The backup is
+written to a temporary directory,
 verified, then atomically renamed. The service keeps the newest 14 `state-*`
 backups; older entries are removed only when they match the generated name and
 contain a manifest. Pre-cutover/acceptance directories are not touched.
@@ -32,10 +38,10 @@ contain a manifest. Pre-cutover/acceptance directories are not touched.
 
 A restore is a root-only maintenance operation. The command:
 
-1. verifies every manifest checksum and both SQLite databases;
+1. verifies every manifest checksum and every included SQLite database;
 2. stops and re-checks `citespec-resource-provision.path`,
    `citespec-resource-provision.service`, `citespec-resource-intake.service`,
-   and `citespec-resource-broker.service`;
+   `citespec-resource-broker.service`, and `citespec-resource-portal.service`;
 3. forces the current state database to `maintenance` before creating the
    safety backup;
 4. stages and verifies the databases, config tree, and spool before replacing
@@ -67,8 +73,9 @@ disabled during installation with `install_server.sh --no-timers`.
 ```
 
 Verification checks every manifest checksum, requires the configured intake
-database and provisioning spool directories, and runs SQLite
-`PRAGMA integrity_check` on both databases.
+database and provisioning spool directories, requires `portal.db` when the
+manifest records one, and runs SQLite `PRAGMA integrity_check` on every included
+database.
 
 ## Restore
 
@@ -82,20 +89,21 @@ sudo /opt/citespec-resource/.venv/bin/python -m citespec_resource.backup restore
   --yes
 ```
 
-The default restore replaces `state.db`, the configured `intake.db`, and the
-provisioning spool. It also creates a `pre-restore-*` safety backup in the
-backup root and removes stale `-wal`/`-shm` sidecars. The intake database is
-restored with the ownership of the existing database (or its state directory),
-so the low-privilege intake service can still open it.
+The default restore replaces `state.db`, the configured `intake.db` and
+`portal.db` (when present in the backup), and the provisioning spool. It also
+creates a `pre-restore-*` safety backup in the backup root and removes stale
+`-wal`/`-shm` sidecars. The intake and portal databases are restored with the
+ownership of the existing database (or its state directory), so the
+low-privilege services can still open them.
 
 Add `--full` only when the configuration/key tree must also be restored. The
 full mode replaces the whole `etc/<config-dir>/` tree exactly: files added
 after the backup are removed. The restored `config.toml` must still point at
-the same state, intake, and spool paths, otherwise the restore aborts before
-swapping live paths.
+the same state, intake, portal, and spool paths, otherwise the restore aborts
+before swapping live paths.
 
 `--skip-service-check` is only for a manually isolated host or recovery media
-where systemd is unavailable. Stop all four writer units and confirm they are
+where systemd is unavailable. Stop all five writer units and confirm they are
 inactive before using it.
 
 On failure, completed path swaps are rolled back and the original paths remain
@@ -109,12 +117,15 @@ read-only checks:
 sudo systemctl start citespec-resource-provision.path
 sudo systemctl start citespec-resource-intake.service
 sudo systemctl start citespec-resource-broker.service
+# Only when [portal].enabled = true and DNS/VPN/TLS acceptance is complete:
+sudo systemctl start citespec-resource-portal.service
 /usr/local/libexec/citespec-resource/verify_gpu_permissions.sh --json
 citespec-resource status --json
 ```
 
 The restored broker starts in `maintenance`. Confirm member keys, queued jobs,
-allocations, and intake records, then switch mode explicitly:
+allocations, intake records, and portal accounts/audit entries, then switch mode
+explicitly:
 
 ```bash
 citespec-resource admin mode active
@@ -123,8 +134,8 @@ citespec-resource admin mode active
 ## Alerts
 
 The installer installs `citespec-resource-alert@.service` and wires
-`OnFailure=` for the broker, intake, disk check, log rotation, and backup
-units. The alert script always writes `/var/log/citespec-resource/alerts.log`
+`OnFailure=` for the broker, intake, portal, disk check, log rotation, and
+backup units. The alert script always writes `/var/log/citespec-resource/alerts.log`
 and the journal. Optional webhook delivery is configured in a root-owned file:
 
 ```bash

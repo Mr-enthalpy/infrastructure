@@ -23,6 +23,7 @@ class Identity:
     username: str
     role: str
     is_admin: bool
+    is_portal: bool = False
 
 
 class IdentityResolverProtocol(Protocol):
@@ -32,8 +33,9 @@ class IdentityResolverProtocol(Protocol):
 class IdentityResolver:
     """Resolve a peer UID to a Linux account and the admin role."""
 
-    def __init__(self, admin_group: str) -> None:
+    def __init__(self, admin_group: str, portal_group: str = "citespec-portal") -> None:
         self.admin_group = admin_group
+        self.portal_group = portal_group
 
     def resolve(self, uid: int, gid: int) -> Identity:
         if pwd is None or grp is None:
@@ -42,6 +44,7 @@ class IdentityResolver:
         group_ids = set(os.getgrouplist(account.pw_name, account.pw_gid))
         group_ids.add(gid)
         is_admin = False
+        is_portal = False
         for group_id in group_ids:
             try:
                 group = grp.getgrgid(group_id)
@@ -49,13 +52,22 @@ class IdentityResolver:
                 continue
             if group.gr_name == self.admin_group:
                 is_admin = True
-                break
+            if group.gr_name == self.portal_group:
+                is_portal = True
+        if is_admin:
+            role = "admin"
+        else:
+            # The broker users table only permits member/admin.  The portal
+            # service account is a machine identity; is_portal is the actual
+            # capability flag and is checked before every portal command.
+            role = "member"
         return Identity(
             uid=uid,
             gid=gid,
             username=account.pw_name,
-            role="admin" if is_admin else "member",
+            role=role,
             is_admin=is_admin,
+            is_portal=is_portal,
         )
 
 

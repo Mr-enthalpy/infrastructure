@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}激活码 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>一次性激活码</h1>
+<div class="card">
+  <p>用户名：<code>{{ username }}</code></p>
+  <p>激活码（只显示一次）：</p>
+  <code class="secret">{{ activation_code }}</code>
+  <p>有效期至：{{ expires_at }}</p>
+  {% if member_id %}<p>成员编号：<code>{{ member_id }}</code></p>{% endif %}
+  <p class="warning">请通过实验室内部渠道单独发给本人，不要发到公开群聊或提交到代码仓库。</p>
+  <p class="muted">本人打开 Portal 的“激活账号”页面，输入用户名和激活码后设置密码与 TOTP。</p>
+  {% if request_id %}
+    <a class="button secondary" href="/admin/registrations/{{ request_id }}">返回审批详情</a>
+  {% elif member_id %}
+    <a class="button secondary" href="/admin/members/{{ member_id }}">返回成员详情</a>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}设置密码和 TOTP · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>设置密码和 TOTP</h1>
+<div class="card">
+  <p>用户名：<code>{{ username }}</code></p>
+  <p>在身份验证器（如 Aegis、1Password、Google Authenticator）中手动添加以下密钥，或导入 otpauth URI：</p>
+  <code class="secret">{{ totp_secret }}</code>
+  <p class="small muted">otpauth URI（复制到身份验证器）：</p>
+  <code class="secret">{{ otpauth_uri }}</code>
+  <form method="post" action="/activate/complete">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="activation_token" value="{{ activation_token }}">
+    <label for="password">新密码（至少 12 个字符）</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" required>
+    <label for="password_confirm">再次输入新密码</label>
+    <input id="password_confirm" name="password_confirm" type="password" autocomplete="new-password" required>
+    <label for="totp">身份验证器当前的 6 位验证码</label>
+    <input id="totp" name="totp" type="text" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <button type="submit">完成激活</button>
+  </form>
+  <p class="small muted">若页面过期，请重新输入激活码开始。</p>
+</div>
+{% endblock %}

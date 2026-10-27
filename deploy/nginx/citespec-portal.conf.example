@@ -1,0 +1,37 @@
+# Example only: host nginx terminates TLS for the C1 VPN-only portal.
+# DNS, certificates, VPN routing, and firewall source ranges are owned by
+# server management; do not install this file until those answers are recorded.
+#
+# The upstream binds loopback only. nginx must overwrite X-Citespec-Client-IP
+# with the real peer address so application rate limits and audit logs cannot be
+# spoofed by a client-supplied header.
+#
+# Bind the campus/VPN-facing private address, never the public interface.  The
+# placeholder must be replaced during deployment.
+server {
+    listen <host-private-ip>:443 ssl;
+    server_name citespec-portal.<lab-domain>;
+
+    ssl_certificate     /etc/ssl/citespec/citespec-portal.fullchain.pem;
+    ssl_certificate_key /etc/ssl/citespec/citespec-portal.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    server_tokens off;
+    client_max_body_size 64k;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8770;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Citespec-Client-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+    }
+}

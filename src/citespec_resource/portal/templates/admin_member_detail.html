@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}成员详情 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>成员详情</h1>
+<p><a href="/admin/members">← 返回成员列表</a></p>
+<div class="grid">
+  <section class="card">
+    <h2>成员信息</h2>
+    <dl>
+      <dt>成员编号</dt><dd><code>{{ detail.member.member_id }}</code></dd>
+      <dt>Linux 用户</dt><dd><code>{{ detail.member.linux_username or '—' }}</code></dd>
+      <dt>Linux UID</dt><dd>{{ detail.member.linux_uid if detail.member.linux_uid is not none else '开通中' }}</dd>
+      <dt>姓名</dt><dd>{{ detail.member.display_name }}</dd>
+      <dt>状态</dt><dd>{{ detail.member.status }}</dd>
+      <dt>有效期</dt><dd>{{ detail.member.valid_until or '—' }}</dd>
+      <dt>访问版本</dt><dd>{{ detail.member.access_version }}</dd>
+    </dl>
+    <h3>登录密钥</h3>
+    <ul>
+      {% for key in detail['keys'] %}
+        <li><code>{{ key.fingerprint }}</code> <span class="muted">{{ key.status }}</span></li>
+      {% else %}
+        <li class="muted">没有密钥。</li>
+      {% endfor %}
+    </ul>
+  </section>
+  <section class="card">
+    <h2>Portal 账号</h2>
+    {% if portal_user %}
+      <dl>
+        <dt>用户名</dt><dd><code>{{ portal_user.username }}</code></dd>
+        <dt>身份</dt><dd>{{ portal_user.role }}</dd>
+        <dt>状态</dt><dd>{{ portal_user.status }}</dd>
+        <dt>最近登录</dt><dd>{{ portal_user.last_login_at or '—' }}</dd>
+      </dl>
+      {% if portal_user.status == 'pending_activation' %}
+        <div class="actions">
+          <h3>重新生成激活码</h3>
+          <form method="post" action="/admin/members/{{ detail.member.member_id }}/activation-code">
+            <input type="hidden" name="_csrf" value="{{ csrf }}">
+            <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+            <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+            <button type="submit">生成新激活码</button>
+          </form>
+        </div>
+      {% endif %}
+    {% else %}
+      <p class="muted">该成员还没有 Portal 账号。可回到对应审批详情创建。</p>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <h2>成员状态操作</h2>
+  <p class="muted">每次操作需要填写原因，并用当前密码和 TOTP 再次确认。Web 只能做简单状态管理，不提供资源操作。</p>
+  <form method="post" action="/admin/members/{{ detail.member.member_id }}/suspend">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>暂停原因</label><input type="text" name="reason" required>
+    <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+    <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <button type="submit">暂停成员</button>
+  </form>
+  <form method="post" action="/admin/members/{{ detail.member.member_id }}/resume">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>恢复原因</label><input type="text" name="reason" required>
+    <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+    <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <button type="submit">恢复成员</button>
+  </form>
+  <form method="post" action="/admin/members/{{ detail.member.member_id }}/revoke">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>撤销原因</label><input type="text" name="reason" required>
+    <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+    <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <button class="danger" type="submit">撤销成员</button>
+  </form>
+</section>
+{% endblock %}

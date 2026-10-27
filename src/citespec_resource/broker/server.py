@@ -22,6 +22,7 @@ from typing import Any, NoReturn
 from .. import store
 from ..config import LabConfig, validate_active_mode_policy
 from ..db import connect, init_db
+from ..enrollment import store as intake_store
 from ..errors import (
     BadRequest,
     CitespecError,
@@ -52,6 +53,7 @@ from ..membership.provisioning import (
     SpoolProvisioningClient,
 )
 from ..models import GPU, Allocation
+from ..portal import store as portal_store
 from ..stream import (
     FRAME_DATA,
     FRAME_EXIT,
@@ -126,7 +128,9 @@ class Broker:
         self.db_path = Path(db_path or config.server.state_db)
         self.socket_path = Path(socket_path or config.server.broker_socket)
         self.docker = docker or DockerDriver(config)
-        self.identity_resolver = identity_resolver or IdentityResolver(config.groups.admins)
+        self.identity_resolver = identity_resolver or IdentityResolver(
+            config.groups.admins, config.groups.portal
+        )
         self.legacy_audit = legacy_audit or LegacyAuditRunner(
             config.policy.legacy_audit_script,
             timeout=config.policy.legacy_audit_timeout,
@@ -404,11 +408,419 @@ class Broker:
             raise BadRequest("request_id must be a non-empty string")
         return request_id
 
+    def _parse_portal_actor(
+        self,
+        raw: Any,
+        *,
+        allow_applicant: bool = False,
+    ) -> dict[str, str]:
+        if not isinstance(raw, dict):
+            raise BadRequest("portal actor is required")
+        extra = set(raw) - {"user_id", "username", "role", "member_id"}
+        if extra:
+            raise BadRequest("unexpected portal actor field(s)")
+        user_id = raw.get("user_id", "")
+        username = raw.get("username", "")
+        role = raw.get("role", "")
+        member_id = raw.get("member_id", "")
+        if not isinstance(user_id, str) or not user_id:
+            raise BadRequest("portal actor user_id must be a non-empty string")
+        if not isinstance(username, str) or not username:
+            raise BadRequest("portal actor username must be a non-empty string")
+        if not isinstance(member_id, str):
+            raise BadRequest("portal actor member_id must be a string")
+        allowed_roles = {"member", "admin"}
+        if allow_applicant:
+            allowed_roles.add("applicant")
+        if role not in allowed_roles:
+            raise Forbidden("portal actor role is not authorized")
+        return {
+            "user_id": user_id,
+            "username": username,
+            "role": str(role),
+            "member_id": member_id,
+        }
+
+    def _record_portal_event(
+        self,
+        identity: Identity,
+        actor: dict[str, str],
+        action: str,
+        *,
+        target: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "portal_user_id": actor["user_id"],
+            "portal_username": actor["username"],
+            "portal_role": actor["role"],
+            "target": target,
+            **(detail or {}),
+        }
+        with self._connection() as connection:
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action=action,
+                detail=payload,
+                now=self._now(),
+            )
+            connection.commit()
+
+    async def _handle_portal_command(
+        self,
+        command: str,
+        identity: Identity,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Narrow portal bridge; never a general admin or resource API."""
+
+        if not identity.is_portal:
+            raise Forbidden("portal broker access required")
+        actor = self._parse_portal_actor(
+            args.get("actor"),
+            allow_applicant=command == "portal_registration_submit",
+        )
+        if command == "portal_registration_submit":
+            self._check_args(args, {"actor", "application"})
+            application = args.get("application")
+            if not isinstance(application, dict):
+                raise BadRequest("application must be an object")
+            intake_db = self.config.onboarding.intake_db
+            result = await asyncio.to_thread(
+                self._submit_portal_application,
+                intake_db,
+                application,
+            )
+            self._record_portal_event(
+                identity,
+                actor,
+                "portal_registration_submitted",
+                target=str(result.get("request_id", "")),
+                detail={"username": str(result.get("username", ""))},
+            )
+            return result
+        if actor["role"] not in {"member", "admin"}:
+            raise Forbidden("applicant actors may only submit a registration")
+        admin_only = {
+            "portal_requests_list",
+            "portal_requests_show",
+            "portal_requests_approve",
+            "portal_requests_reject",
+            "portal_members_list",
+            "portal_members_show",
+            "portal_members_suspend",
+            "portal_members_resume",
+            "portal_members_revoke",
+            "portal_audit",
+        }
+        if command in admin_only and actor["role"] != "admin":
+            raise Forbidden("portal administrator permission required")
+        if command == "portal_status":
+            self._check_args(args, {"actor"})
+            with self._connection() as connection:
+                mode = store.get_mode(connection, self._mode)
+                active = store.active_lease_count(connection)
+                queued = store.queue_request_count(connection, now=self._now())
+                gpus = store.list_gpus(connection, now=self._now())
+            return {
+                "mode": mode,
+                "active_allocations": active,
+                "queued_requests": queued,
+                "gpu_count": len(gpus),
+                "gpus": [
+                    {
+                        "index": int(gpu["index"]),
+                        "name": str(gpu["name"]),
+                        "memory_mib": int(gpu["memory_mib"]),
+                        "state": str(gpu["state"]),
+                    }
+                    for gpu in gpus
+                ],
+                "generated_at": self._now().isoformat(),
+            }
+        if command in {"portal_member_self", "portal_members_show"}:
+            self._check_args(args, {"actor", "member_id"})
+            member_id = args.get("member_id")
+            if not isinstance(member_id, str) or not member_id:
+                raise BadRequest("member_id must be a non-empty string")
+            if actor["role"] != "admin" and actor["member_id"] != member_id:
+                raise Forbidden("members may only view their own membership")
+            with self._connection() as connection:
+                return member_store.get_member(connection, member_id)
+        if command == "portal_members_list":
+            self._check_args(args, {"actor"})
+            with self._connection() as connection:
+                return {"members": member_store.list_members(connection)}
+        if command in {"portal_requests_list", "portal_requests_show"}:
+            mapped = {
+                "portal_requests_list": "admin_requests_list",
+                "portal_requests_show": "admin_requests_show",
+            }[command]
+            return await self._handle_membership_command(
+                mapped,
+                identity,
+                self._without_actor(args),
+                allow_portal=True,
+            )
+        mapped_mutations = {
+            "portal_requests_approve": "admin_requests_approve",
+            "portal_requests_reject": "admin_requests_reject",
+            "portal_members_suspend": "admin_members_suspend",
+            "portal_members_resume": "admin_members_resume",
+            "portal_members_revoke": "admin_members_revoke",
+        }
+        if command in mapped_mutations:
+            result = await self._handle_membership_command(
+                mapped_mutations[command],
+                identity,
+                self._without_actor(args),
+                allow_portal=True,
+            )
+            target = str(
+                args.get("request_id") or args.get("member_id") or result.get("member_id") or ""
+            )
+            detail: dict[str, Any] = {}
+            if isinstance(result, dict):
+                for key in ("request_id", "member_id", "operation_id", "status"):
+                    if key in result:
+                        detail[key] = result[key]
+            self._record_portal_event(
+                identity,
+                actor,
+                f"portal_{command.removeprefix('portal_')}",
+                target=target,
+                detail=detail,
+            )
+            return result
+        if command == "portal_audit":
+            self._check_args(args, {"actor", "limit"})
+            limit = self._parse_positive_int(args.get("limit", 100), "limit")
+            if limit > 500:
+                raise BadRequest("limit must not exceed 500")
+            with self._connection() as connection:
+                return {"events": store.list_events(connection, limit=limit)}
+        raise BadRequest(f"unknown portal command: {command}")
+
+    def _handle_portal_admin_command(
+        self,
+        command: str,
+        identity: Identity,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """CLI-only portal role administration.
+
+        Admin role changes intentionally never go through a browser route.  The
+        root broker owns the portal database for this operation, restores the
+        portal service's ownership of SQLite sidecars, and records the action in
+        both the broker and portal audit logs.
+        """
+
+        path = Path(self.config.portal.db_path)
+        try:
+            owner = path.stat()
+        except FileNotFoundError as exc:
+            raise NotFound("portal database is not initialized") from exc
+        connection = portal_store.connect(path)
+        action = ""
+        target = ""
+        detail: dict[str, Any] = {}
+        try:
+            if command == "admin_portal_accounts_list":
+                self._check_args(args)
+                return {"accounts": portal_store.list_users(connection)}
+            if command == "admin_portal_accounts_set_role":
+                self._check_args(args, {"username", "role"})
+                username = self._portal_admin_string(args, "username")
+                role = self._portal_admin_string(args, "role")
+                if role not in portal_store.PORTAL_ROLES:
+                    raise BadRequest("role must be member or admin")
+                current = portal_store.get_user_by_username(connection, username)
+                if current is None:
+                    raise NotFound(f"portal account not found: {username}")
+                if current["role"] != role:
+                    if role == "member" and current["role"] == "admin":
+                        active_other_admins = [
+                            user
+                            for user in portal_store.list_users(connection)
+                            if user["role"] == "admin"
+                            and user["status"] == "active"
+                            and user["user_id"] != current["user_id"]
+                        ]
+                        if not active_other_admins:
+                            raise Conflict("cannot demote the last active portal administrator")
+                    portal_store.update_user_role(
+                        connection,
+                        str(current["user_id"]),
+                        role=role,
+                        now=self._now(),
+                    )
+                    # A role change must not leave a browser session holding the
+                    # old capability.  Reauthentication is required.
+                    portal_store.delete_user_sessions(
+                        connection,
+                        str(current["user_id"]),
+                    )
+                action = "admin_portal_role_changed"
+                target = username
+                detail = {
+                    "from_role": current["role"],
+                    "to_role": role,
+                    "portal_user_id": current["user_id"],
+                }
+                result = {
+                    "user_id": current["user_id"],
+                    "username": current["username"],
+                    "role": role,
+                    "status": current["status"],
+                }
+            elif command == "admin_portal_accounts_create":
+                self._check_args(
+                    args,
+                    {
+                        "username",
+                        "role",
+                        "member_id",
+                        "linux_username",
+                        "display_name",
+                        "contact",
+                    },
+                )
+                username = self._portal_admin_string(args, "username")
+                if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+                    raise BadRequest("username must match [a-z_][a-z0-9_-]{0,31}")
+                role = self._portal_admin_string(args, "role", default="member")
+                if role not in portal_store.PORTAL_ROLES:
+                    raise BadRequest("role must be member or admin")
+                member_id = self._portal_admin_string(args, "member_id", default="")
+                linux_username = self._portal_admin_string(args, "linux_username", default="")
+                if linux_username and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", linux_username):
+                    raise BadRequest("linux_username must match [a-z_][a-z0-9_-]{0,31}")
+                display_name = self._portal_admin_string(args, "display_name", default="")
+                contact = self._portal_admin_string(args, "contact", default="")
+                try:
+                    result = portal_store.create_pending_account(
+                        connection,
+                        username=username,
+                        display_name=display_name[:200],
+                        contact=contact[:300],
+                        member_id=member_id,
+                        linux_username=linux_username,
+                        activation_ttl_hours=self.config.portal.activation_ttl_hours,
+                        role=role,
+                        created_by=f"cli:{identity.username}",
+                        now=self._now(),
+                    )
+                except ValueError as exc:
+                    raise Conflict(str(exc)) from exc
+                action = "admin_portal_account_created"
+                target = username
+                detail = {
+                    "role": role,
+                    "portal_user_id": result["user_id"],
+                    "member_id": member_id,
+                    "linux_username": linux_username,
+                }
+            else:  # pragma: no cover - dispatch is exact
+                raise BadRequest(f"unknown portal admin command: {command}")
+            if action:
+                portal_store.record_audit(
+                    connection,
+                    action=action,
+                    actor_username=identity.username,
+                    target=target,
+                    detail=detail,
+                    now=self._now(),
+                )
+        finally:
+            connection.close()
+            self._restore_portal_db_ownership(path, owner.st_uid, owner.st_gid)
+        if action:
+            with self._connection() as main_connection:
+                store.record_event(
+                    main_connection,
+                    actor_uid=identity.uid,
+                    action=action,
+                    detail={"target": target, **detail},
+                    now=self._now(),
+                )
+                main_connection.commit()
+        return result
+
+    @staticmethod
+    def _portal_admin_string(
+        args: dict[str, Any],
+        key: str,
+        *,
+        default: str | None = None,
+    ) -> str:
+        value = args.get(key, default)
+        if not isinstance(value, str):
+            raise BadRequest(f"{key} must be a string")
+        return value
+
+    @staticmethod
+    def _restore_portal_db_ownership(path: Path, uid: int, gid: int) -> None:
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return
+        chown = getattr(os, "chown", None)
+        if chown is None:
+            return
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+            try:
+                if candidate.exists():
+                    chown(candidate, uid, gid)
+                    if candidate != path:
+                        candidate.chmod(0o600)
+            except OSError:
+                logger.warning("could not restore ownership of %s", candidate, exc_info=True)
+
+    @staticmethod
+    def _without_actor(args: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in args.items() if key != "actor"}
+
+    @staticmethod
+    def _submit_portal_application(
+        intake_db: str,
+        application: dict[str, Any],
+    ) -> dict[str, Any]:
+        path = Path(intake_db)
+        # The broker runs as root while the intake service owns its database.
+        # Preserve the directory owner on the database and any WAL/SHM files so
+        # the low-privilege intake service can keep writing after this request.
+        owner_uid = owner_gid = -1
+        try:
+            parent = path.parent.stat()
+            owner_uid, owner_gid = parent.st_uid, parent.st_gid
+        except OSError:
+            pass
+        connection = intake_store.init_intake_db(path)
+        try:
+            return intake_store.submit_portal_application(
+                connection,
+                application=application,
+            )
+        finally:
+            connection.close()
+            if hasattr(os, "geteuid") and os.geteuid() == 0 and owner_uid >= 0:
+                for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+                    try:
+                        if candidate.exists():
+                            os.chown(candidate, owner_uid, owner_gid)
+                    except OSError:
+                        logger.warning(
+                            "could not restore intake database ownership: %s",
+                            candidate,
+                            exc_info=True,
+                        )
+
     async def _handle_membership_command(
         self,
         command: str,
         identity: Any,
         args: dict[str, Any],
+        *,
+        allow_portal: bool = False,
     ) -> dict[str, Any]:
         """Admin membership management + member self-service keys (§7, §8)."""
         admin_commands = {
@@ -430,7 +842,8 @@ class Broker:
         }
         is_admin = command in admin_commands
         if is_admin:
-            self._require_admin(identity)
+            if not (identity.is_admin or (allow_portal and identity.is_portal)):
+                raise Forbidden("admin permission required")
         else:
             # Member self-service (me_keys_*): requires an active member.
             if not self.config.policy.membership_required:
@@ -458,6 +871,11 @@ class Broker:
                 decision = None
                 with self._connection() as connection:
                     decision = member_store.get_application_decision(connection, request_id)
+                    if decision is not None and decision.get("operation_id"):
+                        operation = member_store.get_operation(
+                            connection, str(decision["operation_id"])
+                        )
+                        decision["member_id"] = operation.get("member_id") or ""
                 request = member_service.get_request(intake_db, request_id)
                 request["decision"] = decision
                 return request
@@ -2105,6 +2523,8 @@ class Broker:
                         ],
                     }
                 )
+            if command.startswith("portal_"):
+                return _ok(await self._handle_portal_command(command, identity, args))
             # Mode and membership are independent gates.  Maintenance/monitor
             # never bypasses membership, and membership never overrides the
             # mode matrix that blocks new work.  Admin operations keep their
@@ -2192,6 +2612,20 @@ class Broker:
                 summary = await asyncio.to_thread(self.reconcile_once)
                 self._cancel_inactive_tunnels()
                 return _ok(summary)
+            if command in {
+                "admin_portal_accounts_list",
+                "admin_portal_accounts_create",
+                "admin_portal_accounts_set_role",
+            }:
+                self._require_admin(identity)
+                return _ok(
+                    await asyncio.to_thread(
+                        self._handle_portal_admin_command,
+                        command,
+                        identity,
+                        args,
+                    )
+                )
             if command in {
                 "admin_requests_list",
                 "admin_requests_show",

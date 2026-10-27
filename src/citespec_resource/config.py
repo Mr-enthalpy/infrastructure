@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import tempfile
@@ -105,6 +106,7 @@ class GroupsConfig:
     cli: str = "citespec-cli"
     admins: str = "citespec-admins"
     gpu: str = "citespec-gpu"
+    portal: str = "citespec-portal"
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,32 @@ class GUIConfig:
 
 
 @dataclass(frozen=True)
+class PortalConfig:
+    """VPN-only membership portal (C1).
+
+    The Portal is a separate low-privilege service. It binds loopback only and
+    reaches privileged state through a narrow broker allowlist. It deliberately
+    has no resource-allocation, shell, VS Code, or file-transfer routes.
+    """
+
+    enabled: bool = False
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 8770
+    db_path: str = "/var/lib/citespec-resource-portal/portal.db"
+    secret_file: str = "/etc/citespec-resource/portal-secret.key"
+    base_url: str = ""
+    session_ttl_hours: int = 12
+    activation_ttl_hours: int = 24
+    login_max_attempts: int = 5
+    login_window_seconds: int = 900
+    cookie_secure: bool = True
+    registration_enabled: bool = True
+    totp_issuer: str = "Citespec"
+    trusted_proxy_cidrs: tuple[str, ...] = ("127.0.0.1/32", "::1/128")
+    max_body_bytes: int = 64 * 1024
+
+
+@dataclass(frozen=True)
 class OnboardingConfig:
     """Member-facing onboarding information (goal §4.2). Public data only.
 
@@ -138,6 +166,7 @@ class OnboardingConfig:
 
     guide_url: str = ""
     apply_url: str = ""
+    portal_url: str = ""
     support_label: str = "实验室计算资源管理员"
     support_contact: str = ""
     legacy_login_notice_enabled: bool = True
@@ -155,6 +184,7 @@ class LabConfig:
     image: ImageConfig = field(default_factory=ImageConfig)
     deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     gui: GUIConfig = field(default_factory=GUIConfig)
+    portal: PortalConfig = field(default_factory=PortalConfig)
     onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
 
 
@@ -201,6 +231,26 @@ def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
+def _network_list(value: Any, *, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ("127.0.0.1/32", "::1/128")
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field_name} must be a list of CIDR strings")
+    result: list[str] = []
+    for item in value:
+        raw = item.strip()
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} contains an invalid CIDR: {raw}") from exc
+        if not network.is_loopback:
+            raise ValueError(f"{field_name} may only contain loopback networks")
+        normalized = str(network)
+        if normalized not in result:
+            result.append(normalized)
+    return tuple(result)
+
+
 def load_config(path: str | Path) -> LabConfig:
     path = Path(path)
     with path.open("rb") as handle:
@@ -212,6 +262,7 @@ def load_config(path: str | Path) -> LabConfig:
     image_raw = data.get("image", {})
     deployment_raw = data.get("deployment", {})
     gui_raw = data.get("gui", {})
+    portal_raw = data.get("portal", {})
     onboarding_raw = data.get("onboarding", {})
 
     server = ServerConfig(
@@ -453,7 +504,17 @@ def load_config(path: str | Path) -> LabConfig:
         cli=str(groups_raw.get("cli", "citespec-cli")),
         admins=str(groups_raw.get("admins", "citespec-admins")),
         gpu=str(groups_raw.get("gpu", "citespec-gpu")),
+        portal=str(groups_raw.get("portal", "citespec-portal")),
     )
+    for group_name, group_value in (
+        ("members", groups.members),
+        ("cli", groups.cli),
+        ("admins", groups.admins),
+        ("gpu", groups.gpu),
+        ("portal", groups.portal),
+    ):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", group_value):
+            raise ValueError(f"groups.{group_name} is not a valid group name")
     raw_allowlist = image_raw.get("allowlist", [])
     if not isinstance(raw_allowlist, list) or any(
         not isinstance(item, str) or not item.strip() for item in raw_allowlist
@@ -473,9 +534,59 @@ def load_config(path: str | Path) -> LabConfig:
     )
     if gui.connect_timeout <= 0:
         raise ValueError("gui.connect_timeout must be positive")
+    portal = PortalConfig(
+        enabled=bool(portal_raw.get("enabled", False)),
+        bind_host=str(portal_raw.get("bind_host", "127.0.0.1")),
+        bind_port=int(portal_raw.get("bind_port", 8770)),
+        db_path=str(portal_raw.get("db_path", "/var/lib/citespec-resource-portal/portal.db")),
+        secret_file=str(portal_raw.get("secret_file", "/etc/citespec-resource/portal-secret.key")),
+        base_url=str(portal_raw.get("base_url", "")),
+        session_ttl_hours=int(portal_raw.get("session_ttl_hours", 12)),
+        activation_ttl_hours=int(portal_raw.get("activation_ttl_hours", 24)),
+        login_max_attempts=int(portal_raw.get("login_max_attempts", 5)),
+        login_window_seconds=int(portal_raw.get("login_window_seconds", 900)),
+        cookie_secure=bool(portal_raw.get("cookie_secure", True)),
+        registration_enabled=bool(portal_raw.get("registration_enabled", True)),
+        totp_issuer=str(portal_raw.get("totp_issuer", "Citespec")),
+        trusted_proxy_cidrs=_network_list(
+            portal_raw.get("trusted_proxy_cidrs"), field_name="portal.trusted_proxy_cidrs"
+        ),
+        max_body_bytes=int(portal_raw.get("max_body_bytes", 64 * 1024)),
+    )
+    if portal.bind_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise ValueError("portal.bind_host must be a loopback address")
+    if not 1 <= portal.bind_port <= 65535:
+        raise ValueError("portal.bind_port must be between 1 and 65535")
+    for field_name, raw_path in (
+        ("portal.db_path", portal.db_path),
+        ("portal.secret_file", portal.secret_file),
+    ):
+        path_value = PurePosixPath(raw_path)
+        if not path_value.is_absolute() or ".." in path_value.parts:
+            raise ValueError(f"{field_name} must be an absolute path without '..'")
+        if raw_path.startswith("//"):
+            raise ValueError(f"{field_name} must not be a UNC path")
+    if portal.base_url:
+        if not portal.base_url.startswith(("https://", "http://")):
+            raise ValueError("portal.base_url must start with http:// or https://")
+        if portal.cookie_secure and portal.base_url.startswith("http://"):
+            raise ValueError("cookie_secure requires an https portal.base_url")
+    if portal.session_ttl_hours <= 0:
+        raise ValueError("portal.session_ttl_hours must be positive")
+    if portal.activation_ttl_hours <= 0:
+        raise ValueError("portal.activation_ttl_hours must be positive")
+    if portal.login_max_attempts <= 0:
+        raise ValueError("portal.login_max_attempts must be positive")
+    if portal.login_window_seconds <= 0:
+        raise ValueError("portal.login_window_seconds must be positive")
+    if not portal.totp_issuer.strip():
+        raise ValueError("portal.totp_issuer must not be empty")
+    if not 1024 <= portal.max_body_bytes <= 1024 * 1024:
+        raise ValueError("portal.max_body_bytes must be between 1024 and 1048576")
     onboarding = OnboardingConfig(
         guide_url=str(onboarding_raw.get("guide_url", "")),
         apply_url=str(onboarding_raw.get("apply_url", "")),
+        portal_url=str(onboarding_raw.get("portal_url", "")),
         support_label=str(onboarding_raw.get("support_label", "实验室计算资源管理员")),
         support_contact=str(onboarding_raw.get("support_contact", "")),
         legacy_login_notice_enabled=bool(onboarding_raw.get("legacy_login_notice_enabled", True)),
@@ -511,9 +622,11 @@ def load_config(path: str | Path) -> LabConfig:
         image=image,
         deployment=deployment,
         gui=gui,
+        portal=portal,
         onboarding=OnboardingConfig(
             guide_url=onboarding.guide_url,
             apply_url=onboarding.apply_url,
+            portal_url=onboarding.portal_url,
             support_label=onboarding.support_label,
             support_contact=onboarding.support_contact,
             legacy_login_notice_enabled=onboarding.legacy_login_notice_enabled,
@@ -583,6 +696,7 @@ def load_client_config(path: str | Path) -> LabConfig:
         onboarding=OnboardingConfig(
             guide_url=str(onboarding_raw.get("guide_url", "")),
             apply_url=str(onboarding_raw.get("apply_url", "")),
+            portal_url=str(onboarding_raw.get("portal_url", "")),
             support_label=str(onboarding_raw.get("support_label", "实验室计算资源管理员")),
             support_contact=str(onboarding_raw.get("support_contact", "")),
         ),
@@ -619,13 +733,15 @@ def write_client_config(path: str | Path, config: LabConfig) -> Path:
     if server.known_hosts:
         lines.append(f"known_hosts = {_toml_string(server.known_hosts)}")
     lines.append(f"broker_socket = {_toml_string(server.broker_socket)}")
-    if config.onboarding.apply_url or config.onboarding.guide_url:
+    if config.onboarding.apply_url or config.onboarding.guide_url or config.onboarding.portal_url:
         lines.append("")
         lines.append("[onboarding]")
         if config.onboarding.guide_url:
             lines.append(f"guide_url = {_toml_string(config.onboarding.guide_url)}")
         if config.onboarding.apply_url:
             lines.append(f"apply_url = {_toml_string(config.onboarding.apply_url)}")
+        if config.onboarding.portal_url:
+            lines.append(f"portal_url = {_toml_string(config.onboarding.portal_url)}")
         if config.onboarding.support_contact:
             lines.append(f"support_contact = {_toml_string(config.onboarding.support_contact)}")
     content = "\n".join(lines) + "\n"

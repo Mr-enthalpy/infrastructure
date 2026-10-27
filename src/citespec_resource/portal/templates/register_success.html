@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}申请已提交 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>申请已提交</h1>
+<div class="card">
+  <p>申请编号：<code>{{ request_id }}</code></p>
+  <p>用户名：<code>{{ username }}</code></p>
+  {% if receipt_secret %}
+    <p>查询凭据（只显示一次，请妥善保存）：</p>
+    <code class="secret">{{ receipt_secret }}</code>
+  {% endif %}
+  <p class="muted">管理员审批后会通过实验室渠道把一次性激活码发给你。请勿把凭据或激活码发到公开群聊。</p>
+  <a class="button secondary" href="/login">返回登录</a>
+</div>
+{% endblock %}

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}概览 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>概览</h1>
+<div class="grid">
+  <section class="card">
+    <h2>我的账号</h2>
+    {% if user %}
+      <dl>
+        <dt>Portal 用户名</dt><dd>{{ user.username }}</dd>
+        <dt>身份</dt><dd>{{ '管理员' if user.role == 'admin' else '成员' }}</dd>
+        <dt>状态</dt><dd>{{ user.status }}</dd>
+        {% if user.linux_username %}<dt>Linux 用户</dt><dd><code>{{ user.linux_username }}</code></dd>{% endif %}
+      </dl>
+      <p class="small muted">Web 不提供 GPU/容器申请、释放、队列、Shell、VS Code 或文件传输；这些继续使用 CLI/SSH。</p>
+    {% endif %}
+  </section>
+  <section class="card">
+    <h2>成员资格</h2>
+    {% if member_error %}<div class="error">{{ member_error }}</div>{% endif %}
+    {% if member %}
+      <dl>
+        <dt>状态</dt><dd>{{ member.member.status }}</dd>
+        <dt>有效期</dt><dd>{{ member.member.valid_until or '未设置' }}</dd>
+        <dt>显示名</dt><dd>{{ member.member.display_name }}</dd>
+        <dt>Linux UID</dt><dd>{{ member.member.linux_uid if member.member.linux_uid is not none else '开通中' }}</dd>
+        <dt>登录密钥</dt><dd>{{ member['keys']|length }} 个</dd>
+      </dl>
+    {% else %}
+      <p class="muted">尚未关联成员记录。若刚获批准，请等待开通完成后使用激活码激活。</p>
+    {% endif %}
+  </section>
+</div>
+
+{% if is_admin %}
+<section class="card">
+  <h2>管理员快捷入口</h2>
+  <div class="stats">
+    <div class="stat"><span class="muted">待审申请</span><strong>{{ admin_pending|length }}</strong></div>
+    <div class="stat"><span class="muted">成员总数</span><strong>{{ admin_member_count if admin_member_count is not none else '—' }}</strong></div>
+  </div>
+  <p><a class="button" href="/admin/registrations">处理审批</a> <a class="button secondary" href="/admin/members">查看成员</a></p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>只读服务状态</h2>
+  {% if service_error %}<div class="error">{{ service_error }}</div>{% endif %}
+  {% if service %}
+    <div class="stats">
+      <div class="stat"><span class="muted">模式</span><strong>{{ service.mode }}</strong></div>
+      <div class="stat"><span class="muted">活跃资源</span><strong>{{ service.active_allocations }}</strong></div>
+      <div class="stat"><span class="muted">排队请求</span><strong>{{ service.queued_requests }}</strong></div>
+      <div class="stat"><span class="muted">GPU</span><strong>{{ service.gpu_count }}</strong></div>
+    </div>
+    <p><a href="/status">查看 GPU 状态</a></p>
+  {% else %}
+    <p class="muted">状态暂不可用。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -23,6 +23,7 @@ from typing import Any
 
 from aiohttp import web
 
+from ..netutil import trusted_client_ip
 from . import store as intake_store
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,11 @@ def _rate_limited(request: web.Request, bucket: str) -> bool:
     limit, window = request.app[RATE_LIMITS_KEY].get(bucket, (60, 60.0))
     if limit <= 0:
         return False
-    key = (request.remote or "unknown", bucket)
+    client_ip = trusted_client_ip(
+        request.remote,
+        request.headers.get("X-Citespec-Client-IP"),
+    )
+    key = (client_ip, bucket)
     now = time.monotonic()
     state = request.app[RATE_LIMIT_KEY]
     stamps = [stamp for stamp in state.get(key, []) if now - stamp < window]

@@ -279,6 +279,83 @@ def test_admin_users_requires_no_extra_client_logic(monkeypatch):
     assert fake.calls == [("admin_users", {})]
 
 
+def test_admin_portal_create_uses_cli_only_broker_command(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "username": "firstadmin",
+                "role": "admin",
+                "activation_code": "one-time-code",
+                "expires_at": "2026-10-28T12:00:00+00:00",
+                "user": {"role": "admin"},
+            },
+        }
+    )
+    result = _invoke(
+        monkeypatch,
+        fake,
+        [
+            "admin",
+            "portal",
+            "create",
+            "--username",
+            "firstadmin",
+            "--role",
+            "admin",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0
+    assert fake.calls == [
+        (
+            "admin_portal_accounts_create",
+            {
+                "username": "firstadmin",
+                "role": "admin",
+                "member_id": "",
+                "linux_username": "",
+                "display_name": "",
+                "contact": "",
+            },
+        )
+    ]
+
+
+def test_admin_portal_set_role_requires_role(monkeypatch):
+    fake = FakeClient({"ok": True, "data": {}})
+    result = _invoke(
+        monkeypatch,
+        fake,
+        ["admin", "portal", "set-role", "--username", "firstadmin", "--json"],
+    )
+    assert result.exit_code != 0
+    assert fake.calls == []
+
+
+def test_admin_portal_list_formats_accounts(monkeypatch):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "accounts": [
+                    {
+                        "username": "firstadmin",
+                        "role": "admin",
+                        "status": "active",
+                        "member_id": "",
+                        "linux_username": "",
+                    }
+                ]
+            },
+        }
+    )
+    result = _invoke(monkeypatch, fake, ["admin", "portal", "list"])
+    assert result.exit_code == 0
+    assert "firstadmin" in result.output
+    assert "role=admin" in result.output
+
+
 def test_release_command(monkeypatch):
     fake = FakeClient({"ok": True, "data": {"id": "alloc-1", "status": "released"}})
     result = _invoke(monkeypatch, fake, ["release", "alloc-1", "--json"])

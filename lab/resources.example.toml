@@ -101,6 +101,7 @@ members = "citespec-members"
 cli = "citespec-cli"
 admins = "citespec-admins"
 gpu = "citespec-gpu"
+portal = "citespec-portal"
 
 [image]
 base = "citespec-base:2026.10"
@@ -113,3 +114,30 @@ monitor_only_until = ""
 [gui]
 admin_ssh = ""
 connect_timeout = 15
+
+[onboarding]
+# HTTPS entry points; published only after DNS/VPN/certificate work is done.
+guide_url = ""
+apply_url = ""
+portal_url = ""
+
+[portal]
+# C1: the portal is VPN-only and binds loopback behind host nginx (:8770).
+# Keep disabled until the network/certificate prerequisites in
+# docs/server-network-request.md are answered and accepted.
+enabled = false
+bind_host = "127.0.0.1"
+bind_port = 8770
+db_path = "/var/lib/citespec-resource-portal/portal.db"
+secret_file = "/etc/citespec-resource/portal-secret.key"
+# Final value: https://citespec-portal.<lab-domain>
+base_url = ""
+session_ttl_hours = 12
+activation_ttl_hours = 24
+login_max_attempts = 5
+login_window_seconds = 900
+cookie_secure = true
+registration_enabled = true
+totp_issuer = "Citespec"
+trusted_proxy_cidrs = ["127.0.0.1/32", "::1/128"]
+max_body_bytes = 65536

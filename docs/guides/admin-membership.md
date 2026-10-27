@@ -108,3 +108,34 @@ dry-run 会检查账号是否存在、UID 是否已被其他成员占用、组�
 workspace 是否安全；任何冲突都拒绝 apply。apply 会把账号 shell、组、中央公钥、
 workspace 配额收敛到受管状态。`create_user.sh` 只作为审计过的 break-glass 工具：
 成员密钥写入中央目录，管理员账号仍使用自己的 home 公钥。
+
+## 6. VPN Portal 账号与管理员角色
+
+Portal 的审批入口上线后，普通成员的 Portal 账号由审批自动创建为 `member`，不需要
+手工建号。管理员角色**没有 Web 修改入口**；首个管理员和后续角色变更使用：
+
+```bash
+# 首个管理员：生成的一次性激活码只显示一次，通过可信渠道发送
+citespec-resource admin portal create --username labadmin --role admin \
+  --member-id <可选成员ID> --display-name "Lab Admin" --contact admin@example.invalid
+
+# 查看本地 Portal 账号（不显示密码、TOTP、激活码）
+citespec-resource admin portal list
+
+# 授权/降权；目标账号的现有浏览器会话会被注销
+citespec-resource admin portal set-role --username labadmin --role admin
+citespec-resource admin portal set-role --username labadmin --role member
+```
+
+约束与语义：
+
+- 这些命令只接受 `citespec-admins` 成员，Broker 会重新校验 Linux 组；Portal 服务
+  账号不能调用。
+- 不能降权最后一个 `active` 管理员；需要先创建、提升并激活另一个管理员。
+- 同名 `pending_activation` 账号再次 `create` 会重签一次性激活码；已激活账号只能
+  用 `set-role` 调整角色。
+- 审批只创建 `member`；普通成员不能通过注册或 Web 表单把自己变成管理员。
+- 角色变更、创建账号与审批/暂停等操作都会进入 Portal 和 Broker 审计；激活码、
+  密码和 TOTP 不会写入审计。
+- Portal 的 `/admin` 页面负责审批和成员状态，不负责角色；资源申请、释放、队列、
+  Shell、VS Code、文件传输仍只用 CLI/SSH。

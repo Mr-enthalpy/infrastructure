@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <a class="brand" href="/">{{ app_name }}</a>
+    <nav>
+      {% if user %}
+        <a href="/">概览</a>
+        <a href="/status">服务状态</a>
+        <a href="/account">我的账号</a>
+        {% if is_admin %}
+          <a href="/admin/registrations">审批</a>
+          <a href="/admin/members">成员</a>
+          <a href="/admin/audit">审计</a>
+        {% endif %}
+        <form method="post" action="/logout">
+          <input type="hidden" name="_csrf" value="{{ csrf }}">
+          <button class="link" type="submit">退出</button>
+        </form>
+      {% else %}
+        <a href="/login">登录</a>
+        {% if registration_enabled is not defined or registration_enabled %}
+          <a href="/register">新成员注册</a>
+        {% endif %}
+      {% endif %}
+    </nav>
+  </div>
+</header>
+<main>
+  {% if notice %}<div class="notice">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {% if activated %}<div class="notice">账号已激活，请使用新密码和 TOTP 登录。</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

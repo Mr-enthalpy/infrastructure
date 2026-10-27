@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}激活账号 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>激活 Portal 账号</h1>
+<div class="card">
+  <p class="muted">输入管理员发给你的一次性激活码。激活成功后设置密码并绑定 TOTP。</p>
+  <form method="post" action="/activate/start">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label for="username">用户名</label>
+    <input id="username" name="username" type="text" autocomplete="username" value="{{ form.get('username', '') if form else '' }}" required>
+    <label for="activation_code">一次性激活码</label>
+    <input id="activation_code" name="activation_code" type="text" autocomplete="one-time-code" required>
+    <button type="submit">继续</button>
+  </form>
+</div>
+{% endblock %}

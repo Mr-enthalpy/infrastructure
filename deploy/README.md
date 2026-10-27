@@ -4,7 +4,7 @@
 
 This directory contains the deployment and verification tooling for the
 `citespec-resource` broker, CLI, SSH policy, udev rule, systemd units, development
-container image, and host-side verification scripts.
+container image, VPN-only membership portal, and host-side verification scripts.
 
 Deployment is prohibited while the host is serving training workloads or when
 explicit administrator approval has not been recorded. The current project
@@ -13,11 +13,14 @@ status, target-host unknowns, and approved next steps are maintained in
 [`docs/acceptance.md`](../docs/acceptance.md).
 
 This round implements the intake, approval, executor, central-key SSH policy,
-and setup/client-profile paths in code and automated tests. Core active-mode
-acceptance has been run on the live instance, including one-time member
-provisioning and cleanup. External HTTPS onboarding and the optional VS Code,
-file-transfer, and container-root/host-GPU 5.6 gates remain pending; see
-[`docs/handoff.md`](../docs/handoff.md) for current status and evidence.
+setup/client-profile paths, and a VPN-only membership portal in code and
+automated tests. Core active-mode acceptance has been run on the live instance,
+including one-time member provisioning and cleanup. External HTTPS onboarding,
+the portal network/certificate changes, and the optional VS Code, file-transfer,
+and container-root/host-GPU 5.6 gates remain pending; see
+[`docs/handoff.md`](../docs/handoff.md) and
+[`docs/server-network-request.md`](../docs/server-network-request.md) for current
+status and evidence.
 
 All verification scripts marked as read-only must be executed before any
 state-changing step. A read-only script must be reviewed before execution; it
@@ -37,6 +40,10 @@ The following conditions must be satisfied before installation:
   excluded from Git.
 - The read-only checks in Section 3 pass. For the development profile, the
   storage, quota, and `nosuid` requirements in Section 5 are mandatory.
+- For the portal, the internal DNS, NJU VPN route/DNS, TLS certificate, and
+  443 firewall answers in
+  [`docs/server-network-request.md`](../docs/server-network-request.md) are
+  recorded and accepted. Keep `[portal].enabled = false` until then.
 
 ## 3. Read-only pre-deployment checks
 
@@ -81,12 +88,13 @@ these tools is unavailable.
    The installer is idempotent. It does not modify the host without `--yes`, does
    not overwrite an existing configuration unless `--force-config` is supplied,
    and does not start the broker unless `--start` is supplied. It installs the
-   Python package with the `gui` extra (needed by the intake service), creates
-   the root-managed key directory `/etc/citespec-resource/authorized-keys.d`, the
-   provisioning spool `/var/lib/citespec-resource/provision`, and the isolated intake
-   state directory. A fresh database starts in `monitor` mode. A reinstall with
-   active/pending leases preserves `active` or `maintenance` so lease expiry is
-   not silently paused.
+   Python package with the `gui` and `portal` extras, creates the root-managed key
+   directory `/etc/citespec-resource/authorized-keys.d`, the provisioning spool
+   `/var/lib/citespec-resource/provision`, the isolated intake state directory,
+   and the `citespec-portal` account/group, state directory, SQLite database,
+   root-owned TOTP key, and systemd unit. A fresh database starts in `monitor`
+   mode. A reinstall with active/pending leases preserves `active` or
+   `maintenance` so lease expiry is not silently paused.
 
    Before changing the configuration, systemd units, udev rules, sshd
    configuration, or managed symlinks, the installer creates a timestamped
@@ -210,7 +218,50 @@ these tools is unavailable.
    and reconciliation. The broker refuses `admin mode monitor` while leases or
    managed containers exist.
 
-8. Only after explicit approval and completion of the read-only checks may the
+8. Prepare the VPN-only portal only after the network answers are accepted. The
+   installer creates the low-privilege `citespec-portal` account (member of
+   `citespec-cli`, never `citespec-admins`), its state directory, `portal.db`, the
+   root-owned `/etc/citespec-resource/portal-secret.key` (mode `0640`), and
+   `citespec-resource-portal.service`. It enables the unit only when
+   `[portal].enabled = true`, and it never starts it.
+
+   The portal binds `127.0.0.1:8770`; host nginx terminates TLS on the private
+   campus/VPN listener. Example vhosts live in `deploy/nginx/` — they are not
+   installed automatically and contain no certificate, DNS, or firewall changes.
+   Confirm the certificate covers the chosen names and that nginx overwrites
+   `X-Citespec-Client-IP` with `$remote_addr`. Then, after a local activation and
+   admin review test:
+
+   ```bash
+   systemctl start citespec-resource-portal.service
+   curl -fsS http://127.0.0.1:8770/healthz
+   systemctl status citespec-resource-portal.service
+   ```
+
+   Portal scope is deliberately narrow: registration, activation, local
+   password/TOTP login, own member/status view, and admin approval/member-state
+   management. It has no resource apply/release/queue, shell, VS Code, or file
+   transfer. Browser routes are tested with `pytest tests/test_portal.py`; the
+   broker allowlist is tested in `tests/test_broker.py`. Admin role changes remain
+   CLI-only, and approval/suspend/resume/revoke require password + TOTP re-auth.
+   A one-time activation code is shown once and expires after 24 hours by default.
+
+   Bootstrap the first portal administrator before handing the URL to members:
+
+   ```bash
+   citespec-resource admin portal create --username labadmin --role admin \
+     --display-name "Lab Admin" --contact admin@example.invalid
+   citespec-resource admin portal list
+   ```
+
+   The activation code is printed once; deliver it over a trusted channel. Later
+   role changes use `citespec-resource admin portal set-role --username <name>
+   --role member|admin` and invalidate that account's browser sessions. The last
+   active administrator cannot be demoted. These commands require membership
+   in `citespec-admins` and are rechecked by the broker; the portal service account
+   cannot call them.
+
+9. Only after explicit approval and completion of the read-only checks may the
    broker be switched to active mode and the CPU and single-GPU acceptance
    allocations be created. Do not run the destructive acceptance procedure on a
    host that is still serving training containers or other users' allocations.
@@ -265,15 +316,17 @@ warning and critical thresholds so failures are visible in
 `systemctl --failed` and the journal.
 
 The backup timer runs `python -m citespec_resource.backup backup` once a day.
-It uses SQLite's online backup API for `state.db` and the intake database,
-copies the root-owned `/etc/citespec-resource` tree (including central member
-keys), writes a SHA-256 manifest, verifies the result, and retains the newest 14
-`state-*` backups under `/var/backups/citespec-resource/`. Workspaces are not
-included. See `docs/backup-restore.md` for verification, restore, and restore
-drill commands.
+It uses SQLite's online backup API for `state.db`, the intake database, and
+`portal.db` when present, copies the root-owned `/etc/citespec-resource` tree
+(including central member keys and the portal secret), writes a SHA-256
+manifest, verifies the result, and retains the newest 14 `state-*` backups under
+`/var/backups/citespec-resource/`. Workspaces are not included. Restore stops
+the portal writer unit as well, and inherits the existing `portal.db` owner so
+the low-privilege portal service can reopen it. See `docs/backup-restore.md` for
+verification, restore, and restore drill commands.
 
 `citespec-resource-alert@.service` is the common `OnFailure=` target for the
-broker, intake, disk, log-rotation, and backup units. It writes the journal and
+broker, intake, portal, disk, log-rotation, and backup units. It writes the journal and
 `/var/log/citespec-resource/alerts.log`; an optional root-owned
 `/etc/citespec-resource/alert.env` can set `CITESPEC_ALERT_WEBHOOK` for JSON
 webhook delivery.
@@ -301,8 +354,10 @@ container must not mount the host Docker socket.
 - `configure_quotas.sh`: XFS/ext4 project quota setup; dry-run by default.
 - `rotate_job_logs.py`: symlink-safe job-log rotation.
 - `alert.sh`: `OnFailure=` alert recorder; journal + local log + optional webhook.
-- `../src/citespec_resource/backup.py`: state backup, verify, restore, and
-  retention implementation used by the backup timer.
+- `../src/citespec_resource/backup.py`: state/intake/portal backup, verify,
+  restore, and retention implementation used by the backup timer.
+- `../src/citespec_resource/portal/`: portal HTTP/UI, local auth/TOTP store, and
+  narrow broker bridge.
 - `acceptance_active.py`: destructive active-mode acceptance harness; see
   `docs/acceptance.md`.
 - `systemd/citespec-resource-broker.service`: hardened broker unit.
@@ -312,6 +367,10 @@ container must not mount the host Docker socket.
 - `systemd/citespec-resource-alert@.service`: common failure alert template.
 - `systemd/citespec-resource-intake.service`: unprivileged public application entry;
   owns only its own SQLite store.
+- `systemd/citespec-resource-portal.service`: unprivileged VPN-only membership
+  portal; binds loopback and may use only the broker's narrow portal commands.
+- `nginx/citespec-portal.conf.example` and `nginx/citespec-apply.conf.example`:
+  example VPN-only vhosts; certificates, DNS, and firewall rules are external.
 - `systemd/citespec-resource-provision.service` and `.path`: root executor triggered
   by fixed JSON requests in the provisioning spool.
 - `udev/99-citespec-gpu.rules`: NVIDIA device-node ownership rule.

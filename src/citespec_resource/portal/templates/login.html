@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}登录 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>登录</h1>
+<div class="card">
+  <p class="muted">仅校园网或南京大学 VPN 可访问。请使用 Portal 账号密码和 TOTP。</p>
+  <form method="post" action="/login">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <input type="hidden" name="next" value="{{ next_url|default('') }}">
+    <label for="username">用户名</label>
+    <input id="username" name="username" type="text" autocomplete="username" required>
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <label for="totp">TOTP 验证码</label>
+    <input id="totp" name="totp" type="text" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <button type="submit">登录</button>
+  </form>
+  <p class="small muted">
+    新成员请先<a href="/register">提交注册申请</a>；已获批准但尚未设置密码的成员请<a href="/activate">使用激活码激活</a>。
+  </p>
+</div>
+{% endblock %}

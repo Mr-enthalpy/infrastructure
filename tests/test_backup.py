@@ -16,6 +16,7 @@ def _write_config(
     state_db: Path,
     intake_db: Path | None = None,
     spool_dir: Path | None = None,
+    portal_db: Path | None = None,
 ) -> None:
     lines = [
         "[server]",
@@ -29,6 +30,8 @@ def _write_config(
         lines.append(f'intake_db = "{intake_db.as_posix()}"')
     if spool_dir is not None:
         lines.append(f'provisioning_spool = "{spool_dir.as_posix()}"')
+    if portal_db is not None:
+        lines += ["", "[portal]", f'db_path = "{portal_db.as_posix()}"']
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -264,6 +267,64 @@ def test_backup_fails_if_configured_spool_is_missing(tmp_path):
 
     with pytest.raises(backup.BackupError, match="provisioning spool"):
         backup.create_backup(config_path, backup_root, stamp="20260101-000000")
+
+
+def test_backup_and_restore_include_portal_database(tmp_path):
+    config_dir = tmp_path / "portal-source" / "etc"
+    config_dir.mkdir(parents=True)
+    state_db = tmp_path / "portal-source" / "state.db"
+    intake_db = tmp_path / "portal-source" / "intake.db"
+    spool_dir = tmp_path / "portal-source" / "provision"
+    portal_db = tmp_path / "portal-source" / "portal.db"
+    _make_state_db(state_db, "broker")
+    _make_db(intake_db, "intake")
+    _make_db(portal_db, "portal-source")
+    _make_spool(spool_dir)
+    source_config = config_dir / "config.toml"
+    _write_config(
+        source_config,
+        state_db,
+        intake_db,
+        spool_dir,
+        portal_db=portal_db,
+    )
+    backup_root = tmp_path / "portal-source" / "backups"
+    result = backup.create_backup(source_config, backup_root, stamp="20260101-000000")
+    manifest = json.loads((result / "manifest.json").read_text(encoding="utf-8"))
+    assert "portal.db" in {entry["path"] for entry in manifest["files"]}
+    assert manifest["sources"]["portal_db"] == str(portal_db)
+    assert backup.verify_backup(result)["schema"] == backup.BACKUP_SCHEMA
+
+    restore_dir = tmp_path / "portal-restore"
+    target_config_dir = restore_dir / "etc"
+    target_config_dir.mkdir(parents=True)
+    target_state = restore_dir / "state.db"
+    target_intake = restore_dir / "intake.db"
+    target_spool = restore_dir / "provision"
+    target_portal = restore_dir / "portal.db"
+    _make_state_db(target_state, "old")
+    _make_db(target_intake, "old-intake")
+    _make_db(target_portal, "old-portal")
+    _make_spool(target_spool)
+    target_config = target_config_dir / "config.toml"
+    _write_config(
+        target_config,
+        target_state,
+        target_intake,
+        target_spool,
+        portal_db=target_portal,
+    )
+
+    restored = backup.restore_backup(
+        result,
+        target_config,
+        confirmed=True,
+        skip_service_check=True,
+    )
+    assert restored["portal_db"] == str(target_portal)
+    assert restored["mode"] == "maintenance"
+    with sqlite3.connect(target_portal) as connection:
+        assert connection.execute("SELECT value FROM items").fetchone()[0] == "portal-source"
 
 
 def test_retention_keeps_newest_state_backups_and_preserves_other_directories(tmp_path):

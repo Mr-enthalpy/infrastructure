@@ -265,6 +265,65 @@ def submit_application(
     return {"request_id": request_id, "receipt_secret": receipt_secret}
 
 
+def submit_portal_application(
+    connection: sqlite3.Connection,
+    *,
+    application: dict[str, Any],
+) -> dict[str, Any]:
+    """Create a membership request submitted from the authenticated portal.
+
+    This is the portal replacement for the invitation-gated public form.  The
+    portal is VPN-only and rate-limited, so it does not need a single-use
+    invitation.  The returned receipt secret is shown once to the applicant and
+    is stored only as a hash.
+    """
+
+    normalized = normalize_application(application)
+    request_id = uuid.uuid4().hex
+    receipt_secret = secrets.token_urlsafe(24)
+    version = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    timestamp = _now()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        pending = connection.execute(
+            "SELECT COUNT(*) FROM requests WHERE status IN ('pending_review', 'needs_info')"
+        ).fetchone()[0]
+        if int(pending) >= REQUEST_LIMITS["max_pending_requests"]:
+            connection.rollback()
+            raise ValueError("当前待审申请过多，请稍后再提交")
+        connection.execute(
+            """
+            INSERT INTO requests(
+                request_id, receipt_hash, version, snapshot, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending_review', ?, ?)
+            """,
+            (
+                request_id,
+                _hash(receipt_secret),
+                version,
+                json.dumps(normalized, sort_keys=True, ensure_ascii=False),
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    return {
+        "request_id": request_id,
+        "receipt_secret": receipt_secret,
+        "version": version,
+        "status": "pending_review",
+        "username": normalized["username"],
+        "display_name": normalized["display_name"],
+    }
+
+
 def request_status(
     connection: sqlite3.Connection,
     *,

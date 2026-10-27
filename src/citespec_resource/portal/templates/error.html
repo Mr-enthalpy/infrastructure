@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}请求失败 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>请求未完成</h1>
+<div class="card">
+  <div class="error">{{ error or '请求未完成。' }}</div>
+  <p class="muted">如果问题持续存在，请联系实验室计算资源管理员。</p>
+  <a class="button secondary" href="/">返回概览</a>
+</div>
+{% endblock %}

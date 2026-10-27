@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}审计 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>审计</h1>
+<div class="grid">
+  <section class="card">
+    <h2>Portal 审计</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>目标</th><th>来源 IP</th></tr></thead>
+        <tbody>
+          {% for event in events %}
+          <tr>
+            <td class="small">{{ event.ts }}</td>
+            <td>{{ event.actor_username or '—' }}</td>
+            <td>{{ event.action }}</td>
+            <td class="small"><code>{{ event.target or '—' }}</code></td>
+            <td class="small">{{ event.ip or '—' }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="muted">没有审计记录。</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Broker 审计</h2>
+    {% if broker_error %}<div class="error">{{ broker_error }}</div>{% endif %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>动作</th><th>详情</th></tr></thead>
+        <tbody>
+          {% for event in broker_events %}
+          <tr>
+            <td class="small">{{ event.ts }}</td>
+            <td>{{ event.action }}</td>
+            <td class="small"><code>{{ event.detail }}</code></td>
+          </tr>
+          {% else %}
+          <tr><td colspan="3" class="muted">没有 Broker 审计记录。</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

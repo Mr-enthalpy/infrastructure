@@ -3148,6 +3148,90 @@ def admin_users(
         typer.echo(f"{user['uid']}  {user['username']}  {user['role']}")
 
 
+@admin_app.command("portal")
+def admin_portal(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="list / create / set-role"),
+    username: str = typer.Option("", "--username", help="Portal 本地账号名。"),
+    role: str = typer.Option("", "--role", help="member 或 admin（set-role 必填）。"),
+    member_id: str = typer.Option("", "--member-id", help="关联的成员 ID（可选）。"),
+    linux_username: str = typer.Option(
+        "", "--linux-username", help="关联的 Linux 用户名（可选）。"
+    ),
+    display_name: str = typer.Option("", "--display-name"),
+    contact: str = typer.Option("", "--contact"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """CLI-only Portal 账号引导与角色变更。"""
+    config = _load(ctx)
+    if action == "list":
+        data = _request(_make_client(config), "admin_portal_accounts_list", json_output)
+        if json_output:
+            return
+        for account in data.get("accounts", []):
+            typer.echo(
+                f"{account.get('username')}  role={account.get('role')}  "
+                f"status={account.get('status')}  member={account.get('member_id') or '-'}  "
+                f"linux={account.get('linux_username') or '-'}"
+            )
+        return
+    if action == "create":
+        if not username:
+            _fail("bad_request", "create 需要 --username", json_output)
+        target_role = role or "member"
+        if target_role not in {"member", "admin"}:
+            _fail("bad_request", "role 必须是 member 或 admin", json_output)
+        if target_role == "admin" and not json_output:
+            typer.confirm(
+                f"确认创建 Portal 管理员 {username} 并生成一次性激活码？",
+                abort=True,
+            )
+        data = _request(
+            _make_client(config),
+            "admin_portal_accounts_create",
+            json_output,
+            username=username,
+            role=target_role,
+            member_id=member_id,
+            linux_username=linux_username,
+            display_name=display_name,
+            contact=contact,
+        )
+        if json_output:
+            return
+        typer.echo(f"Portal 账号：{data.get('username')}  角色：{target_role}")
+        typer.echo(f"一次性激活码（仅显示一次）：{data.get('activation_code')}")
+        typer.echo(f"有效期至：{data.get('expires_at')}")
+        typer.echo("激活地址：https://citespec-portal.<lab-domain>/activate")
+        return
+    if action == "set-role":
+        if not username or not role:
+            _fail("bad_request", "set-role 需要 --username 与 --role", json_output)
+        if role not in {"member", "admin"}:
+            _fail("bad_request", "role 必须是 member 或 admin", json_output)
+        if not json_output:
+            typer.confirm(
+                f"确认把 Portal 账号 {username} 的角色改为 {role}？现有会话将被注销。",
+                abort=True,
+            )
+        data = _request(
+            _make_client(config),
+            "admin_portal_accounts_set_role",
+            json_output,
+            username=username,
+            role=role,
+        )
+        if json_output:
+            return
+        typer.echo(f"Portal 账号 {data.get('username')}：{data.get('role')}")
+        return
+    _fail(
+        "bad_request",
+        f"未知操作 {action}；可用：list/create/set-role",
+        json_output,
+    )
+
+
 @admin_app.command("resources")
 def admin_resources(
     ctx: typer.Context,

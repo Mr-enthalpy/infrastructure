@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}服务状态 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>只读服务状态</h1>
+<section class="card">
+  {% if service_error %}<div class="error">{{ service_error }}</div>{% endif %}
+  {% if service %}
+    <div class="stats">
+      <div class="stat"><span class="muted">模式</span><strong>{{ service.mode }}</strong></div>
+      <div class="stat"><span class="muted">活跃资源</span><strong>{{ service.active_allocations }}</strong></div>
+      <div class="stat"><span class="muted">排队请求</span><strong>{{ service.queued_requests }}</strong></div>
+      <div class="stat"><span class="muted">生成时间</span><strong class="small">{{ service.generated_at }}</strong></div>
+    </div>
+    <h2>GPU</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>编号</th><th>型号</th><th>显存</th><th>状态</th></tr></thead>
+        <tbody>
+          {% for gpu in service.gpus %}
+          <tr>
+            <td>{{ gpu.index }}</td>
+            <td>{{ gpu.name }}</td>
+            <td>{{ gpu.memory_mib }} MiB</td>
+            <td>{{ gpu.state }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="muted">没有 GPU 数据。</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="muted">状态暂不可用。</p>
+  {% endif %}
+</section>
+{% endblock %}

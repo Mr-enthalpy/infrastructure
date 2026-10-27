@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}成员审批 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>成员审批</h1>
+<div class="card">
+  <div class="tabs">
+    {% for value, label in [('pending_review', '待审'), ('needs_info', '需补充'), ('approved', '已批准'), ('rejected', '已拒绝'), ('all', '全部')] %}
+      <a class="{% if selected_status == value %}active{% endif %}" href="/admin/registrations?status={{ value }}">{{ label }}</a>
+    {% endfor %}
+  </div>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>申请编号</th><th>用户名</th><th>姓名</th><th>状态</th><th>Portal 账号</th><th>提交时间</th></tr>
+      </thead>
+      <tbody>
+        {% for item in requests %}
+        {% set local = registrations.get(item.request_id) %}
+        <tr>
+          <td><a href="/admin/registrations/{{ item.request_id }}"><code>{{ item.request_id[:12] }}</code></a></td>
+          <td><code>{{ item.username }}</code></td>
+          <td>{{ item.display_name }}</td>
+          <td>{{ item.status }}</td>
+          <td>{% if local and local.portal_user_id %}已创建{% elif local %}待创建{% else %}—{% endif %}</td>
+          <td class="small">{{ item.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">没有该状态的申请。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

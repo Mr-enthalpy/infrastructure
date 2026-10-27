@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}审批详情 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>审批详情</h1>
+<p><a href="/admin/registrations">← 返回审批列表</a></p>
+<div class="grid">
+  <section class="card">
+    <h2>申请信息</h2>
+    <dl>
+      <dt>申请编号</dt><dd><code>{{ request_row.request_id }}</code></dd>
+      <dt>用户名</dt><dd><code>{{ request_row.username }}</code></dd>
+      <dt>姓名</dt><dd>{{ request_row.display_name }}</dd>
+      <dt>院系 / 单位</dt><dd>{{ request_row.affiliation }}</dd>
+      <dt>联系方式</dt><dd>{{ request_row.contact }}</dd>
+      <dt>用途</dt><dd>{{ request_row.purpose }}</dd>
+      <dt>状态</dt><dd>{{ request_row.status }}</dd>
+      <dt>提交时间</dt><dd>{{ request_row.created_at }}</dd>
+    </dl>
+    <h3>SSH 公钥</h3>
+    <ul>
+      {% for key in request_row['keys'] %}
+        <li><code>{{ key.fingerprint }}</code><br><span class="small muted">{{ key.public_key }}</span></li>
+      {% else %}
+        <li class="muted">没有公钥。</li>
+      {% endfor %}
+    </ul>
+  </section>
+  <section class="card">
+    <h2>审批记录</h2>
+    {% if request_row.decision %}
+      <dl>
+        <dt>决定</dt><dd>{{ request_row.decision.status }}</dd>
+        <dt>审批人 UID</dt><dd>{{ request_row.decision.reviewer_uid }}</dd>
+        <dt>公开说明</dt><dd>{{ request_row.decision.review_note or '—' }}</dd>
+        <dt>时间</dt><dd>{{ request_row.decision.updated_at }}</dd>
+        {% if request_row.decision.member_id %}<dt>成员编号</dt><dd><code>{{ request_row.decision.member_id }}</code></dd>{% endif %}
+      </dl>
+    {% else %}
+      <p class="muted">尚未决定。</p>
+    {% endif %}
+    {% if registration %}
+      <h3>Portal 关联</h3>
+      <dl>
+        <dt>Portal 账号</dt><dd>{% if portal_user %}<code>{{ portal_user.username }}</code>（{{ portal_user.status }}）{% else %}尚未创建{% endif %}</dd>
+        <dt>成员编号</dt><dd><code>{{ registration.member_id or '—' }}</code></dd>
+      </dl>
+    {% endif %}
+    {% if request_row.decision and request_row.decision.status == 'approved' and not portal_user %}
+      <div class="actions">
+        <h3>创建 Portal 账号</h3>
+        <p class="muted">用于 CLI 批准或历史批准后补建账号。激活码只显示一次。</p>
+        <form method="post" action="/admin/registrations/{{ request_row.request_id }}/portal-account">
+          <input type="hidden" name="_csrf" value="{{ csrf }}">
+          <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+          <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+          <button type="submit">创建账号并生成激活码</button>
+        </form>
+      </div>
+    {% endif %}
+  </section>
+</div>
+
+{% if request_row.status in ['pending_review', 'needs_info'] %}
+<div class="grid">
+  <section class="card">
+    <h2>批准</h2>
+    <form method="post" action="/admin/registrations/{{ request_row.request_id }}/approve">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <input type="hidden" name="expected_version" value="{{ request_row.version }}">
+      <label for="valid_until">有效期（可选，ISO 日期/时间）</label>
+      <input id="valid_until" name="valid_until" type="text" placeholder="例如 2027-10-27">
+      <label for="quota_gb">工作区配额（GB）</label>
+      <input id="quota_gb" name="quota_gb" type="number" min="1" value="200" required>
+      <label for="review_note">公开说明（可选）</label>
+      <textarea id="review_note" name="review_note"></textarea>
+      <p class="small warning">批准会自动开通 Linux 成员并创建待激活 Portal 账号。需要密码和 TOTP 再次确认。</p>
+      <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+      <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+      <button type="submit">批准并生成激活码</button>
+    </form>
+  </section>
+  <section class="card">
+    <h2>拒绝</h2>
+    <form method="post" action="/admin/registrations/{{ request_row.request_id }}/reject">
+      <input type="hidden" name="_csrf" value="{{ csrf }}">
+      <input type="hidden" name="expected_version" value="{{ request_row.version }}">
+      <label for="reject_note">申请人可见的原因</label>
+      <textarea id="reject_note" name="review_note" required></textarea>
+      <p class="small warning">拒绝不会创建账号或成员。需要密码和 TOTP 再次确认。</p>
+      <label>当前密码</label><input type="password" name="password" autocomplete="current-password" required>
+      <label>当前 TOTP</label><input type="text" name="totp" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+      <button class="danger" type="submit">拒绝申请</button>
+    </form>
+  </section>
+</div>
+{% endif %}
+{% endblock %}

@@ -5,7 +5,8 @@
 本仓库是 Citespec 实验室共享 GPU 服务器的独立基础设施仓库，核心实现为
 `citespec-resource`。该实现提供受 SSH 策略约束的成员 CLI、以 root 运行并仅监听
 Unix socket 的 Broker、SQLite 状态存储、Docker 容器生命周期管理、资源排队、
-monitor/maintenance 模式、重启对账，以及仅绑定回环地址的本地 Web GUI。
+monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web GUI，以及供校园网/NJU VPN
+使用的成员 Portal。
 
 本仓库不依附于研究仓库，不是 `reconstruction` 或 `optic_system` 的 submodule。
 本仓库不修改研究仓库的 Meta pin，不读取测试数据，也不操作研究实验环境。
@@ -18,11 +19,12 @@ monitor/maintenance 模式、重启对账，以及仅绑定回环地址的本地
 | 范围 | 状态 | 证据 |
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
-| 自动化验证 | 完成 | 本地 `400 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
+| 自动化验证 | 完成 | 本地 `448 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
 | CI | 完成 | GitHub Actions 运行 `40315992883`（P0-2）通过 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
 | 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
+| VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；等待内网 DNS/VPN/证书答复 |
 | 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现，CI `40315992883` 通过；实机部署与恢复演练待维护窗口 |
 | 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
 | amax | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
@@ -51,6 +53,10 @@ monitor/maintenance 模式、重启对账，以及仅绑定回环地址的本地
   workspace，且在验收完成前保持禁用。
 - **GUI**：本地 `127.0.0.1` Web UI 与 xterm.js；仅通过 SSH 调用 CLI，不直接连接
   Broker。
+- **VPN Portal**：独立的低权限 `citespec-portal` 服务，仅监听 `127.0.0.1:8770`，
+  由主机 nginx 在校园网/NJU VPN 入口终止 TLS。它只提供新成员注册、账号激活、
+  本人成员信息、只读服务状态，以及管理员审批/成员状态管理；不提供资源申请、
+  释放、队列、Web shell、VS Code 或文件传输。
 - **成员闭环**：低权限 intake 申请页、管理员邀请/审批、root 窄执行器开户、
   中央 SSH 公钥目录、暂停/恢复/撤销与操作重试。成员资格是独立权威记录；
   已批准成员的正常 GPU 使用仍是自助申请，不逐次人工审批。
@@ -66,7 +72,15 @@ monitor/maintenance 模式、重启对账，以及仅绑定回环地址的本地
 - Broker 以 root systemd 服务运行，仅开放 Unix socket，并通过 `SO_PEERCRED` 识别
   用户。Broker socket 必须为 `root:citespec-cli 0660`。
 - CLI 是唯一业务入口。GUI 的数据请求仅调用 CLI `--json`，交互终端仅调用 CLI
-  `shell`。
+  `shell`。VPN Portal 只通过 Broker 的 `portal_*` 窄命令白名单读写审批/成员状态，
+  Broker 会记录实际操作者并重新校验管理员断言；Portal 进程不属于
+  `citespec-admins`。
+- Portal 使用本地账号、Argon2id 密码、TOTP、服务端会话和 CSRF 双重提交校验。
+  激活码一次性、默认 24 小时有效；管理员角色变更仅能通过 CLI 完成；暂停/恢复/
+  撤销等操作要求密码 + TOTP 再认证。
+- Portal 默认 `[portal].enabled = false`。只有内网 DNS、NJU VPN 路由/DNS、TLS
+  证书和 443 防火墙白名单全部验收后，才启动 Portal；不发布公网 A/AAAA，不把
+  公网 443 映射到本机。
 - GPU 按整卡分配，默认 12 小时、最长 36 小时。到期后停止容器并保留 workspace，
   不自动续租。
 - 每用户默认最多 4 张 GPU、4 个 active allocation；管理员同样受预算限制。
@@ -117,6 +131,7 @@ src/citespec_resource/
   db.py              # SQLite schema、连接 PRAGMA、settings
   store.py           # 用户/GPU/claim/allocation/event 事务
   identity.py        # UID/组身份解析与 SO_PEERCRED
+  netutil.py         # nginx 后端的受信客户端 IP 解析
   gpu_audit.py       # 设备指纹与 GPU 权限审计闸门
   workspace_quota.py # workspace 项目配额闸门
   errors.py          # Broker/CLI 共享错误码与退出码
@@ -127,6 +142,7 @@ src/citespec_resource/
   onboarding.py      # setup/doctor：托管 SSH 片段、主机指纹、成员状态
   membership/        # 权威成员状态、审批、开户操作、密钥与 legacy import
   enrollment/        # 低权限公开申请页与回执查询
+  portal/            # VPN-only 成员 Portal、本地账号/TOTP 与窄 Broker 桥
   broker/            # UDS Broker、Docker driver、到期 worker、重启对账
   gui/               # 本地 Web GUI、静态资源与 vendored xterm.js
 deploy/
@@ -138,6 +154,7 @@ deploy/
   verify_gpu_permissions.sh # 只读全 GPU/NVIDIA 设备权限验收
   verify_monitor_only.sh    # 只读 monitor-only 安全验收
   docker/            # 开发容器 Dockerfile、sshd_config、bootstrap.sh
+  nginx/             # 仅示例：VPN 入口 Portal/apply vhost，不含证书
   systemd/udev/sshd/ # 部署模板
 docs/                # 验收、队列、job/文件传输、legacy 权限撤销与交接文档
 tests/               # 配置、数据库与安全规则测试
@@ -156,7 +173,9 @@ uv.lock              # 锁定依赖版本
 - [docs/legacy-access-revocation.md](docs/legacy-access-revocation.md)：旧管理员
   权限撤销与验证清单。
 - [docs/backup-restore.md](docs/backup-restore.md)：状态备份、校验、恢复和失败
-  告警 runbook。
+  告警 runbook（含 `portal.db`）。
+- [docs/server-network-request.md](docs/server-network-request.md)：校园网/NJU VPN
+  入口的 DNS、VPN、防火墙、TLS 证书问题和验收清单。
 - [docs/handoff.md](docs/handoff.md)：当前实施状态、已验证项、目标机待验证项和
   下一会话的操作边界。
 - [docs/guides/member-quickstart.md](docs/guides/member-quickstart.md)：新成员申请、
@@ -250,7 +269,113 @@ citespec-resource gui --server <server-alias> --admin-server <admin-alias>
 
 示例使用 `<server-alias>`；实际值以本地 `lab/resources.local.toml` 或 SSH 配置为准。
 
-## 11. 部署与验收状态
+## 11. VPN-only 成员 Portal（C1）
+
+Portal 是独立于本地 GUI 的低权限 Web 服务，面向成员和管理员使用同一个 HTTPS
+地址；管理员能力来自本地 Portal 账号的 `admin` 角色，不另外部署管理入口。它
+默认关闭，只监听 `127.0.0.1:8770`，由主机 nginx 在校园网/NJU VPN 入口终止 TLS：
+
+```text
+citespec-portal.<lab-domain> → 127.0.0.1:8770   # 成员/管理员 Portal
+citespec-apply.<lab-domain>  → 127.0.0.1:8765   # 旧 intake/申请页，保持独立
+```
+
+公网不发布 A/AAAA，不把公网 443 映射到本机。DNS、VPN 路由/DNS、证书和防火墙
+源地址段由服务器/网络管理确认，详见
+[docs/server-network-request.md](docs/server-network-request.md)。在答复和验收完成前，
+保持 `[portal].enabled = false`，不要启动 `citespec-resource-portal.service`。
+
+### 11.1 Web 范围
+
+允许：
+
+- `/register`：VPN 内新成员注册；提交经 Broker 写入 intake 数据库；
+- `/activate`：使用一次性激活码设置本地密码并绑定 TOTP；
+- `/login`、`/logout`、`/account`：本地账号登录、改密和 TOTP 状态；
+- `/`、`/status`：本人成员资格与只读服务状态；
+- `/admin/registrations`、`/admin/members`、`/admin/audit`：管理员审批、成员
+  暂停/恢复/撤销、激活码重置和审计查看。
+
+明确不提供：GPU/容器申请、释放、队列操作、Web shell、VS Code、文件传输，也不
+代理现有本地 `citespec-resource gui`。这些仍只能通过 CLI/SSH 使用。
+
+### 11.2 账号、审批与激活
+
+1. 申请人在 VPN 内提交 `/register`；Portal 不直接创建 Linux 账号，只通过
+   `portal_registration_submit` 写入 intake。
+2. 管理员在 `/admin/registrations` 查看并审批；审批沿用 Broker 的成员审批与
+   root 开户流程，同时创建（或复用）`pending_activation` Portal 账号。
+3. 一次性激活码只在审批结果页显示一次，默认 24 小时有效；数据库只保存哈希。
+4. 申请人打开 `/activate`，输入用户名和激活码，设置密码并扫描/录入 TOTP。
+5. 账号变为 `active` 后才能登录。成员 `resume` 只恢复 Linux 成员资格，不会把
+   `pending_activation` Portal 账号直接变成 `active`；必须完成激活。
+6. Portal 管理员角色变更仅通过 CLI；暂停/恢复/撤销、审批等 Web 操作要求再次
+   输入密码 + TOTP。首个管理员和后续角色调整见 11.5。
+
+### 11.3 安全与部署约束
+
+- 密码使用 Argon2id；TOTP secret 使用 root-owned 密钥文件加密后落盘；会话 token
+  和激活码只保存哈希；所有 POST 使用服务端会话绑定的 CSRF token。
+- Portal 进程属于 `citespec-portal` 和 `citespec-cli`，不得加入 `citespec-admins`；
+  Broker 只接受 `PORTAL_COMMANDS` 白名单，并重新校验断言的管理员角色。
+- nginx 必须覆盖 `X-Citespec-Client-IP $remote_addr`，应用只信任 loopback 传来的
+  该头；请求体上限与 Portal 一致为 64 KiB。
+- Portal 数据库、审计记录、TOTP 加密密钥和配置树纳入备份；恢复时先停止 Portal
+  writer unit。
+- 页面为 Jinja2 服务端渲染，无 JavaScript；CSP 只允许同源 CSS/图片，禁止 frame、
+  WebSocket 和外部资源。
+
+### 11.4 安装与本地验证
+
+安装器会创建低权限账号、`citespec-portal` 组、状态目录、root-owned 密钥文件和
+`portal.db`，安装 systemd unit；只有 `[portal].enabled = true` 时才 enable，且
+**从不自动 start**。安装示例：
+
+```bash
+bash deploy/install_server.sh --dry-run --skip-preflight
+bash deploy/install_server.sh --yes
+# 网络/证书验收后再执行：
+sudo systemctl start citespec-resource-portal.service
+```
+
+`deploy/nginx/` 中只有 vhost 示例，不包含证书、DNS 或防火墙改动。本地验证命令：
+
+```powershell
+.\.venv\Scripts\python -m pytest tests/test_portal.py tests/test_broker.py tests/test_backup.py -q
+.\.venv\Scripts\python -m ruff check .
+.\.venv\Scripts\python -m mypy src
+```
+
+### 11.5 首个管理员与角色变更（仅 CLI）
+
+Portal 没有 Web 角色管理路由。首个管理员、后续授权和降权都由
+`citespec-admins` 成员通过 Broker 的 `admin_portal_accounts_*` 命令完成；Broker
+会重新校验 Linux 管理员组，Portal 服务账号不能调用这些命令：
+
+```bash
+# 创建首个 Portal 管理员；激活码只显示一次
+citespec-resource admin portal create --username labadmin --role admin \
+  --display-name "Lab Admin" --contact admin@example.invalid
+
+# 查看本地 Portal 账号（不含密码、TOTP 或激活码）
+citespec-resource admin portal list
+
+# 授权/降权；目标账号的现有浏览器会话会被注销
+citespec-resource admin portal set-role --username labadmin --role member
+citespec-resource admin portal set-role --username another --role admin
+```
+
+- 新成员的 Portal 账号由审批流程自动创建为 `member`；如需让某成员成为管理员，
+  必须显式执行 `set-role ... --role admin`。
+- `create` 对同名 `pending_activation` 账号会重新签发一次性激活码；已激活账号
+  请改用 `set-role`，不会通过重复创建绕过激活。
+- 不能把最后一个 `active` 管理员降为普通成员，避免 Portal 失去管理入口；先激活
+  另一个管理员再降权。
+- 角色变更同时写入 Portal 审计和 Broker 审计；审计不记录激活码、密码或 TOTP。
+- 若 `portal.db` 尚未由安装器初始化，命令返回“未初始化”，不会自行创建 root
+  所有的数据库目录。
+
+## 12. 部署与验收状态
 
 部署前依次执行只读检查和安装流程：
 
@@ -268,7 +393,10 @@ bash deploy/verify_monitor_only.sh --member <member>
 状态备份 timer，可用 `--no-timers` 关闭。安装器会将严格审计脚本、GPU 权限验收脚本、root-owned
 成员 shell、窄开户执行器和 intake 服务安装到固定路径，并创建
 `/etc/citespec-resource/authorized-keys.d/`、开户 spool 与低权限 intake 状态目录。
-安装 Python 包时使用 `.[gui]` extras，使 intake/GUI 依赖可用。
+它同时创建 `citespec-portal` 账号/组、`portal.db`、root-owned Portal 密钥和
+systemd unit；`[portal].enabled = true` 时仅 enable，不 start。安装 Python 包时
+使用 `.[gui,portal]` extras，使 intake/GUI/Portal 依赖可用。`deploy/nginx/` 仅是
+vhost 示例，安装器不会修改 nginx、DNS、VPN 或防火墙。
 
 正式成员不再通过手工 `create_user.sh` 直接加入。管理员先在 GUI/CLI 生成邀请，
 申请人通过申请页或 `citespec-resource join` 提交；批准后 Broker 写入固定动作 spool，
@@ -320,14 +448,14 @@ NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-
 在容器 sshd、隧道释放、配额和 target-host 测试全部通过前，不得启用
 `file_transfer_enabled` 或 `vscode_enabled`。
 
-## 12. 开发与验证
+## 13. 开发与验证
 
 生产部署基线为 Python 3.12；本地可使用 Python 3.13。不得使用系统默认的 Python
 3.8。
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\python -m pip install -e ".[dev,gui]"
+.\.venv\Scripts\python -m pip install -e ".[dev,gui,portal]"
 .\.venv\Scripts\python -m pytest -q
 .\.venv\Scripts\python -m ruff check .
 .\.venv\Scripts\python -m ruff format --check .
@@ -360,6 +488,11 @@ citespec-resource start --gpu-count 1                     # 批准后的正常�
 片段和 `~/.config/citespec-resource/client.toml`（仅连接信息，不复制服务器硬件/策略
 配置），不覆盖已有 SSH 配置或私钥。工作站日常命令在无本地 Broker socket 时
 经 SSH 中继到服务器，不要求本地运行 Broker。
+
+Portal 上线后，成员在 VPN 内打开 `https://citespec-portal.<lab-domain>/register`
+提交注册；批准后使用一次性激活码完成密码/TOTP 激活。Portal 只用于账号、成员状态
+和服务状态；GPU/容器申请、释放、队列、Shell、VS Code 和文件传输仍使用上面的
+CLI/SSH 命令。
 
 新成员申请、配置与日常使用见 `docs/guides/member-quickstart.md`；管理员审批与
 管理见 `docs/guides/admin-membership.md`。实现报告见

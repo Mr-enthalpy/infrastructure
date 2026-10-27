@@ -3,6 +3,7 @@
 The backup set contains:
 - the broker SQLite database, copied through SQLite's backup API;
 - the intake SQLite database when configured;
+- the portal SQLite database when it exists;
 - the root-owned ``/etc/citespec-resource`` configuration/key directory;
 - the provisioning spool, including in-flight and completed operations.
 
@@ -43,6 +44,7 @@ WRITER_UNITS = (
     "citespec-resource-provision.service",
     "citespec-resource-intake.service",
     "citespec-resource-broker.service",
+    "citespec-resource-portal.service",
 )
 _STATE_BACKUP_NAME = re.compile(r"^state-\d{8}-\d{6}-\d+$")
 
@@ -63,7 +65,7 @@ def _chmod(path: Path, mode: int) -> None:
 def _read_config_paths(
     config_path: Path,
     state_db_override: Path | None = None,
-) -> tuple[Path, Path | None, Path | None, Path]:
+) -> tuple[Path, Path | None, Path | None, Path | None, Path]:
     try:
         with config_path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -89,7 +91,14 @@ def _read_config_paths(
     spool_dir = (
         Path(spool_value).expanduser() if isinstance(spool_value, str) and spool_value else None
     )
-    return state_db, intake_db, spool_dir, config_path.parent
+    portal = data.get("portal")
+    if not isinstance(portal, dict):
+        portal = {}
+    portal_value = portal.get("db_path")
+    portal_db = (
+        Path(portal_value).expanduser() if isinstance(portal_value, str) and portal_value else None
+    )
+    return state_db, intake_db, spool_dir, portal_db, config_path.parent
 
 
 def _sqlite_backup(source: Path, destination: Path) -> None:
@@ -198,7 +207,7 @@ def create_backup(
 
     config = Path(config_path)
     root = Path(backup_root)
-    state_db, intake_db, spool_dir, config_dir = _read_config_paths(
+    state_db, intake_db, spool_dir, portal_db, config_dir = _read_config_paths(
         config,
         Path(state_db_override) if state_db_override is not None else None,
     )
@@ -210,6 +219,8 @@ def create_backup(
         raise BackupError(f"intake database does not exist: {intake_db}")
     if spool_dir is not None and not spool_dir.is_dir():
         raise BackupError(f"provisioning spool does not exist: {spool_dir}")
+    if portal_db is not None and not portal_db.is_file():
+        portal_db = None
 
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     _chmod(root, 0o700)
@@ -224,6 +235,8 @@ def create_backup(
         _sqlite_backup(state_db, temporary / "state.db")
         if intake_db is not None:
             _sqlite_backup(intake_db, temporary / "intake.db")
+        if portal_db is not None:
+            _sqlite_backup(portal_db, temporary / "portal.db")
         # Preserve the whole root-owned config tree, including central member
         # keys. Symlinks are copied as links, never followed during backup.
         shutil.copytree(
@@ -250,6 +263,7 @@ def create_backup(
                 "config_dir": str(config_dir),
                 "state_db": str(state_db),
                 "intake_db": str(intake_db) if intake_db is not None else None,
+                "portal_db": str(portal_db) if portal_db is not None else None,
                 "spool_dir": str(spool_dir) if spool_dir is not None else None,
             },
             "files": _manifest_files(temporary),
@@ -297,7 +311,7 @@ def verify_backup(backup_dir: str | Path) -> dict[str, Any]:
             raise BackupError(f"backup file size mismatch: {path}")
         if _sha256(path) != str(entry.get("sha256", "")):
             raise BackupError(f"backup file checksum mismatch: {path}")
-        if key in {"state.db", "intake.db"}:
+        if key in {"state.db", "intake.db", "portal.db"}:
             _sqlite_integrity(path)
     if "state.db" not in seen:
         raise BackupError(f"backup manifest has no state.db: {manifest_path}")
@@ -306,6 +320,8 @@ def verify_backup(backup_dir: str | Path) -> dict[str, Any]:
         raise BackupError(f"backup manifest has no sources: {manifest_path}")
     if sources.get("intake_db") is not None and "intake.db" not in seen:
         raise BackupError(f"backup manifest has no intake.db: {manifest_path}")
+    if sources.get("portal_db") is not None and "portal.db" not in seen:
+        raise BackupError(f"backup manifest has no portal.db: {manifest_path}")
     config_value = sources.get("config")
     config_dir_value = sources.get("config_dir")
     if not isinstance(config_value, str) or not isinstance(config_dir_value, str):
@@ -491,7 +507,7 @@ def restore_backup(
     root = Path(backup_dir)
     payload = verify_backup(root)
     config = Path(config_path)
-    state_target, intake_target, spool_target, config_dir = _read_config_paths(
+    state_target, intake_target, spool_target, portal_target, config_dir = _read_config_paths(
         config,
         Path(state_db) if state_db is not None else None,
     )
@@ -525,6 +541,15 @@ def restore_backup(
             staged_intake = _stage_sqlite(intake_source, intake_target)
             _inherit_owner(staged_intake, intake_target)
             staged.append(staged_intake)
+        staged_portal: Path | None = None
+        if portal_target is not None:
+            portal_source = root / "portal.db"
+            if portal_source.is_file():
+                staged_portal = _stage_sqlite(portal_source, portal_target)
+                _inherit_owner(staged_portal, portal_target)
+                staged.append(staged_portal)
+            elif payload.get("sources", {}).get("portal_db") is not None:
+                raise BackupError("backup does not contain the configured portal database")
         staged_spool: Path | None = None
         if spool_target is not None:
             spool_source = root / SPOOL_BACKUP_NAME
@@ -539,9 +564,13 @@ def restore_backup(
                 raise BackupError(f"backup has no config directory: {source_etc}")
             staged_config = _stage_tree(source_etc, config_dir)
             staged.append(staged_config)
-            restored_state, restored_intake, restored_spool, _ = _read_config_paths(
-                staged_config / config.name
-            )
+            (
+                restored_state,
+                restored_intake,
+                restored_spool,
+                restored_portal,
+                _,
+            ) = _read_config_paths(staged_config / config.name)
             if restored_state != state_target:
                 raise BackupError(
                     "restored config server.state_db does not match the restore target"
@@ -554,12 +583,19 @@ def restore_backup(
                 raise BackupError(
                     "restored config onboarding.provisioning_spool does not match the target"
                 )
+            if restored_portal != portal_target:
+                raise BackupError(
+                    "restored config portal.db_path does not match the restore target"
+                )
 
         swaps.append((state_target, _swap_in(staged_state, state_target, sqlite=True)))
         staged.remove(staged_state)
         if staged_intake is not None and intake_target is not None:
             swaps.append((intake_target, _swap_in(staged_intake, intake_target, sqlite=True)))
             staged.remove(staged_intake)
+        if staged_portal is not None and portal_target is not None:
+            swaps.append((portal_target, _swap_in(staged_portal, portal_target, sqlite=True)))
+            staged.remove(staged_portal)
         if staged_spool is not None and spool_target is not None:
             swaps.append((spool_target, _swap_in(staged_spool, spool_target)))
             staged.remove(staged_spool)
@@ -572,6 +608,8 @@ def restore_backup(
         _sqlite_integrity(state_target)
         if intake_target is not None:
             _sqlite_integrity(intake_target)
+        if portal_target is not None and portal_target.is_file():
+            _sqlite_integrity(portal_target)
         if spool_target is not None and not spool_target.is_dir():
             raise BackupError("restored provisioning spool is missing")
         if restore_config and not config_dir.is_dir():
@@ -590,6 +628,7 @@ def restore_backup(
         "backup": str(root),
         "state_db": str(state_target),
         "intake_db": str(intake_target) if intake_target is not None else None,
+        "portal_db": str(portal_target) if portal_target is not None else None,
         "spool_dir": str(spool_target) if spool_target is not None else None,
         "config_restored": restore_config,
         "mode": "maintenance",

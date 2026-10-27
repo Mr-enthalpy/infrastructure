@@ -31,12 +31,16 @@ BACKUP_UNIT=/etc/systemd/system/citespec-resource-backup.service
 BACKUP_TIMER=/etc/systemd/system/citespec-resource-backup.timer
 ALERT_LOG_DIR=/var/log/citespec-resource
 INTAKE_UNIT=/etc/systemd/system/citespec-resource-intake.service
+PORTAL_UNIT=/etc/systemd/system/citespec-resource-portal.service
 PROVISION_UNIT=/etc/systemd/system/citespec-resource-provision.service
 PROVISION_PATH=/etc/systemd/system/citespec-resource-provision.path
 CENTRAL_KEY_DIR=/etc/citespec-resource/authorized-keys.d
 PROVISION_SPOOL_DIR=/var/lib/citespec-resource/provision
 INTAKE_STATE_DIR=/var/lib/citespec-resource-intake
 INTAKE_USER=citespec-intake
+PORTAL_STATE_DIR=/var/lib/citespec-resource-portal
+PORTAL_USER=citespec-portal
+PORTAL_SECRET_FILE=/etc/citespec-resource/portal-secret.key
 BANNER_FILE=/etc/ssh/citespec-resource-banner.txt
 LEGACY_LOGROTATE=/etc/logrotate.d/citespec-resource
 LOGIN_WRAPPER=/usr/local/bin/citespec-resource-login
@@ -56,7 +60,7 @@ NVIDIA_SMI=/usr/bin/nvidia-smi
 NVIDIA_SMI_REAL=/usr/bin/nvidia-smi.real
 NVIDIA_MODPROBE=/usr/bin/nvidia-modprobe
 NVIDIA_MODPROBE_REAL=/usr/bin/nvidia-modprobe.real
-CITESPEC_RESOURCE_GROUPS=(citespec-members citespec-cli citespec-admins citespec-gpu)
+CITESPEC_RESOURCE_GROUPS=(citespec-members citespec-cli citespec-admins citespec-gpu citespec-portal)
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -88,7 +92,8 @@ Options:
   --dry-run             Print actions without changing the host.
   --yes                 Required for a real (non-dry-run) installation.
   --skip-preflight      Skip deploy/preflight.sh (not recommended).
-  --start               Start the broker after installation (default: install only).
+  --start               Start the broker and intake after installation (default:
+                        install only). The portal is never auto-started.
   --allow-active        Allow an active-mode config after training and approval.
                         A fresh database still starts in monitor; existing active
                         leases are preserved only when deployment_allowed=true.
@@ -346,6 +351,15 @@ with open(sys.argv[1], "rb") as handle:
 print("true" if data.get("policy", {}).get("allow_root_ssh_keys", False) else "false")
 PY
 ) || fail "could not parse config: $CONFIG_SOURCE"
+CONFIG_PORTAL_ENABLED=$("$PYTHON_BIN" - "$CONFIG_SOURCE" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+print("true" if data.get("portal", {}).get("enabled", False) else "false")
+PY
+) || fail "could not parse config: $CONFIG_SOURCE"
 if [ "$CONFIG_MODE" = "active" ] && [ "$ALLOW_ACTIVE" -ne 1 ]; then
     fail "config is in active mode; pass --allow-active only after training and approval"
 fi
@@ -400,6 +414,24 @@ else
         --no-create-home --shell /usr/sbin/nologin "$INTAKE_USER"
 fi
 
+if getent passwd "$PORTAL_USER" >/dev/null 2>&1; then
+    ok "account exists: $PORTAL_USER"
+else
+    note "creating low-privilege portal account: $PORTAL_USER"
+    run useradd --system --gid "$PORTAL_USER" --groups citespec-cli \
+        --home-dir "$PORTAL_STATE_DIR" --no-create-home \
+        --shell /usr/sbin/nologin "$PORTAL_USER"
+fi
+if id -nG "$PORTAL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-cli; then
+    ok "$PORTAL_USER may connect to the broker socket via citespec-cli"
+else
+    note "adding $PORTAL_USER to citespec-cli for broker socket access"
+    run usermod -aG citespec-cli "$PORTAL_USER"
+fi
+if id -nG "$PORTAL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-admins; then
+    fail "$PORTAL_USER must not be a member of citespec-admins"
+fi
+
 if [ -n "$(effective_members citespec-gpu)" ]; then
     fail "citespec-gpu has effective members; remove them before installing"
 fi
@@ -423,16 +455,16 @@ done < <(effective_members citespec-admins)
 if [ "$DRY_RUN" -eq 0 ]; then
     run install -d -o root -g root -m 0755 "$PREFIX"
     if have uv; then
-        note "installing package with uv sync --frozen --no-dev --no-editable --extra gui"
+        note "installing package with uv sync --frozen --no-dev --no-editable --extra gui --extra portal"
         run env UV_PROJECT_ENVIRONMENT="$VENV" uv sync \
-            --frozen --no-dev --no-editable --extra gui --project "$REPO_ROOT" --python "$PYTHON_BIN"
+            --frozen --no-dev --no-editable --extra gui --extra portal --project "$REPO_ROOT" --python "$PYTHON_BIN"
     else
         warn "uv is not installed; falling back to pip (versions may drift)"
         if [ ! -x "$VENV/bin/python" ]; then
             run "$PYTHON_BIN" -m venv "$VENV"
         fi
         run "$VENV/bin/python" -m pip install --upgrade pip
-        run "$VENV/bin/python" -m pip install "$REPO_ROOT[gui]"
+        run "$VENV/bin/python" -m pip install "$REPO_ROOT[gui,portal]"
     fi
     [ -x "$VENV/bin/python" ] || fail "venv was not created: $VENV"
     [ -x "$VENV/bin/citespec-resource" ] || fail "citespec-resource entry point is missing"
@@ -440,11 +472,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
 else
     run_shell "install -d -o root -g root -m 0755 $PREFIX"
     if have uv; then
-        run_shell "UV_PROJECT_ENVIRONMENT=$VENV uv sync --frozen --no-dev --no-editable --extra gui --project $REPO_ROOT --python $PYTHON_BIN"
+        run_shell "UV_PROJECT_ENVIRONMENT=$VENV uv sync --frozen --no-dev --no-editable --extra gui --extra portal --project $REPO_ROOT --python $PYTHON_BIN"
     else
         run_shell "$PYTHON_BIN -m venv $VENV"
         run_shell "$VENV/bin/python -m pip install --upgrade pip"
-        run_shell "$VENV/bin/python -m pip install $REPO_ROOT[gui]"
+        run_shell "$VENV/bin/python -m pip install $REPO_ROOT[gui,portal]"
     fi
 fi
 
@@ -531,6 +563,9 @@ else
     if [ "$EFFECTIVE_MODE" = "active" ] && [ "$ALLOW_ACTIVE" -ne 1 ]; then
         fail "installed config is active; pass --allow-active only after approval"
     fi
+    CONFIG_PORTAL_ENABLED=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
+        'import os; from citespec_resource.config import load_config; print("true" if load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).portal.enabled else "false")') \
+        || fail "could not read portal.enabled from config"
     ok "config validated"
     WORKSPACE_ROOT=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
         'import os; from citespec_resource.config import load_config; print(load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).server.workspace_root)') \
@@ -547,6 +582,92 @@ run install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 run install -d -o root -g root -m 0750 "$ALERT_LOG_DIR"
 run install -d -o "$INTAKE_USER" -g "$INTAKE_USER" -m 0700 "$INTAKE_STATE_DIR"
 ok "intake state directory ready: $INTAKE_STATE_DIR (owned by $INTAKE_USER)"
+run install -d -o "$PORTAL_USER" -g "$PORTAL_USER" -m 0750 "$PORTAL_STATE_DIR"
+ok "portal state directory ready: $PORTAL_STATE_DIR (owned by $PORTAL_USER)"
+
+# The portal secret encrypts TOTP seeds at rest.  root owns it so the service
+# cannot rewrite its own key material; the portal group has read-only access.
+if [ "$DRY_RUN" -eq 1 ]; then
+    note "would create/secure $PORTAL_SECRET_FILE (root:$PORTAL_USER 0640)"
+else
+    backup_file "$PORTAL_SECRET_FILE"
+    if [ ! -f "$PORTAL_SECRET_FILE" ]; then
+        (umask 077; "$VENV/bin/python" - "$PORTAL_SECRET_FILE" <<'PY'
+import base64
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    raise SystemExit(0)
+path.write_text(base64.urlsafe_b64encode(os.urandom(32)).decode("ascii") + "\n", encoding="ascii")
+PY
+        ) || fail "could not create portal secret: $PORTAL_SECRET_FILE"
+    fi
+    run chown root:"$PORTAL_USER" "$PORTAL_SECRET_FILE"
+    run chmod 0640 "$PORTAL_SECRET_FILE"
+    ok "portal secret ready: $PORTAL_SECRET_FILE (root:$PORTAL_USER 0640)"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    note "would initialize the intake and portal SQLite databases"
+else
+    INTAKE_DB=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
+        'import os; from citespec_resource.config import load_config; print(load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).onboarding.intake_db)') \
+        || fail "could not read onboarding.intake_db from config"
+    run install -d -o "$INTAKE_USER" -g "$INTAKE_USER" -m 0700 "$(dirname "$INTAKE_DB")"
+    backup_file "$INTAKE_DB"
+    (umask 077; "$VENV/bin/python" - "$INTAKE_DB" <<'PY'
+import sys
+
+from citespec_resource.enrollment import store
+
+connection = store.init_intake_db(sys.argv[1])
+connection.close()
+PY
+    ) || fail "intake SQLite initialization failed"
+    [ -f "$INTAKE_DB" ] || fail "intake database was not created: $INTAKE_DB"
+    run chown "$INTAKE_USER":"$INTAKE_USER" "$INTAKE_DB"
+    run chmod 0600 "$INTAKE_DB"
+    for suffix in -wal -shm; do
+        if [ -f "$INTAKE_DB$suffix" ]; then
+            run chown "$INTAKE_USER":"$INTAKE_USER" "$INTAKE_DB$suffix"
+            run chmod 0600 "$INTAKE_DB$suffix"
+        fi
+    done
+    ok "intake SQLite initialized: $INTAKE_DB"
+
+    PORTAL_DB=$(CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
+        'import os; from citespec_resource.config import load_config; print(load_config(os.environ["CITESPEC_RESOURCE_CONFIG"]).portal.db_path)') \
+        || fail "could not read portal.db_path from config"
+    run install -d -o "$PORTAL_USER" -g "$PORTAL_USER" -m 0750 "$(dirname "$PORTAL_DB")"
+    backup_file "$PORTAL_DB"
+    (umask 077; "$VENV/bin/python" - "$PORTAL_DB" <<'PY'
+import sys
+
+from citespec_resource.portal import store
+
+connection = store.init_portal_db(sys.argv[1])
+connection.close()
+PY
+    ) || fail "portal SQLite initialization failed"
+    [ -f "$PORTAL_DB" ] || fail "portal database was not created: $PORTAL_DB"
+    run chown "$PORTAL_USER":"$PORTAL_USER" "$PORTAL_DB"
+    run chmod 0600 "$PORTAL_DB"
+    for suffix in -wal -shm; do
+        if [ -f "$PORTAL_DB$suffix" ]; then
+            run chown "$PORTAL_USER":"$PORTAL_USER" "$PORTAL_DB$suffix"
+            run chmod 0600 "$PORTAL_DB$suffix"
+        fi
+    done
+    case "$PORTAL_DB" in
+        /var/lib/citespec-resource-portal/*) ;;
+        *) warn "portal.db_path is outside $PORTAL_STATE_DIR; update systemd ReadWritePaths" ;;
+    esac
+    ok "portal SQLite initialized: $PORTAL_DB"
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
     note "would initialize SQLite; fresh install uses monitor, active leases keep management"
 else
@@ -619,14 +740,17 @@ install_file 0644 \
 install_file 0644 \
     "$SCRIPT_DIR/systemd/citespec-resource-intake.service" "$INTAKE_UNIT"
 install_file 0644 \
+    "$SCRIPT_DIR/systemd/citespec-resource-portal.service" "$PORTAL_UNIT"
+install_file 0644 \
     "$SCRIPT_DIR/systemd/citespec-resource-provision.service" "$PROVISION_UNIT"
 install_file 0644 \
     "$SCRIPT_DIR/systemd/citespec-resource-provision.path" "$PROVISION_PATH"
 install_file 0644 \
     "$SCRIPT_DIR/systemd/citespec-gpu-permissions.service" "$GPU_PERM_UNIT"
 if [ "$DRY_RUN" -eq 0 ] && have systemd-analyze; then
-    systemd-analyze verify "$SYSTEMD_UNIT" "$INTAKE_UNIT" "$PROVISION_UNIT" \
-        "$PROVISION_PATH" "$GPU_PERM_UNIT" || fail "systemd unit validation failed"
+    systemd-analyze verify "$SYSTEMD_UNIT" "$INTAKE_UNIT" "$PORTAL_UNIT" \
+        "$PROVISION_UNIT" "$PROVISION_PATH" "$GPU_PERM_UNIT" \
+        || fail "systemd unit validation failed"
     ok "systemd units validated"
 fi
 if [ -d /run/citespec-resource ]; then
@@ -637,7 +761,13 @@ run systemctl enable citespec-resource-broker.service
 run systemctl enable citespec-resource-intake.service
 run systemctl enable citespec-resource-provision.path
 run systemctl enable citespec-gpu-permissions.service
-ok "broker, intake, provisioning, and GPU-permission units installed and enabled"
+if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
+    run systemctl enable citespec-resource-portal.service
+    note "portal unit enabled but not started; start it only after DNS/VPN/TLS acceptance"
+else
+    note "portal unit installed but left disabled because [portal].enabled=false"
+fi
+ok "broker, intake, provisioning, GPU-permission, and portal units installed"
 run "$GPU_FIX_INSTALL"
 ok "current GPU device permissions applied"
 
@@ -755,8 +885,16 @@ if [ "$START" -eq 1 ]; then
             || fail "intake failed to start; inspect journalctl -u citespec-resource-intake"
         ok "broker and intake started (${MODE:-unknown} mode)"
     fi
+    if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
+        note "portal is enabled but was not started; start it after DNS/VPN/TLS acceptance"
+    fi
 else
     note "broker installed but not started; use: systemctl start citespec-resource-broker"
+    if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
+        note "portal enabled; use: systemctl start citespec-resource-portal"
+    else
+        note "portal disabled; use: systemctl start citespec-resource-portal after enabling [portal]"
+    fi
     if [ "$DRY_RUN" -eq 0 ] && systemctl is-active --quiet citespec-resource-broker.service; then
         warn "broker is already running; restart it to apply the installed files"
     fi
@@ -788,3 +926,4 @@ printf '\nInstallation complete. Next steps:\n'
 printf '  1. create member/admin accounts with deploy/create_user.sh\n'
 printf '  2. keep policy.mode=monitor and run deploy/verify_monitor_only.sh\n'
 printf '  3. do not switch to active mode until training ends and approval is recorded\n'
+printf '  4. install the nginx vhost and start the portal only after DNS/VPN/TLS acceptance\n'

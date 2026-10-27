@@ -18,6 +18,7 @@ from citespec_resource.gpu_audit import GpuAuditResult
 from citespec_resource.identity import Identity
 from citespec_resource.legacy_audit import LegacyAuditResult
 from citespec_resource.models import GPU
+from citespec_resource.portal import store as portal_store
 from citespec_resource.workspace_quota import QuotaCheckResult
 from tests.fakes import FakeDocker, FakeIdentityResolver, FakeShellSession
 
@@ -25,6 +26,25 @@ FIXED = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 ALICE = Identity(uid=1000, gid=1000, username="alice", role="member", is_admin=False)
 BOB = Identity(uid=1001, gid=1001, username="bob", role="member", is_admin=False)
 ADMIN = Identity(uid=0, gid=0, username="root", role="admin", is_admin=True)
+PORTAL = Identity(
+    uid=2000,
+    gid=2000,
+    username="citespec-portal",
+    role="member",
+    is_admin=False,
+    is_portal=True,
+)
+VALID_PORTAL_APPLICATION = {
+    "display_name": "Portal Applicant",
+    "username": "portalmember",
+    "affiliation": "Lab A",
+    "purpose": "training runs",
+    "contact": "portal@example.invalid",
+    "nickname": "",
+    "public_contact": "",
+    "agree_terms": "1",
+    "public_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI portal@lab"],
+}
 
 
 def _passing_member_quota(workspace, uid, limit):
@@ -49,10 +69,11 @@ def _broker(
     member_quota_check=None,
     member_quota_provision=None,
     provisioning=None,
+    identity_resolver=None,
     clock=None,
 ):
     fake_docker = docker or FakeDocker()
-    resolver = FakeIdentityResolver(
+    resolver = identity_resolver or FakeIdentityResolver(
         {
             ALICE.uid: ALICE,
             BOB.uid: BOB,
@@ -1948,6 +1969,223 @@ async def test_reconcile_finalizes_cleanup_pending(tmp_path, active_config):
     # can be allocated again immediately.
     freed = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, BOB)
     assert freed["data"]["status"] == "active"
+
+
+async def test_portal_bridge_is_narrow_and_audits_admin_actor(tmp_path, active_config):
+    config = replace(
+        active_config,
+        onboarding=replace(
+            active_config.onboarding,
+            intake_db=str(tmp_path / "intake.db"),
+        ),
+    )
+    resolver = FakeIdentityResolver({PORTAL.uid: PORTAL})
+    broker, _ = _broker(tmp_path, config, identity_resolver=resolver)
+    member_actor = {
+        "user_id": "member-1",
+        "username": "alice",
+        "role": "member",
+        "member_id": "m-1",
+    }
+    admin_actor = {
+        "user_id": "admin-1",
+        "username": "admin",
+        "role": "admin",
+        "member_id": "",
+    }
+
+    submitted = await _call(
+        broker,
+        "portal_registration_submit",
+        {
+            "actor": {
+                "user_id": "anonymous",
+                "username": "anonymous",
+                "role": "applicant",
+                "member_id": "",
+            },
+            "application": VALID_PORTAL_APPLICATION,
+        },
+        PORTAL,
+    )
+    assert submitted["ok"] is True
+    assert submitted["data"]["request_id"]
+    assert submitted["data"]["receipt_secret"]
+
+    listed = await _call(
+        broker,
+        "portal_requests_list",
+        {"actor": admin_actor, "status": "pending_review"},
+        PORTAL,
+    )
+    assert listed["ok"] is True
+    assert [item["username"] for item in listed["data"]] == ["portalmember"]
+
+    status = await _call(broker, "portal_status", {"actor": member_actor}, PORTAL)
+    assert status["ok"] is True
+    assert status["data"]["mode"] in {"monitor", "active", "maintenance"}
+
+    denied_self = await _call(
+        broker,
+        "portal_member_self",
+        {"actor": member_actor, "member_id": "m-2"},
+        PORTAL,
+    )
+    assert denied_self["ok"] is False
+    assert denied_self["error"]["code"] == "forbidden"
+
+    denied_mutation = await _call(
+        broker,
+        "portal_members_suspend",
+        {"actor": member_actor, "member_id": "m-1", "reason": "test"},
+        PORTAL,
+    )
+    assert denied_mutation["ok"] is False
+    assert denied_mutation["error"]["code"] == "forbidden"
+
+    denied_non_portal = await _call(
+        broker,
+        "portal_status",
+        {"actor": member_actor},
+        ALICE,
+    )
+    assert denied_non_portal["ok"] is False
+    assert denied_non_portal["error"]["code"] == "forbidden"
+
+    audit = await _call(
+        broker,
+        "portal_audit",
+        {"actor": admin_actor, "limit": 50},
+        PORTAL,
+    )
+    assert audit["ok"] is True
+    actions = {event["action"] for event in audit["data"]["events"]}
+    assert "portal_registration_submitted" in actions
+
+
+async def test_portal_admin_role_changes_are_cli_only_and_audited(tmp_path, active_config):
+    config = replace(
+        active_config,
+        portal=replace(
+            active_config.portal,
+            db_path=str(tmp_path / "portal.db"),
+        ),
+    )
+    connection = portal_store.init_portal_db(config.portal.db_path)
+    connection.close()
+    broker, _ = _broker(tmp_path, config)
+
+    denied = await _call(
+        broker,
+        "admin_portal_accounts_create",
+        {"username": "firstadmin", "role": "admin"},
+        ALICE,
+    )
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "forbidden"
+
+    created = await _call(
+        broker,
+        "admin_portal_accounts_create",
+        {
+            "username": "firstadmin",
+            "role": "admin",
+            "member_id": "",
+            "linux_username": "",
+            "display_name": "First Admin",
+            "contact": "admin@example.invalid",
+        },
+        ADMIN,
+    )
+    assert created["ok"] is True
+    assert created["data"]["activation_code"]
+    assert created["data"]["user"]["role"] == "admin"
+
+    second = await _call(
+        broker,
+        "admin_portal_accounts_create",
+        {"username": "secondadmin", "role": "admin"},
+        ADMIN,
+    )
+    assert second["ok"] is True
+    connection = portal_store.connect(config.portal.db_path)
+    try:
+        portal_store.update_user_status(
+            connection,
+            str(second["data"]["user_id"]),
+            status="active",
+        )
+    finally:
+        connection.close()
+
+    listed = await _call(broker, "admin_portal_accounts_list", {}, ADMIN)
+    assert listed["ok"] is True
+    assert {item["username"] for item in listed["data"]["accounts"]} == {
+        "firstadmin",
+        "secondadmin",
+    }
+
+    demoted = await _call(
+        broker,
+        "admin_portal_accounts_set_role",
+        {"username": "firstadmin", "role": "member"},
+        ADMIN,
+    )
+    assert demoted["ok"] is True
+    assert demoted["data"]["role"] == "member"
+
+    last_admin = await _call(
+        broker,
+        "admin_portal_accounts_set_role",
+        {"username": "secondadmin", "role": "member"},
+        ADMIN,
+    )
+    assert last_admin["ok"] is False
+    assert last_admin["error"]["code"] == "conflict"
+
+    connection = portal_store.connect(config.portal.db_path)
+    try:
+        events = portal_store.list_audit(connection)
+    finally:
+        connection.close()
+    actions = [event["action"] for event in events]
+    assert actions.count("admin_portal_role_changed") == 1
+    assert actions.count("admin_portal_account_created") == 2
+    assert all(
+        "activation_code" not in event["detail"]
+        for event in events
+        if event["action"] == "admin_portal_account_created"
+    )
+
+
+async def test_portal_identity_cannot_use_general_admin_commands(tmp_path, active_config):
+    broker, _ = _broker(
+        tmp_path,
+        active_config,
+        identity_resolver=FakeIdentityResolver({PORTAL.uid: PORTAL}),
+    )
+    admin_actor = {
+        "user_id": "admin-1",
+        "username": "admin",
+        "role": "admin",
+        "member_id": "",
+    }
+    denied = await _call(
+        broker,
+        "admin_members_list",
+        {},
+        PORTAL,
+    )
+    assert denied["ok"] is False
+
+    listed = await _call(
+        broker,
+        "portal_members_list",
+        {"actor": admin_actor},
+        PORTAL,
+    )
+    assert listed["ok"] is True
+    assert listed["data"]["members"] == []
 
 
 async def test_storage_gate_constrains_by_free_space_entitlements(

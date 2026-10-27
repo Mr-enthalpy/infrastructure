@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}新成员注册 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>新成员注册</h1>
+<div class="card">
+  <p class="muted">
+    提交后由管理员审批。批准后管理员会通过实验室渠道把一次性激活码发给你；
+    激活时再设置密码和 TOTP。请提交 SSH <strong>公钥</strong>，不要提交私钥。
+  </p>
+  <form method="post" action="/register">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label for="display_name">姓名</label>
+    <input id="display_name" name="display_name" type="text" maxlength="80" value="{{ form.get('display_name', '') if form else '' }}" required>
+    <label for="username">期望的 Linux / Portal 用户名</label>
+    <input id="username" name="username" type="text" maxlength="32" pattern="[a-z_][a-z0-9_-]{0,31}" value="{{ form.get('username', '') if form else '' }}" required>
+    <p class="small muted">小写字母或下划线开头，仅含 a-z、0-9、下划线、连字符。</p>
+    <label for="affiliation">院系 / 单位</label>
+    <input id="affiliation" name="affiliation" type="text" maxlength="160" value="{{ form.get('affiliation', '') if form else '' }}" required>
+    <label for="contact">联系方式（邮箱 / 手机 / 微信）</label>
+    <input id="contact" name="contact" type="text" maxlength="160" value="{{ form.get('contact', '') if form else '' }}" required>
+    <label for="purpose">用途</label>
+    <textarea id="purpose" name="purpose" maxlength="600" required>{{ form.get('purpose', '') if form else '' }}</textarea>
+    <label for="nickname">昵称（可选）</label>
+    <input id="nickname" name="nickname" type="text" maxlength="60" value="{{ form.get('nickname', '') if form else '' }}">
+    <label for="public_keys">SSH 公钥（每行一个，最多 3 个）</label>
+    <textarea id="public_keys" name="public_keys" required>{{ (form.get('public_keys', []) if form else [])|join('\n') }}</textarea>
+    <label class="check">
+      <input type="checkbox" name="public_contact" value="1" {% if form and form.get('public_contact') %}checked{% endif %}>
+      <span>允许在成员目录中公开我的联系方式</span>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="agree_terms" value="1" {% if form and form.get('agree_terms') %}checked{% endif %} required>
+      <span>我已阅读并同意实验室计算资源使用约定；我理解 Web 仅用于成员/状态/审批，不提供资源申请或释放。</span>
+    </label>
+    <button type="submit">提交申请</button>
+  </form>
+</div>
+{% endblock %}

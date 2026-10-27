@@ -209,11 +209,65 @@ def test_backup_and_alert_units_are_installed_and_failure_wired():
     for name in (
         "citespec-resource-broker.service",
         "citespec-resource-intake.service",
+        "citespec-resource-portal.service",
         "citespec-resource-disk-check.service",
         "citespec-resource-logrotate.service",
     ):
         text = (ROOT / "deploy/systemd" / name).read_text(encoding="utf-8")
         assert "OnFailure=citespec-resource-alert@%n.service" in text
+
+
+def test_portal_deploy_assets_are_vpn_only_and_least_privilege():
+    unit = (ROOT / "deploy/systemd/citespec-resource-portal.service").read_text(encoding="utf-8")
+    assert "User=citespec-portal" in unit
+    assert "Group=citespec-portal" in unit
+    assert "SupplementaryGroups=citespec-cli" in unit
+    assert (
+        "ExecStart=/opt/citespec-resource/.venv/bin/python -m citespec_resource.portal.server"
+    ) in unit
+    assert "StateDirectory=citespec-resource-portal" in unit
+    assert "StateDirectoryMode=0750" in unit
+    assert "ReadWritePaths=/var/lib/citespec-resource-portal" in unit
+    assert "ProtectSystem=strict" in unit
+    assert "NoNewPrivileges=true" in unit
+    assert "CapabilityBoundingSet=" in unit
+    assert "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" in unit
+
+    portal_nginx = (ROOT / "deploy/nginx/citespec-portal.conf.example").read_text(encoding="utf-8")
+    assert "server_name citespec-portal.<lab-domain>;" in portal_nginx
+    assert "proxy_pass http://127.0.0.1:8770;" in portal_nginx
+    assert "proxy_set_header X-Citespec-Client-IP $remote_addr;" in portal_nginx
+    assert "listen <host-private-ip>:443 ssl;" in portal_nginx
+    assert "listen 443 ssl;" not in portal_nginx
+    assert "0.0.0.0:443" not in portal_nginx
+    assert "listen 80" not in portal_nginx
+    assert "client_max_body_size 64k;" in portal_nginx
+
+    apply_nginx = (ROOT / "deploy/nginx/citespec-apply.conf.example").read_text(encoding="utf-8")
+    assert "server_name citespec-apply.<lab-domain>;" in apply_nginx
+    assert "proxy_pass http://127.0.0.1:8765;" in apply_nginx
+    assert "proxy_set_header X-Citespec-Client-IP $remote_addr;" in apply_nginx
+    assert "listen <host-private-ip>:443 ssl;" in apply_nginx
+    assert "listen 443 ssl;" not in apply_nginx
+    assert "0.0.0.0:443" not in apply_nginx
+    assert "listen 80" not in apply_nginx
+
+    installer = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "--extra gui --extra portal" in installer
+    assert "$REPO_ROOT[gui,portal]" in installer
+    assert (
+        "CITESPEC_RESOURCE_GROUPS=(citespec-members citespec-cli "
+        "citespec-admins citespec-gpu citespec-portal)"
+    ) in installer
+    assert "PORTAL_SECRET_FILE=/etc/citespec-resource/portal-secret.key" in installer
+    assert 'chown root:"$PORTAL_USER"' in installer
+    assert "chmod 0640" in installer
+    assert "init_intake_db" in installer
+    assert "init_portal_db" in installer
+    assert "systemctl enable citespec-resource-portal.service" in installer
+    assert "run systemctl start citespec-resource-portal.service" not in installer
+    assert "portal is enabled but was not started" in installer
+    assert "must not be a member of citespec-admins" in installer
 
 
 def test_development_container_image_has_sshd_sudo_and_bootstrap():

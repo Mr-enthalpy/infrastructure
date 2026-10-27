@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}我的账号 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>我的账号</h1>
+<div class="grid">
+  <section class="card">
+    <h2>账号信息</h2>
+    {% if user %}
+      <dl>
+        <dt>用户名</dt><dd>{{ user.username }}</dd>
+        <dt>身份</dt><dd>{{ '管理员' if user.role == 'admin' else '成员' }}</dd>
+        <dt>状态</dt><dd>{{ user.status }}</dd>
+        <dt>创建时间</dt><dd>{{ user.created_at }}</dd>
+        <dt>最近登录</dt><dd>{{ user.last_login_at or '—' }}</dd>
+      </dl>
+    {% endif %}
+  </section>
+  <section class="card">
+    <h2>成员资格</h2>
+    {% if member_error %}<div class="error">{{ member_error }}</div>{% endif %}
+    {% if member %}
+      <dl>
+        <dt>状态</dt><dd>{{ member.member.status }}</dd>
+        <dt>有效期</dt><dd>{{ member.member.valid_until or '未设置' }}</dd>
+        <dt>Linux 用户</dt><dd><code>{{ member.member.linux_username or '—' }}</code></dd>
+        <dt>Linux UID</dt><dd>{{ member.member.linux_uid if member.member.linux_uid is not none else '开通中' }}</dd>
+      </dl>
+      <h3>登录密钥</h3>
+      <ul>
+        {% for key in member['keys'] %}
+          <li><code>{{ key.fingerprint }}</code> <span class="muted">{{ key.status }}</span></li>
+        {% else %}
+          <li class="muted">没有密钥。</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="muted">尚未关联成员记录。</p>
+    {% endif %}
+  </section>
+</div>
+<section class="card">
+  <h2>修改密码</h2>
+  <p class="muted">需要当前密码和当前 TOTP；修改后其他浏览器会话将退出。</p>
+  <form method="post" action="/account/password">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label for="current_password">当前密码</label>
+    <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+    <label for="reauth_totp">当前 TOTP</label>
+    <input id="reauth_totp" name="totp" type="text" inputmode="numeric" pattern="[0-9 ]{6,7}" autocomplete="one-time-code" required>
+    <label for="new_password">新密码（至少 12 个字符）</label>
+    <input id="new_password" name="new_password" type="password" autocomplete="new-password" required>
+    <label for="new_password_confirm">再次输入新密码</label>
+    <input id="new_password_confirm" name="new_password_confirm" type="password" autocomplete="new-password" required>
+    <button type="submit">更新密码</button>
+  </form>
+</section>
+{% endblock %}

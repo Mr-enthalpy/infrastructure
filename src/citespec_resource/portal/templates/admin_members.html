@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}成员管理 · {{ app_name }}{% endblock %}
+{% block content %}
+<h1>成员管理</h1>
+<div class="card">
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>成员编号</th><th>Linux 用户</th><th>姓名</th><th>成员状态</th><th>有效期</th><th>Portal 账号</th></tr></thead>
+      <tbody>
+        {% for member in members %}
+        {% set account = portal_users.get(member.member_id) %}
+        <tr>
+          <td><a href="/admin/members/{{ member.member_id }}"><code>{{ member.member_id[:12] }}</code></a></td>
+          <td><code>{{ member.linux_username or '—' }}</code></td>
+          <td>{{ member.display_name }}</td>
+          <td>{{ member.status }}</td>
+          <td class="small">{{ member.valid_until or '—' }}</td>
+          <td>{% if account %}{{ account.status }} / {{ account.role }}{% else %}—{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">没有成员记录。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
