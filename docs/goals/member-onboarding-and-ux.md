@@ -45,11 +45,11 @@
 
 ### 0.3 不得越过的授权边界
 
-本文授权的是**本地开发与隔离测试**，不是对 amax 的操作授权。
+本文授权的是**本地开发与隔离测试**，不是对 example-gpu 的操作授权。
 
 未经另行明确批准，不得：
 
-- SSH 连接 amax 进行所谓“顺手检查”；
+- SSH 连接 example-gpu 进行所谓“顺手检查”；
 - 安装服务、修改目标机账号、SSH、udev、配额或防火墙；
 - 重启 Docker、NVIDIA 或目标机系统服务；
 - 开启目标机 `deployment_allowed`、`vscode_enabled`、`file_transfer_enabled`；
@@ -637,7 +637,7 @@ citespec-resource join --portal https://lab.example.invalid/compute
 citespec-resource join status
 
 # 已批准后配置工作站。
-citespec-resource setup --server amax
+citespec-resource setup --server example-gpu
 citespec-resource doctor
 citespec-resource me
 
@@ -963,7 +963,7 @@ D2 之外，还需要独立批准、旧权限回收、实机验收、GPU 与存�
 保持既有 GPU 调度与容器边界；成员审批不应演变成 GPU 逐次人工审批。
 确保旧登录有新入口，管理员能批准/拒绝/管理成员，撤权覆盖已建立的会话。
 
-不得未经单独授权访问或部署 amax，不得修改本机真实账号/SSH。
+不得未经单独授权访问或部署 example-gpu，不得修改本机真实账号/SSH。
 需要系统权限的验证放在可销毁隔离环境；没有条件执行的测试标记为未验证，
 继续完成其他可执行工作，不伪造通过。
 

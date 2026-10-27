@@ -7,7 +7,7 @@ resource broker. It changes host and database state and is therefore restricted
 to a dedicated test allocation and an approved maintenance window.
 
 The procedure must not be executed on any host while training containers or
-other users' allocations are present. On amax, it additionally requires training
+other users' allocations are present. On example-gpu, it additionally requires training
 to have ended and explicit approval from the lab owner. It requires:
 
 - a dedicated test GPU that is currently `free`;

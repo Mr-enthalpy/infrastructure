@@ -55,7 +55,7 @@ def test_write_managed_fragment_never_touches_existing_config(tmp_path, monkeypa
 
 def test_ssh_probe_reports_missing_client(config, monkeypatch):
     monkeypatch.setattr(onboarding.shutil, "which", lambda name: None)
-    ok, detail = onboarding._ssh_fingerprint_probe("amax", config)
+    ok, detail = onboarding._ssh_fingerprint_probe("example-gpu", config)
     assert ok is False
     assert "ssh" in detail
 

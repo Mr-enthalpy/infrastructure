@@ -43,14 +43,14 @@
 > 保留实现/验收清单与当前状态。
 
 - 目标机：`<server-address>`（SSH 端口 `<ssh-port>`），实际部署在<server-instance>；
-  amax 未改动。
+  example-gpu 未改动。
 - 管理员：`<admin-account>` 使用普通 shell，主组 `citespec-admins`（附加组 `sudo`、
   `citespec-cli`），**不属于 `citespec-members`**；root bootstrap 公钥已移除，
   `ROOT_KEYS_ABSENT`。
 - 存储与 profile：workspace 根 `/home/data1/citespec-users`，ext4 + `prjquota`；
   DockerRootDir `/home/data2/docker-data` 为 ext4（非 XFS+prjquota），因此
   `container_profile = "restricted"`；配额闸门保持启用。
-- GPU/镜像：4 张 GPU；当前基镜像 `citespec-base:2026.10`（ID `566d0e599e2e`，
+- GPU/镜像：GPU 服务器；当前基镜像 `citespec-base:2026.10`（ID `566d0e599e2e`，
   约 25.2 GiB；在旧基镜像上叠加一个小层，仅收敛可见的 sudoers 文件名；镜像站
   `docker.mirrors.ustc.edu.cn` 已不可解析）；NVIDIA Docker runtime 可用；
   `citespec-gpu-permissions.service` active。旧基镜像标签已在最终验收后删除。
@@ -133,8 +133,8 @@
   （sanitized handoff + naming guard）；文档校准和 P0-2 实现见后续提交。
 - GitHub Actions 运行 `40308426242` 在 `d0294be`、`40315992883` 在 `7e9a4cc`
   （P0-2）上通过；当前分支 `main`，远程 `origin`。P0-2 仍待实机部署和恢复演练。
-- amax 未改动，未执行 Docker/NVIDIA 重启、容器操作或验收测试。期间一次
-  `admin ... --help` 被旧的自动中继逻辑误判并尝试解析 `amax`，连接未建立，
+- example-gpu 未改动，未执行 Docker/NVIDIA 重启、容器操作或验收测试。期间一次
+  `admin ... --help` 被旧的自动中继逻辑误判并尝试解析 `example-gpu`，连接未建立，
   未认证、未修改主机状态；该缺陷已修复（含 `--help` 的命令不再中继，且新增
   回归测试）。
 
@@ -147,7 +147,7 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 
 目标：为 Citespec 实验室共享 GPU 服务器建立受约束的资源管理器，完成可丢弃开发
 容器工作流，并在 Broker 中介下提供 VS Code 接入。当前实机部署在
-<server-instance>；amax 未改动。
+<server-instance>；example-gpu 未改动。
 
 当前阶段：
 
@@ -157,7 +157,7 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
   <server-instance> 实机完成本地 intake 的浏览器申请/审批/开户和 active 验收（§0）。
 - 实机核心验收已完成；VS Code、文件传输、外部 onboarding 和容器 root/宿主 GPU
   5.6 未开放。D3 对外生产开放未完成，剩余项见 §9。
-- amax 未改动，继续保持原状。
+- example-gpu 未改动，继续保持原状。
 
 ## 3. 已完成的实现
 
@@ -305,7 +305,7 @@ systemd hardening 测试必须在目标机或 Ubuntu CI 执行。
 
 ## 4. 当前安全不变量
 
-1. amax 上的训练、现有容器和资源分配不得被中断。未获得明确批准时，不部署、
+1. example-gpu 上的训练、现有容器和资源分配不得被中断。未获得明确批准时，不部署、
    不重启 Docker/NVIDIA、不修改 udev 规则、不创建或停止容器。
 2. 成员 SSH 仅允许密钥认证，并通过 `ForceCommand` 限制为白名单 CLI；不得暴露
    host shell 或 SSH 转发。成员公钥只从 root 中央目录读取，home

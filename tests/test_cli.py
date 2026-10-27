@@ -46,7 +46,7 @@ def test_list_json_envelope(monkeypatch):
         {
             "ok": True,
             "data": {
-                "server": "amax",
+                "server": "example-gpu",
                 "mode": "monitor",
                 "gpus": [],
                 "allocations": [],
@@ -57,7 +57,7 @@ def test_list_json_envelope(monkeypatch):
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["ok"] is True
-    assert payload["data"]["server"] == "amax"
+    assert payload["data"]["server"] == "example-gpu"
     assert fake.calls == [("list", {})]
 
 
@@ -585,18 +585,20 @@ def test_remote_mode_relays_command(monkeypatch):
     monkeypatch.setattr(
         sys_module,
         "argv",
-        ["citespec-resource", "--config", str(CONFIG), "--remote", "amax", "queue", "list"],
+        ["citespec-resource", "--config", str(CONFIG), "--remote", "example-gpu", "queue", "list"],
     )
-    result = runner.invoke(cli.app, ["--config", str(CONFIG), "--remote", "amax", "queue", "list"])
+    result = runner.invoke(
+        cli.app, ["--config", str(CONFIG), "--remote", "example-gpu", "queue", "list"]
+    )
     assert result.exit_code == 0
-    assert recorded["argv"][-2] == "amax"
+    assert recorded["argv"][-2] == "example-gpu"
     assert recorded["argv"][-1] == "citespec-resource queue list"
     assert "--config" not in recorded["argv"][-1]
 
 
 def test_remote_mode_rejects_local_only_commands(monkeypatch):
     for head in ("shell", "vscode", "gui", "tunnel", "file", "connect"):
-        result = runner.invoke(cli.app, ["--remote", "amax", head, "alloc-1"])
+        result = runner.invoke(cli.app, ["--remote", "example-gpu", head, "alloc-1"])
         assert result.exit_code != 0, head
 
 
@@ -622,7 +624,7 @@ def test_connect_command_rejects_bad_job_name(monkeypatch):
 
 
 def test_remote_mode_rejects_job_attach(monkeypatch):
-    result = runner.invoke(cli.app, ["--remote", "amax", "job", "attach", "alloc-1"])
+    result = runner.invoke(cli.app, ["--remote", "example-gpu", "job", "attach", "alloc-1"])
     assert result.exit_code != 0
 
 
@@ -644,7 +646,7 @@ def test_vscode_tunnel_cleans_up_on_probe_failure(tmp_path, monkeypatch):
                 config=config,
                 allocation_id="abc123",
                 username="alice",
-                ssh_alias="amax",
+                ssh_alias="example-gpu",
                 host="citespec-abc123",
                 requested_port=0,
                 ssh_config=ssh_config_path,

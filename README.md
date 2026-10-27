@@ -5,7 +5,7 @@
 本仓库是 Citespec 实验室共享 GPU 服务器的独立基础设施仓库，核心实现为
 `citespec-resource`。该实现提供受 SSH 策略约束的成员 CLI、以 root 运行并仅监听
 Unix socket 的 Broker、SQLite 状态存储、Docker 容器生命周期管理、资源排队、
-monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web GUI，以及供校园网/NJU VPN
+monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web GUI，以及供校园网/校园 VPN
 使用的成员 Portal。
 
 本仓库不依附于研究仓库，不是 `reconstruction` 或 `optic_system` 的 submodule。
@@ -28,7 +28,7 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 | VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；等待内网 DNS/VPN/证书答复 |
 | 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现，CI `40465970858` 通过；实机部署与恢复演练待维护窗口 |
 | 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
-| amax | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
+| example-gpu | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
 
 - 生产基线为 Python 3.12；本地开发可使用 Python 3.13。
 - `lab/resources.local.toml` 保存本地资源清单，已被 `.gitignore` 排除。
@@ -55,7 +55,7 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 - **GUI**：本地 `127.0.0.1` Web UI 与 xterm.js；仅通过 SSH 调用 CLI，不直接连接
   Broker。
 - **VPN Portal**：独立的低权限 `citespec-portal` 服务，仅监听 `127.0.0.1:8770`，
-  由主机 nginx 在校园网/NJU VPN 入口终止 TLS。它只提供新成员注册、账号激活、
+  由主机 nginx 在校园网/校园 VPN 入口终止 TLS。它只提供新成员注册、账号激活、
   本人成员信息、只读服务状态，以及管理员审批/成员状态管理；不提供资源申请、
   释放、队列、Web shell、VS Code 或文件传输。
 - **成员闭环**：低权限 intake 申请页、管理员邀请/审批、root 窄执行器开户、
@@ -79,7 +79,7 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 - Portal 使用本地账号、Argon2id 密码、TOTP、服务端会话和 CSRF 双重提交校验。
   激活码一次性、默认 24 小时有效；管理员角色变更仅能通过 CLI 完成；暂停/恢复/
   撤销等操作要求密码 + TOTP 再认证。
-- Portal 默认 `[portal].enabled = false`。只有内网 DNS、NJU VPN 路由/DNS、TLS
+- Portal 默认 `[portal].enabled = false`。只有内网 DNS、校园 VPN 路由/DNS、TLS
   证书和 443 防火墙白名单全部验收后，才启动 Portal；不发布公网 A/AAAA，不把
   公网 443 映射到本机。
 - GPU 按整卡分配，默认 12 小时、最长 36 小时。到期后停止容器并保留 workspace，
@@ -120,7 +120,7 @@ lab/resources.local.toml
 lab/resources.example.toml
 ```
 
-amax 的静态硬件与路径信息、部署闸门记录在 [lab/README.md](lab/README.md)。GPU 和
+example-gpu 的静态硬件与路径信息、部署闸门记录在 [lab/README.md](lab/README.md)。GPU 和
 容器的实时占用必须由 Broker 查询，不得写入配置文件或仓库。
 
 ## 6. 仓库结构
@@ -175,7 +175,7 @@ uv.lock              # 锁定依赖版本
   权限撤销与验证清单。
 - [docs/backup-restore.md](docs/backup-restore.md)：状态备份、校验、恢复和失败
   告警 runbook（含 `portal.db`）。
-- [docs/server-network-request.md](docs/server-network-request.md)：校园网/NJU VPN
+- [docs/server-network-request.md](docs/server-network-request.md)：校园网/校园 VPN
   入口的 DNS、VPN、防火墙、TLS 证书问题和验收清单。
 - [docs/handoff.md](docs/handoff.md)：当前实施状态、已验证项、目标机待验证项和
   下一会话的操作边界。
@@ -276,7 +276,7 @@ citespec-resource gui --server <server-alias> --admin-server <admin-alias>
 
 Portal 是独立于本地 GUI 的低权限 Web 服务，面向成员和管理员使用同一个 HTTPS
 地址；管理员能力来自本地 Portal 账号的 `admin` 角色，不另外部署管理入口。它
-默认关闭，只监听 `127.0.0.1:8770`，由主机 nginx 在校园网/NJU VPN 入口终止 TLS：
+默认关闭，只监听 `127.0.0.1:8770`，由主机 nginx 在校园网/校园 VPN 入口终止 TLS：
 
 ```text
 citespec-portal.<lab-domain> → 127.0.0.1:8770   # 成员/管理员 Portal

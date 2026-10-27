@@ -9,9 +9,9 @@
 
 目标：
 
-- Citespec 的成员/管理员 Web 入口只允许**校园网或南京大学 VPN**访问。
+- Citespec 的成员/管理员 Web 入口只允许**校园网或学校 VPN**访问。
 - 不开公网 Web 入口，不把管理面暴露到互联网。
-- 校内外使用同一个 HTTPS 域名；校外先连 NJU VPN，再打开页面。
+- 校内外使用同一个 HTTPS 域名；校外先连校园 VPN，再打开页面。
 - 手机和非开发机可以访问：新成员注册、成员信息/状态、只读服务状态、管理员简单审批/成员管理。
 - Web 不提供 Web shell、VS Code、文件传输、GPU/容器资源申请或释放；这些继续走 CLI/SSH。
 - 应用侧 `[portal].enabled` 默认 `false`；只有本文件第 6 节网络/证书验收通过后
@@ -38,7 +38,7 @@
 ## 3. 目标拓扑
 
 ```text
-手机 / 非开发机（校园网或先连 NJU VPN）
+手机 / 非开发机（校园网或先连校园 VPN）
   │ HTTPS 443
   ▼
 主机 nginx :443（私网监听，仅校园/VPN 网段）
@@ -68,21 +68,21 @@
 - 如果使用公共 CA 的 DNS-01 验证，需要能在公网 DNS 添加 `_acme-challenge` TXT 记录；不需要公网 A 记录。
 - 如使用公共 CA，建议配置 CAA，允许对应 CA。
 
-### 4.2 NJU VPN
+### 4.2 校园 VPN
 
 需要确认/配置：
 
-- NJU VPN 是网络层 VPN，能把 `<host-private-ip>`（或 `<private-subnet>`）路由给客户端。
+- 校园 VPN 是网络层 VPN，能把 `<host-private-ip>`（或 `<private-subnet>`）路由给客户端。
 - VPN 下发内网 DNS，使客户端能解析 `citespec-portal.<lab-domain>` 和 `citespec-apply.<lab-domain>`。
 - 提供校园网和 VPN 客户端源地址段，用于主机 443 防火墙白名单。
 - 如果只有 WebVPN/URL 重写型入口，请先说明；该类型可能破坏 API、CSRF、会话和后续状态轮询，需要先做兼容性验证。
-- 手机端验收：连接 NJU VPN 后能解析内网域名、打开 HTTPS、证书无警告、登录成功。
+- 手机端验收：连接校园 VPN 后能解析内网域名、打开 HTTPS、证书无警告、登录成功。
 
 ### 4.3 防火墙
 
 建议规则：
 
-- 入站 443：仅允许校园网和 NJU VPN 源地址段；拒绝公网。
+- 入站 443：仅允许校园网和校园 VPN 源地址段；拒绝公网。
 - 入站 80：不开放公网；本机如需要可仅做本地跳转，不用于 ACME。
 - 不开放 8765、8770 到非 loopback 地址。
 - 不新增公网 443 NAT/端口映射。
@@ -97,7 +97,7 @@
 优先级：
 
 1. **公共 CA + DNS-01**（推荐）：使用公网域名，但不发布公网 A 记录；通过 `_acme-challenge` TXT 完成签发。手机浏览器无需安装根证书。
-2. **学校通配证书**：如果学校有 `*.nju.edu.cn` 或实验室域名的通配证书，直接使用并确认续期方式。
+2. **学校通配证书**：如果学校有 `*.<university-domain>` 或实验室域名的通配证书，直接使用并确认续期方式。
 3. **内部 CA**：可用于纯内网，但成员手机需要安装根证书；不推荐作为首选。
 
 需要明确：
@@ -135,7 +135,7 @@
 | 1 | 可分配的域名/区域是什么？ | 例如 `citespec-portal.<lab-domain>`、`citespec-apply.<lab-domain>` 是否可用 |
 | 2 | 内网 DNS 由谁管理？能否添加 A/TXT/CAA？ | 管理方、TTL、是否需要工单 |
 | 3 | 是否支持 split-horizon？ | 校内解析到 `<host-private-ip>`，公网无 A |
-| 4 | NJU VPN 是网络层 VPN 还是 WebVPN？ | 类型；是否支持内网 DNS 和到 `<host-private-ip>` 的路由 |
+| 4 | 校园 VPN 是网络层 VPN 还是 WebVPN？ | 类型；是否支持内网 DNS 和到 `<host-private-ip>` 的路由 |
 | 5 | VPN/校园网源地址段是什么？ | 用于 443 防火墙白名单 |
 | 6 | 是否启用 IPv6？ | 是否发布 AAAA；防火墙是否同样限制 |
 | 7 | 证书用哪种方式？ | 公共 CA DNS-01 / 学校通配 / 内部 CA |
@@ -152,7 +152,7 @@
 网络/证书侧：
 
 - [ ] 校园网可解析 `citespec-portal` / `citespec-apply`，HTTPS 证书链有效。
-- [ ] 手机连接 NJU VPN 后同样可解析、打开、证书无警告。
+- [ ] 手机连接校园 VPN 后同样可解析、打开、证书无警告。
 - [ ] 不连 VPN、从公网访问两个域名均超时/不可达。
 - [ ] 公网没有对应 A/AAAA 记录；没有公网 443 到本机的映射。
 - [ ] `openssl s_client -servername ...` 显示的证书与域名匹配。
@@ -207,7 +207,7 @@ DNS/VPN/防火墙。完整测试为 `475 passed, 21 skipped`。
 | 事项 | 负责方 |
 |---|---|
 | 内网 DNS、split-horizon、TXT/CAA | 服务器/网络管理 |
-| NJU VPN 路由、DNS、源地址段 | 服务器/网络管理 |
+| 校园 VPN 路由、DNS、源地址段 | 服务器/网络管理 |
 | 防火墙、公网 443 不映射 | 服务器/网络管理 |
 | TLS 证书签发/续期/告警 | 服务器/网络管理（或明确移交 Citespec） |
 | 主机 nginx vhost | Citespec 侧优先；服务器管理可协助 |
@@ -262,7 +262,7 @@ server {
 
 ## 附录 B：微信沟通话术（可直接复制）
 
-> 老师您好，Citespec 想改成只走校园网/NJU VPN 的 HTTPS 访问，不开公网入口。需要您协助确认内网 DNS、VPN 路由/DNS、443 防火墙和证书方式。具体需求和待确认项我整理在一页文档里，方便时请您看一下；主要想先确认 DNS、VPN 和证书这三项是否可行。谢谢！
+> 老师您好，Citespec 想改成只走校园网/校园 VPN 的 HTTPS 访问，不开公网入口。需要您协助确认内网 DNS、VPN 路由/DNS、443 防火墙和证书方式。具体需求和待确认项我整理在一页文档里，方便时请您看一下；主要想先确认 DNS、VPN 和证书这三项是否可行。谢谢！
 
 ## 附录 C：现场实施与回滚顺序
 
@@ -287,7 +287,7 @@ docker ps -a --format '{{.Names}} {{.Status}}' > /root/citespec-containers-befor
 
 1. 添加 `citespec-portal.<lab-domain>` 和 `citespec-apply.<lab-domain>` 的内网
    A 记录，指向 `<host-private-ip>`；不发布公网 A/AAAA。
-2. 确认校园网和 NJU VPN 客户端能解析两个域名；TTL 先设 300。
+2. 确认校园网和校园 VPN 客户端能解析两个域名；TTL 先设 300。
 3. 443 只允许校园网/VPN 源地址段；不新增公网 443 NAT；8765/8770 不对外。
 4. 从校外普通网络确认两个域名不可达；从 VPN 确认可达。
 

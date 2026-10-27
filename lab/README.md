@@ -12,7 +12,7 @@ never be committed to Git.
 - `resources.local.toml`: the actual local inventory; **ignored by Git**.
 - `README.md`: non-secret context for the inventory.
 
-## 3. amax snapshot
+## 3. example-gpu snapshot
 
 Status: initialized on 2026-10-22. The host is currently used for training.
 Deployment and Docker restarts are prohibited until training has ended and the
@@ -20,10 +20,10 @@ lab owner has approved deployment.
 
 | Item | Value |
 |---|---|
-| Host | `amax` (local SSH alias) |
-| GPUs | 8 × NVIDIA GeForce RTX 4090, 49140 MiB reported per card |
-| CPU | 128 logical CPUs |
-| RAM | 251 GiB |
+| Host | `example-gpu` (local SSH alias) |
+| GPUs | `<GPU model/count>` (not published) |
+| CPU | `<CPU count>` (not published) |
+| RAM | `<RAM>` (not published) |
 | Data volume | `/data1` (shared volume; usage changes) |
 | Docker | 28.1.1 observed previously |
 | Python | 3.10.12 observed previously; deployment baseline is 3.12 |
@@ -31,6 +31,9 @@ lab owner has approved deployment.
 | Broker socket | `/run/citespec-resource/broker.sock` |
 | Broker state | `/var/lib/citespec-resource/state.db` |
 | Base image | `citespec-base:2026.10` |
+
+Exact hardware inventory is intentionally not published in this repository;
+the ignored local inventory is authoritative for the deployment host.
 
 The GPU workload observed on 2026-10-22 at approximately 17:03 CST was a
 transient snapshot, not a reservation. It must not be used as current state.

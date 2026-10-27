@@ -48,7 +48,7 @@ class FakeRunner:
             data = {"operation_id": args[3], "status": "succeeded"}
         elif args[:1] == ["list"]:
             data = {
-                "server": "amax",
+                "server": "example-gpu",
                 "mode": "monitor",
                 "gpus": [],
                 "allocations": [],
@@ -107,7 +107,7 @@ class FakeRunner:
         elif args[:2] == ["admin", "users"]:
             data = {"users": [{"uid": 1000, "username": "alice", "role": "member"}]}
         elif args[:2] == ["admin", "resources"]:
-            data = {"server": "amax", "mode": "monitor", "gpus": [], "allocations": []}
+            data = {"server": "example-gpu", "mode": "monitor", "gpus": [], "allocations": []}
         elif args[:2] == ["admin", "audit"]:
             data = {"events": []}
         elif args[:2] == ["admin", "mode"]:

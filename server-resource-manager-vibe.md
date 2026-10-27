@@ -2,8 +2,8 @@
 
 - 版本：2026-10-22
 - 文档状态：初始需求与设计基线，保留用于追溯设计意图
-- 部署目标：首期仅针对 amax 一台服务器
-- 编写时状态：**不部署**。amax 仍在训练；先完成实现、测试和 monitor-only 验收。
+- 部署目标：首期仅针对 example-gpu 一台服务器
+- 编写时状态：**不部署**。example-gpu 仍在训练；先完成实现、测试和 monitor-only 验收。
 
 > 本文档描述初始设计目标。当前实施状态、部署边界和验收流程以
 > [README.md](README.md)、[docs/handoff.md](docs/handoff.md) 和
@@ -89,7 +89,7 @@ GUI 视觉可使用本地打包的轻量 CSS（如 Pico.css/Bootstrap 单文件�
       │  本地 127.0.0.1 Web UI
       │  subprocess: ssh <alias> citespec-resource ... --json
       ▼
-amax sshd
+example-gpu sshd
   ForceCommand /usr/local/bin/citespec-resource-login
       │  仅允许 citespec-resource 子命令
       ▼
@@ -316,7 +316,7 @@ citespec-resource release <id> [--json]
 citespec-resource shell <id>
 citespec-resource logs <id> [--follow]
 citespec-resource menu
-citespec-resource gui [--server amax] [--port 0]
+citespec-resource gui [--server example-gpu] [--port 0]
 ```
 
 管理员：
@@ -350,7 +350,7 @@ citespec-resource admin mode monitor|active
 
 - 启动本地 `127.0.0.1` Web server（随机端口）；
 - 自动打开浏览器；
-- 配置中读取 SSH alias（默认 `amax`）；
+- 配置中读取 SSH alias（默认 `example-gpu`）；
 - 所有数据通过 `ssh <alias> citespec-resource ... --json` 获取；
 - 不直接访问 Broker，不新增 API client。
 
@@ -434,7 +434,7 @@ citespec-resource/
 
 ### 11.3 部署闸门
 
-当前 amax 在训练，**禁止部署**。训练结束后：
+当前 example-gpu 在训练，**禁止部署**。训练结束后：
 
 1. 先 monitor-only；
 2. 确认现有容器全部显示 unmanaged 且 Broker 未碰它们；
@@ -471,7 +471,7 @@ citespec-resource/
 
 ### 安全验收
 
-- 成员 `ssh amax bash` 被 ForceCommand 拒绝；
+- 成员 `ssh example-gpu bash` 被 ForceCommand 拒绝；
 - 成员 `docker ps` 无权限；
 - 成员 `/dev/nvidia*` 打开失败；
 - 容器内不能访问 `/var/run/docker.sock`；
@@ -492,7 +492,7 @@ citespec-resource/
 
 ## 13. 分阶段执行提示
 
-新会话按阶段实现，每阶段结束提交代码和测试；**不要直接部署到 amax**。
+新会话按阶段实现，每阶段结束提交代码和测试；**不要直接部署到 example-gpu**。
 
 ### P0 — 仓库与只读预检
 
@@ -544,7 +544,7 @@ citespec-resource/
 
 ## 14. 明确禁止
 
-- 不要在 amax 训练期间部署或重启 Docker。
+- 不要在 example-gpu 训练期间部署或重启 Docker。
 - 不要杀未知容器/进程。
 - 不要给成员 Docker socket、sudo 或 GPU 设备组权限。
 - 不要用 `--privileged`。
@@ -560,8 +560,8 @@ citespec-resource/
 
 当前已知：
 
-- amax：8 × RTX 4090（48 GiB/卡），128 logical CPU，251 GiB RAM，Docker 28.1.1；当前全部 GPU 被其他任务占用。
-- 原计划 GPU 3/5 已被其他任务使用；本系统不依赖当前空闲卡。
+- example-gpu：GPU 服务器（具体型号、卡数、CPU/RAM 规格不在此公开文档记录）；当前全部 GPU 被其他任务占用。
+- 部分 GPU 已被其他任务使用；本系统不依赖当前空闲卡。
 - 服务器曾因主机内存不足崩溃；容器必须加 memory/swap 限制，Broker 不得再造成 OOM。
 
 待管理员确认后填入配置：

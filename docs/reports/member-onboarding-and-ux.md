@@ -26,9 +26,9 @@ Playwright 浏览器任务待接入 CI。本轮新增的本地浏览器路径已
 `C:\Program Files\Git\bin\bash.exe`，Node.js。本地没有 Docker/WSL；真实
 Linux/SSH/浏览器验收在实机完成。
 
-本轮没有改动 amax，没有重启其 Docker/NVIDIA 服务，也没有修改其容器或资源分配。
+本轮没有改动 example-gpu，没有重启其 Docker/NVIDIA 服务，也没有修改其容器或资源分配。
 期间一次旧 CLI 自动中继逻辑把 `admin ... --help` 误判为远端命令并尝试解析
-`amax`，连接未建立；该缺陷已修复并加入回归测试。
+`example-gpu`，连接未建立；该缺陷已修复并加入回归测试。
 
 ## 2. 需求 → 实现模块 → 验收状态
 
@@ -120,7 +120,7 @@ node --check src\citespec_resource\gui\static\app.js
 | FAIL | 无本地失败 |
 | 已完成 | 真实 SSH 核心路径、useradd/quota、intake/provision、active 验收、GPU 审计、restricted profile |
 | 未覆盖 | 外部 443 onboarding、VS Code、文件传输、5.6、reboot/driver reload 复验、Playwright CI |
-| amax | 未改动；未执行 Docker/NVIDIA 操作 |
+| example-gpu | 未改动；未执行 Docker/NVIDIA 操作 |
 
 ### 4.1 本轮新增/加强的主要测试
 
@@ -223,6 +223,6 @@ D3 尚未开放，剩余项包括：
 - 备份恢复/告警的实机部署与恢复演练、安装器可复现性和浏览器 CI；
 - reboot/NVIDIA driver reload 后的复验。
 
-amax 未改动，未重启 Docker/NVIDIA，未修改 udev，未创建/停止容器或修改真实成员账号。
+example-gpu 未改动，未重启 Docker/NVIDIA，未修改 udev，未创建/停止容器或修改真实成员账号。
 
 **最终分级：D1 完成；D2 核心实机验收完成；D3 未开放。**

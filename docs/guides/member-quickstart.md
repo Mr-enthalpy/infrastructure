@@ -49,7 +49,7 @@
 
    正常创建/排队/释放资源是自助的，不需要每次找管理员审批。
 
-**VPN Portal（上线后）**：在校园网或先连接南京大学 VPN，打开实验室公布的
+**VPN Portal（上线后）**：在校园网或先连接学校 VPN，打开实验室公布的
 `https://citespec-portal.<lab-domain>/register` 即可提交注册，不需要邀请码。管理员
 批准后会通过可信渠道发来一次性激活码；打开 `/activate` 设置密码、绑定 TOTP，
 之后用 `/login` 登录。Portal 只能查看本人成员/服务状态，以及管理员审批；GPU/容器

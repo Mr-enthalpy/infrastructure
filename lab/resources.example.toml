@@ -1,3 +1,5 @@
+# Example-only configuration used by tests and documentation. Values are not a
+# claim about any live host or its current inventory.
 [server]
 name = "example"
 ssh_alias = "example"
@@ -108,7 +110,7 @@ base = "citespec-base:2026.10"
 allowlist = []
 
 [deployment]
-reason = "amax is still training; deploy only after explicit approval"
+reason = "example-gpu is still training; deploy only after explicit approval"
 monitor_only_until = ""
 
 [gui]

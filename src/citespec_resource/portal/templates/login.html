@@ -3,7 +3,7 @@
 {% block content %}
 <h1>登录</h1>
 <div class="card">
-  <p class="muted">仅校园网或南京大学 VPN 可访问。请使用 Portal 账号密码和 TOTP。</p>
+  <p class="muted">仅校园网或学校 VPN 可访问。请使用 Portal 账号密码和 TOTP。</p>
   <form method="post" action="/login">
     <input type="hidden" name="_csrf" value="{{ csrf }}">
     <input type="hidden" name="next" value="{{ next_url|default('') }}">

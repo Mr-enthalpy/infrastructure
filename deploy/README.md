@@ -40,7 +40,7 @@ The following conditions must be satisfied before installation:
   excluded from Git.
 - The read-only checks in Section 3 pass. For the development profile, the
   storage, quota, and `nosuid` requirements in Section 5 are mandatory.
-- For the portal, the internal DNS, NJU VPN route/DNS, TLS certificate, and
+- For the portal, the internal DNS, campus VPN route/DNS, TLS certificate, and
   443 firewall answers in
   [`docs/server-network-request.md`](../docs/server-network-request.md) are
   recorded and accepted. Keep `[portal].enabled = false` until then.
