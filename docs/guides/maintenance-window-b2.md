@@ -89,15 +89,15 @@ systemctl stop citespec-resource-broker.service \
   citespec-resource-intake.service citespec-resource-provision.path 2>/dev/null || true
 ```
 
-为了让 `--no-timers` 窗口内即使重启也不会自动触发，记录并 disable 已启用的 timer；
-回滚时按记录恢复：
+为了让 `--no-timers` 窗口内即使重启也不会自动触发，先记录 timer 原状态；**不要
+在安装前 disable**，否则安装器捕获到的“原状态”会变成 disabled，失败回滚就无法恢复
+旧状态。成功验收后再在启动步骤里 disable。
 
 ```bash
 for t in citespec-resource-logrotate.timer \
          citespec-resource-disk-check.timer citespec-resource-backup.timer; do
   if systemctl is-enabled --quiet "$t" 2>/dev/null; then
     echo "$t enabled" >> "$B/meta/timer-enabled.txt"
-    systemctl disable "$t"
   fi
 done
 systemctl is-active citespec-resource-broker.service \
@@ -283,7 +283,9 @@ cd <repo-root>
 bash deploy/preflight.sh --config "$B/config.monitor.toml" --skip-nvidia
 ```
 
-记录任何 failure；有 failure 就停止，不要继续安装。然后 dry-run：
+记录任何 failure；有 failure 就停止，不要继续安装。安装器本身仍会运行
+`audit_legacy.sh --production`：monitor 模式下 critical findings 只告警、不阻断安装，
+但必须记录并交由管理员决定；不得因此把配置切到 active。然后 dry-run：
 
 ```bash
 bash deploy/install_server.sh \
@@ -306,7 +308,9 @@ bash deploy/install_server.sh \
   原状态恢复。
 - 若安装器失败，**不要手动清理**，先读它的 `[rollback]` 输出并确认
   `/var/backups/citespec-resource/<timestamp>/`；其 EXIT trap 会恢复文件、unit/
-  timer 状态和 NVIDIA 路径。
+  timer 状态和 NVIDIA 路径。安装器捕获的是“安装开始时”的状态，而我们在第 3.1 节
+  已停止 broker/intake/provision，因此它不会自动重新启动这些服务；确认回滚成功后，
+  按第 7 节的启动顺序启动旧服务并验收。
 
 ## 7. 启动与验收
 
@@ -317,6 +321,12 @@ systemctl daemon-reload
 systemctl start citespec-resource-provision.path
 systemctl start citespec-resource-intake.service
 systemctl start citespec-resource-broker.service
+
+# --no-timers 只阻止安装器启用 timer；若旧安装已启用，这里显式 disable。
+for t in citespec-resource-logrotate.timer \
+         citespec-resource-disk-check.timer citespec-resource-backup.timer; do
+  systemctl disable --now "$t" 2>/dev/null || true
+done
 ```
 
 验收项：
