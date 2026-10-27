@@ -285,27 +285,27 @@ stub 回滚测试继续覆盖备份/恢复与回滚状态。
 | `python -m ruff format --check .` | 通过 |
 | `python -m mypy src` | 通过（45 个源文件） |
 | `bash -n deploy/*.sh` | 通过 |
-| 真实 Linux/Docker/descriptor-relative 测试 | 本地跳过，由 Ubuntu CI 覆盖 |
+| Ubuntu CI `ci`（3.11/3.12/3.13 × Ubuntu/Windows） | 通过（`38a00bc`） |
+| Ubuntu CI `client-build`（linux-x64/windows-x64，含强制安装校验） | 通过（`38a00bc`） |
+| 真实 Linux/Docker/descriptor-relative 测试 | 本地跳过，Ubuntu CI 已覆盖并通过 |
 | 真实主机修改 | 未执行 |
 
 27 个 skip 主要是 Linux-only（descriptor-relative 文件操作、Unix socket、POSIX
-执行位、stub 回滚、stub nginx/openssl 验收）和 Docker 集成测试；需要在推送后的
-Ubuntu CI 或目标机验证。
+执行位、stub 回滚、stub nginx/openssl 验收）和 Docker 集成测试；已在 Ubuntu CI
+覆盖并通过。
 
 ## 4. 部署前仍需完成
 
-1. 推送分支并等待 Ubuntu CI；确认 Linux-only 回滚、WAL、执行位和 Portal 验收
-   测试通过。
-2. 在一次性 VM 上做安装器回滚演练（至少包含 unit/timer、版本化 venv 切换、
+1. 在一次性 VM 上做安装器回滚演练（至少包含 unit/timer、版本化 venv 切换、
    一致快照和 NVIDIA 路径故障）。
-3. 目标机维护窗口内先记录现状；安装时使用 `--maintenance-window` 让安装器自动
+2. 目标机维护窗口内先记录现状；安装时使用 `--maintenance-window` 让安装器自动
    停止写入者并取一致快照。`--no-timers` 仍可用于 monitor 部署，验收后再启用。
-4. 首次安装后运行 `preflight.sh`（默认不探测 NVIDIA）与
+3. 首次安装后运行 `preflight.sh`（默认不探测 NVIDIA）与
    `verify_portal_network.sh`；确认 `service_account`、NVIDIA wrapper/shim 和
    设备权限。需要探测时先安装 wrapper，再用 `--probe-nvidia`。
-5. Portal 保持禁用；DNS/VPN/TLS/防火墙验收完成后，才运行
+4. Portal 保持禁用；DNS/VPN/TLS/防火墙验收完成后，才运行
    `enable_portal.sh --yes --approved-cidr <CIDR>` 写标记并启用。
-6. development profile + container sudo 保持关闭；先运行
+5. development profile + container sudo 保持关闭；先运行
    `verify_gpu_isolation.sh --write-marker` 取得真机 PASS，再评估是否开放。
 
 ## 5. 结论

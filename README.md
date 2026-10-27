@@ -337,14 +337,15 @@ citespec-apply.<lab-domain>  → 127.0.0.1:8765   # 旧 intake/申请页，保�
 ### 11.4 安装与本地验证
 
 安装器会创建低权限账号、`citespec-portal` 组、状态目录、root-owned 密钥文件和
-`portal.db`，安装 systemd unit；只有 `[portal].enabled = true` 时才 enable，且
-**从不自动 start**。安装示例：
+`portal.db`，安装 systemd unit，但**从不 enable、也从不 start**。unit 还带有
+`ConditionPathExists=/etc/citespec-resource/portal-network-accepted`，没有验收标记
+时即使被手工 enable 也不会启动。安装示例：
 
 ```bash
 bash deploy/install_server.sh --dry-run --skip-preflight
 bash deploy/install_server.sh --yes
-# 网络/证书验收后再执行：
-sudo systemctl start citespec-resource-portal.service
+# 网络/证书验收后，唯一启用入口（fail-closed 审计通过才写标记并 enable）：
+sudo deploy/enable_portal.sh --yes --approved-cidr <vpn-source-cidr>
 ```
 
 `deploy/nginx/` 中只有 vhost 示例，不包含证书、DNS 或防火墙改动。本地验证命令：

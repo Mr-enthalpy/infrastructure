@@ -325,15 +325,20 @@ openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
 
 ### C.5 Portal 安装与启用
 
-先用 `[portal].enabled = false` 安装；`deploy/install_server.sh` 不会自动启动 Portal。
-网络/证书验收通过后，才在维护窗口内：
+先用 `[portal].enabled = false` 安装；`deploy/install_server.sh` 不会 enable 或
+启动 Portal。网络/证书验收通过后，才在维护窗口内：
 
 ```bash
 # 将 [portal].enabled 改为 true，确认 db_path 在 /var/lib/citespec-resource-portal 下
-sudo systemctl enable --now citespec-resource-portal
+# 唯一启用入口：先做 fail-closed 网络审计，通过后才写标记并 enable/start
+sudo bash deploy/enable_portal.sh --yes --approved-cidr <vpn-source-cidr>
 sudo systemctl status citespec-resource-portal --no-pager
 curl -fsS http://127.0.0.1:8770/healthz
 ```
+
+不要手工 `systemctl enable`：unit 带有
+`ConditionPathExists=/etc/citespec-resource/portal-network-accepted`，没有
+`enable_portal.sh` 写入的标记不会启动。
 
 首个管理员只通过 CLI 创建/改角色，不把 `citespec-portal` 加入
 `citespec-admins`；管理员密码/TOTP 不写入文档、日志或命令行历史。

@@ -124,7 +124,7 @@ read-only checks:
 sudo systemctl start citespec-resource-provision.path
 sudo systemctl start citespec-resource-intake.service
 sudo systemctl start citespec-resource-broker.service
-# Only when [portal].enabled = true and DNS/VPN/TLS acceptance is complete:
+# Only after enable_portal.sh has written the acceptance marker:
 sudo systemctl start citespec-resource-portal.service
 /usr/local/libexec/citespec-resource/verify_gpu_permissions.sh --json
 citespec-resource status --json

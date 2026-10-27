@@ -245,8 +245,9 @@ these tools is unavailable.
    installer creates the low-privilege `citespec-portal` account (member of
    `citespec-cli`, never `citespec-admins`), its state directory, `portal.db`, the
    root-owned `/etc/citespec-resource/portal-secret.key` (mode `0640`), and
-   `citespec-resource-portal.service`. It enables the unit only when
-   `[portal].enabled = true`, and it never starts it.
+   `citespec-resource-portal.service`. It never enables or starts the unit, even
+   when `[portal].enabled = true`; the unit also has
+   `ConditionPathExists=/etc/citespec-resource/portal-network-accepted`.
 
    The portal binds `127.0.0.1:8770`; host nginx terminates TLS on the private
    campus/VPN listener. Example vhosts live in `deploy/nginx/` — they are not
@@ -255,13 +256,17 @@ these tools is unavailable.
    `X-Citespec-Client-IP` with `$remote_addr`, then run
    `bash deploy/verify_portal_network.sh --nginx-root /etc/nginx` and require a
    zero exit before exposing the vhost. Then, after a local activation and
-   admin review test:
+   admin review test, enable the unit through the only supported gate:
 
    ```bash
-   systemctl start citespec-resource-portal.service
+   bash deploy/enable_portal.sh --yes --approved-cidr <vpn-source-cidr>
    curl -fsS http://127.0.0.1:8770/healthz
    systemctl status citespec-resource-portal.service
    ```
+
+   `enable_portal.sh` runs the fail-closed acceptance audit, writes
+   `/etc/citespec-resource/portal-network-accepted` only on success, and then
+   enables/starts the unit. A failed re-run rolls back only the state it added.
 
    Portal scope is deliberately narrow: registration, activation, local
    password/TOTP login, own member/status view, and admin approval/member-state
