@@ -190,6 +190,10 @@ uv.lock              # 锁定依赖版本
 
 - [docs/client-distribution.md](docs/client-distribution.md)：Windows/Linux 客户端安装、
   签名自动更新、构建发布和回滚。
+- [docs/reports/p1-remediation.md](docs/reports/p1-remediation.md)：部署前 P1 安全修复、
+  验证证据与残余风险。
+- [docs/guides/maintenance-window-b2.md](docs/guides/maintenance-window-b2.md)：monitor
+  模式维护窗口、手动备份/checkpoint、回滚演练与回滚操作单。
 ## 8. 实现里程碑
 
 > 以下 M0–M5 是初始实现阶段；历史文档中的 P0–P5 指同一组里程碑。后续变更优先级
