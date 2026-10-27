@@ -296,6 +296,7 @@ def install_update(
         raise UpdateError("update version escapes the versions directory")
     previous = installed_version(root)
     if _payload_path(destination).is_file():
+        _ensure_payload_executable(_payload_path(destination))
         write_current(root, version)
         return UpdateResult(version, destination, previous)
 
@@ -321,6 +322,7 @@ def install_update(
                 raise UpdateError("update artifact is not a valid zip archive") from exc
             if not _payload_path(temporary).is_file():
                 raise UpdateError("update artifact does not contain the client payload")
+            _ensure_payload_executable(_payload_path(temporary))
             if _payload_path(destination).is_file():
                 # Another process completed the same version while we were
                 # downloading.  Keep the already-installed copy.
@@ -433,6 +435,20 @@ def payload_name() -> str:
 
 def _payload_path(version_dir: Path) -> Path:
     return version_dir / payload_name()
+
+
+def _ensure_payload_executable(payload: Path) -> None:
+    """Restore the executable bit that zip extraction does not preserve.
+
+    ``zipfile`` writes regular files as 0600/0666 subject to umask regardless of
+    the archive's Unix mode.  Without this the versioned launcher is installed
+    but cannot be executed on Linux.  Windows uses file extension semantics, so
+    leave its ACLs alone.
+    """
+
+    if os.name == "nt":
+        return
+    payload.chmod(0o755)
 
 
 def _acquire_update_lock(lock: Path) -> Any:
