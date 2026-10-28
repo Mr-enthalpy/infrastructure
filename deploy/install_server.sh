@@ -589,6 +589,16 @@ cleanup_venv_staging() {
 # Replace /opt/citespec-resource/.venv only after the new environment passed its
 # smoke test.  A real directory is moved aside; an existing symlink target is
 # recorded and recreated on rollback.  Services must already be stopped.
+rewrite_venv_prefix() {
+    local staging=$1 target=$2
+    [ -n "$staging" ] && [ -d "$target/bin" ] || return 0
+    grep -rlIZ -- "$staging" "$target/bin" 2>/dev/null \
+        | xargs -0 -r sed -i "s|$staging|$target|g" 2>/dev/null || true
+    if grep -rqlI -- "$staging" "$target/bin" 2>/dev/null; then
+        fail "could not rewrite the staged Python prefix in $target/bin"
+    fi
+}
+
 switch_venv() {
     local tmp_link=$VENV.tmp-$$
     if [ -L "$VENV" ]; then
@@ -1042,12 +1052,18 @@ PY
     fi
     mv -- "$VENV_STAGING" "$VENV_TARGET" \
         || fail "could not promote the new Python environment"
+    # uv writes the staging prefix into every console script and activate file.
+    # Renaming the directory leaves the entry points pointing at a path that no
+    # longer exists, so rewrite the embedded prefix before .venv is switched.
+    rewrite_venv_prefix "$VENV_STAGING" "$VENV_TARGET"
     VENV_STAGING=""
     switch_venv
     ok "activated Python environment: $VENV_TARGET"
     [ -x "$VENV/bin/python" ] || fail "venv was not activated: $VENV"
     [ -x "$VENV/bin/citespec-resource" ] || fail "citespec-resource entry point is missing"
     [ -x "$VENV/bin/citespec-resource-login" ] || fail "citespec-resource-login entry point is missing"
+    "$VENV/bin/citespec-resource" version >/dev/null \
+        || fail "activated environment failed its console-script smoke test"
 else
     run_shell "install -d -o root -g root -m 0755 $PREFIX"
     run_shell "install -d -o root -g root -m 0755 $VENVS_DIR"
