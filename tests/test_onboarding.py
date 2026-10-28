@@ -204,3 +204,174 @@ def test_host_key_rejects_wrong_trusted_fingerprint(monkeypatch, config, tmp_pat
             expected_fingerprint="SHA256:expected",
         )
     assert not known_hosts.exists()
+
+
+def test_run_capture_decodes_non_utf8_output(tmp_path):
+    """Regression (C4-2): GBK hosts must not crash on non-GBK SSH output."""
+    import sys
+
+    script = (
+        "import sys;"
+        "sys.stdout.buffer.write(b'\\xff\\xac');"
+        "sys.stderr.buffer.write(b'\\xff');"
+        "sys.stdout.flush();sys.stderr.flush()"
+    )
+    result = onboarding._run_capture([sys.executable, "-c", script])
+    assert result.returncode == 0
+    assert isinstance(result.stdout, str)
+    assert isinstance(result.stderr, str)
+    assert "\ufffd" in result.stdout
+
+
+def test_run_capture_requests_utf8_replace(config, monkeypatch):
+    seen: dict[str, object] = {}
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+    onboarding._run_capture(["ssh", "-V"])
+    assert seen["encoding"] == "utf-8"
+    assert seen["errors"] == "replace"
+    assert seen["text"] is True
+    assert seen["capture_output"] is True
+
+
+def test_ssh_probe_reports_server_version_with_utf8_banner(config, monkeypatch):
+    """Regression (C4-2/C4-4): a UTF-8 login banner is informational, not fatal."""
+    seen: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = "0.1.0\n"
+        stderr = "本服务器已启用个人账号\n"
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        return Result()
+
+    monkeypatch.setattr(onboarding.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+    ok, detail = onboarding._ssh_fingerprint_probe("192.0.2.5", config)
+    assert ok is True
+    assert "0.1.0" in detail
+    # Older servers reject `version --json`; the probe must stay compatible.
+    assert seen[0][-1] == "citespec-resource version"
+
+
+def test_ssh_probe_tolerates_missing_streams(config, monkeypatch):
+    """Regression (C4-2): a probe result without captured streams must not crash."""
+
+    class Result:
+        returncode = 1
+        stdout = None
+        stderr = None
+
+    monkeypatch.setattr(onboarding.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(onboarding.subprocess, "run", lambda argv, **kwargs: Result())
+    ok, detail = onboarding._ssh_fingerprint_probe("192.0.2.5", config)
+    assert ok is False
+    assert "SSH 认证或连接失败" in detail
+
+
+def test_ssh_probe_handles_decode_failure_as_connection_error(config, monkeypatch):
+    """Regression (C4-2): decode problems are reported, never raised as a traceback."""
+
+    def fake_run(argv, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\xac", 2, 3, "illegal multibyte sequence")
+
+    monkeypatch.setattr(onboarding.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(onboarding.subprocess, "run", fake_run)
+    ok, detail = onboarding._ssh_fingerprint_probe("192.0.2.5", config)
+    assert ok is False
+    assert "SSH 连接失败" in detail
+
+
+def test_fingerprint_mismatch_reports_observed_algorithms(monkeypatch, config, tmp_path, capsys):
+    known_hosts = tmp_path / "known_hosts"
+    monkeypatch.setattr(onboarding, "_known_hosts_path", lambda _config: known_hosts)
+    monkeypatch.setattr(onboarding, "_host_key_is_known", lambda _config, _host: False)
+    monkeypatch.setattr(
+        onboarding,
+        "_scan_host_keys",
+        lambda _config, _host: "192.0.2.5 ssh-rsa AAAAB3NzaC1yc2E\n",
+    )
+    monkeypatch.setattr(
+        onboarding,
+        "_scan_fingerprints",
+        lambda _config, _host: "3072 SHA256:actual (RSA)",
+    )
+    with pytest.raises(RuntimeError, match="RSA"):
+        onboarding._trust_host_key(
+            config,
+            "192.0.2.5",
+            interactive=False,
+            expected_fingerprint="SHA256:ed25519only",
+        )
+    output = capsys.readouterr().out
+    assert "SHA256:actual" in output
+    assert "RSA (ssh-rsa)" in output
+    assert not known_hosts.exists()
+
+
+def test_fingerprint_match_accepts_bare_digest():
+    fingerprints = "3072 SHA256:abc123def (RSA)"
+    assert onboarding._fingerprint_matches("SHA256:abc123def", fingerprints)
+    assert onboarding._fingerprint_matches("abc123def", fingerprints)
+    assert not onboarding._fingerprint_matches("SHA256:zzz", fingerprints)
+
+
+def test_setup_returns_zero_after_writing_profile(monkeypatch, config, tmp_path):
+    from citespec_resource import config as config_module
+
+    profile = tmp_path / "client.toml"
+    monkeypatch.setattr(onboarding, "_check_program", lambda name: name)
+    monkeypatch.setattr(onboarding, "_trust_host_key", lambda *a, **k: None)
+    monkeypatch.setattr(
+        onboarding,
+        "_write_managed_fragment",
+        lambda *a, **k: (tmp_path / "fragment").write_text("x", encoding="utf-8"),
+    )
+    monkeypatch.setattr(config_module, "client_config_path", lambda: profile)
+    monkeypatch.setattr(
+        onboarding, "_ssh_fingerprint_probe", lambda *a, **k: (True, "SSH 认证成功")
+    )
+    monkeypatch.setattr(
+        onboarding,
+        "_remote_me",
+        lambda *a, **k: {"membership": {"status": "active"}},
+    )
+    code = onboarding.run_setup(config, host="192.0.2.5", yes=True)
+    assert code == 0
+    assert profile.exists()
+
+
+def test_setup_reports_written_profile_when_probe_fails(monkeypatch, config, tmp_path, capsys):
+    from citespec_resource import config as config_module
+
+    profile = tmp_path / "client.toml"
+    monkeypatch.setattr(onboarding, "_check_program", lambda name: name)
+    monkeypatch.setattr(onboarding, "_trust_host_key", lambda *a, **k: None)
+    monkeypatch.setattr(
+        onboarding,
+        "_write_managed_fragment",
+        lambda *a, **k: (tmp_path / "fragment").write_text("x", encoding="utf-8"),
+    )
+    monkeypatch.setattr(config_module, "client_config_path", lambda: profile)
+
+    def boom(*args, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\xac", 2, 3, "illegal multibyte sequence")
+
+    monkeypatch.setattr(onboarding, "_ssh_fingerprint_probe", boom)
+    code = onboarding.run_setup(config, host="192.0.2.5", yes=True)
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "已写入成员连接配置" in output
+    assert "doctor" in output
+    assert profile.exists()
