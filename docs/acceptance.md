@@ -509,6 +509,18 @@ onboarding findings (host-key algorithm mismatch, `setup` crash) and five
 non-core defects. Details and the remediation list are in
 [`docs/reports/c4-agent-acceptance.md`](reports/c4-agent-acceptance.md).
 
+### 6.10 Rerun on 0.1.1
+
+The rerun (2026-10-28) used the signed 0.1.1 client against the matching server,
+with the window reset to `active` and file transfer temporarily enabled. The
+agent chose its own task and completed two training arms in parallel inside one
+2 GPU / 16 CPU / 48 GiB / 4 h lease, survived a six-minute client disconnect,
+released both allocations, and pulled a file from the released workspace with a
+matching hash. Administrator checks matched the server-side checkpoint hashes.
+The rerun closed the blocking findings and recorded three new non-blocking ones
+(`job start` name reuse, host-wide `nproc` versus the CPU quota, missing passwd
+entry for the member UID). Details are in the same report, §5.2.
+
 ## 7. Evidence to retain
 
 Retain the complete command output and the following artifacts:

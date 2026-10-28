@@ -106,6 +106,56 @@ window: the stale `uv.lock` that omitted the `portal` extra (#7), the portal
 sudo check that treated `sudo -l`'s exit status as a privilege grant (#8), and
 the staged-venv rename that left dead shebangs in the console scripts (#9).
 
+### 5.2 Acceptance rerun on 0.1.1 (2026-10-28)
+
+The same member identity reran the acceptance with the signed 0.1.1 client
+installed from the CI-built candidate package, against the server upgraded to
+the same 0.1.1 tree. The task, configuration, and run layout were chosen by the
+agent; the administrator only reset the time window (`mode=active`, four free
+GPUs, file transfer enabled for the duration) and did not intervene afterwards.
+The agent reported zero requests for external assistance (two in the first
+round) and completed the work in one lease: 2 GPU / 16 CPU / 48 GiB / 4 h,
+applied through the normal path and released 2 h 06 min later.
+
+| Item | Result |
+|---|---|
+| Real training | Pass. Two matching arms (chromatic / achromatic PSF) trained in parallel on two GPUs inside one lease; 248 and 300 epochs, best checkpoints saved, full validation metrics written |
+| Reproducibility | Pass. One arm reproduced an earlier single-GPU run epoch by epoch (max absolute difference 0.0), so single vs. dual GPU and one vs. two concurrent processes do not change the numbers |
+| Disconnect recovery | Pass. The client was absent for 6 min mid-run; training continued (epoch 2 to 12) with complete logs |
+| Release | Pass. Both allocations released, four GPUs back to `free`, no leftover containers |
+| Post-release pull | Pass. Retrieved a file from the released workspace, hash identical to the copy taken before release |
+| Administrator check | Checkpoint, history, validation, and execution hashes on the server matched the copies the agent pulled; workspace (2.0 GB) retained; no test-set data in the workspace |
+| Privilege boundary | Pass. Member UID, read-only root, no sudo, only the allocated GPUs visible |
+
+Per-item recheck of the first round's findings:
+
+| Item | Rerun result |
+|---|---|
+| C4-1 | Fixed. A deliberate wrong-fingerprint run printed the offered algorithm, the real RSA fingerprint, and why an ED25519 fingerprint can never match; the correct run then exited 0 |
+| C4-2 | Fixed. No decode crash, no traceback, exit code 0, version reported correctly. Residual: on a console whose code page cannot represent full-width punctuation, those characters still render as `?` (see C4-8) |
+| C4-3 | Fixed. `start --gpu-count 1` printed the fallback notice and allocated through `apply` |
+| C4-4 | Improved. The old `monitor_only` path is gone; an over-sized request now returns `gpu_busy` with the requested and free counts. It still does not suggest queuing, see C4-4 follow-up below |
+| C4-5 | Fixed. `nvidia-smi --query-gpu=...` inside the container returned both allocated 3090s |
+| C4-6 | Fixed. Post-release `pull` exited 0 with a matching hash |
+| C4-7 | Fixed in the rendered output; the JSON body of a released allocation still carries `remaining_seconds` |
+| C4-8 | Partially fixed. Redirected and piped output is UTF-8 and JSON parses, but non-JSON output on an interactive console still uses the console encoding and loses unrepresentable punctuation |
+
+New findings from the rerun (non-blocking, not yet fixed):
+
+| ID | Severity | Finding | Recommended fix |
+|---|---|---|---|
+| C4-9 | Medium | `job start --name <existing name>` does not conflict when only a stale log remains from an earlier lease: it appends to that log, so `job logs` replays the previous session and looks like the new job produced nothing | Refuse to start when the log already exists (or rotate it and say so), instead of appending silently |
+| C4-10 | Medium | The container reports the host CPU count (72) although the lease grants 16, and default thread pools follow it; two concurrent trainings over-subscribed the host and ran about 3x slower until the agent set `OMP/MKL/OPENBLAS_NUM_THREADS=4` by hand | Export thread limits matching the allocation, and state in the guide that `nproc` is host-wide |
+| C4-11 | Low | `id -un` fails with "cannot find name for user ID 1003" because the container has no passwd entry for the member UID; harmless but confusing in scripts | Add a passwd entry for the member UID at container creation |
+| C4-4 follow-up | Low | `gpu_busy` does not mention that removing `--no-queue` would queue instead | Add the next step to the error detail |
+
+Verdict: **C-4 passes on 0.1.1**. All blocking items from the first round are
+closed and the member-visible workflow held up without administrator help.
+C4-9 and C4-10 are cheap fixes and should land before the service is offered to
+more members; C4-7 (JSON field), C4-11, and the C4-4 hint can go in the same
+batch. The agent chose to keep the workspace and both checkpoints for review;
+they are not deleted.
+
 ## 6. Project-side findings
 
 1. The best checkpoint can land on an epoch that `eval_every` does not sample,
