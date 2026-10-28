@@ -34,6 +34,7 @@
     <button class="tab" data-tab="apply">申请</button>
     <button class="tab" data-tab="allocations">我的 allocation</button>
     <button class="tab" data-tab="unmanaged">未纳管</button>
+    <button class="tab" data-tab="environments">环境</button>
     <button class="tab" data-tab="admin" id="admin-tab" hidden>管理员</button>
   </nav>
 
@@ -65,6 +66,9 @@
             </label>
             <label>镜像
               <input name="image" type="text" placeholder="默认基础镜像">
+            </label>
+            <label>环境版本
+              <input name="env" type="text" placeholder="project@v1（与镜像互斥）">
             </label>
           </div>
           <label>备注
@@ -118,8 +122,76 @@
       <div id="unmanaged-processes" class="allocation-list empty">None.</div>
     </section>
 
+    <section id="tab-environments" class="tab-panel">
+      <div class="panel">
+        <h2>科研项目</h2>
+        <p class="muted">
+          项目 → 环境档案 → 不可变版本。采集只读记录依赖；构建与功能验证是两个独立维度。
+        </p>
+        <form id="project-create-form" class="inline-form">
+          <input name="name" placeholder="项目名，例如 reconstruction" maxlength="64" required>
+          <button type="submit" class="primary">创建项目</button>
+        </form>
+        <span id="project-error" class="error-text"></span>
+        <div id="project-list" class="allocation-list empty">No projects.</div>
+      </div>
+
+      <div class="panel">
+        <div class="section-head">
+          <h2>环境版本</h2>
+          <div class="actions">
+            <select id="env-project"></select>
+            <button id="env-refresh" class="ghost">刷新</button>
+          </div>
+        </div>
+        <form id="env-capture-form" class="inline-form">
+          <select name="allocation" id="env-capture-allocation"></select>
+          <button type="submit" class="ghost">采集当前环境</button>
+        </form>
+        <p class="muted">从 active allocation 采集到选中的项目，生成一个新的不可变版本。</p>
+        <span id="env-capture-error" class="error-text"></span>
+        <div id="version-list" class="allocation-list empty">No versions.</div>
+      </div>
+
+      <div class="panel">
+        <div class="section-head">
+          <h2>旧容器认领</h2>
+          <button id="legacy-refresh" class="ghost">刷新</button>
+        </div>
+        <p class="muted">
+          旧容器只登记脱敏元数据并做只读探测；认领需要管理员批准。已停止的容器不会被启动，
+          也不会使用 docker commit/export 作为迁移证据。
+        </p>
+        <form id="legacy-claim-form" class="inline-form">
+          <select name="source" id="legacy-source"></select>
+          <select name="project" id="legacy-project"></select>
+          <input name="reason" placeholder="为什么属于你的项目（可选）" maxlength="500">
+          <button type="submit" class="ghost">提交认领申请</button>
+        </form>
+        <span id="legacy-claim-error" class="error-text"></span>
+        <div id="legacy-sources" class="allocation-list empty">No sources.</div>
+        <h3>我的认领申请</h3>
+        <div id="legacy-claims" class="allocation-list empty">No claims.</div>
+      </div>
+    </section>
+
     <section id="tab-admin" class="tab-panel">
       <div id="admin-content">
+        <div class="panel" id="legacy-admin-panel">
+          <div class="section-head">
+            <h2>旧容器审核</h2>
+            <div class="actions">
+              <button id="legacy-scan" class="ghost">扫描主机容器</button>
+              <button id="legacy-admin-refresh" class="ghost">刷新</button>
+            </div>
+          </div>
+          <p class="muted">
+            批准一条认领前请确认同一容器没有其他待处理申请；系统不会自动替管理员选择。
+          </p>
+          <div id="legacy-admin-sources" class="allocation-list empty">No sources.</div>
+          <h3>认领申请</h3>
+          <div id="legacy-admin-claims" class="allocation-list empty">No claims.</div>
+        </div>
         <div class="panel" id="membership-panel" hidden>
           <h2>加入申请</h2>
           <div class="actions">

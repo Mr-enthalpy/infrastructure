@@ -39,6 +39,14 @@ VSCODE_CONFIG_PATH_KEY: web.AppKey[str] = web.AppKey("vscode_config_path", str)
 ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 ALLOCATION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 JOB_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ENV_REF_RE = re.compile(
+    r"^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,63}@v[0-9]{1,6}|ver_[A-Za-z0-9_-]{1,64})$"
+)
+LEGACY_SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{0,64}$")
+LEGACY_CLAIM_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+CLAIM_STATUSES = frozenset({"pending", "approved", "rejected", "conflict"})
+SOURCE_STATUSES = frozenset({"available", "claimed", "dismissed"})
 # The tunnel must come up through SSH, the broker, and the container sshd;
 # anything slower than this is treated as a failure instead of a false
 # success.
@@ -211,6 +219,25 @@ def create_app(
     app.router.add_post("/api/admin/membership/retry", _api_admin_operation_retry)
     app.router.add_post("/api/admin/membership/keys/add", _api_admin_key_add)
     app.router.add_post("/api/admin/membership/keys/revoke", _api_admin_key_revoke)
+    app.router.add_get("/api/projects", _api_projects)
+    app.router.add_post("/api/projects", _api_project_create)
+    app.router.add_get("/api/projects/{name}", _api_project_show)
+    app.router.add_post("/api/projects/{name}/archive", _api_project_archive)
+    app.router.add_get("/api/environments", _api_environments)
+    app.router.add_post("/api/environments", _api_env_capture)
+    app.router.add_get("/api/environments/{ref}", _api_environment)
+    app.router.add_get("/api/environments/{ref}/diff", _api_environment_diff)
+    app.router.add_post("/api/environments/{ref}/build", _api_env_build)
+    app.router.add_post("/api/environments/{ref}/verify", _api_env_verify)
+    app.router.add_get("/api/legacy/sources", _api_legacy_sources)
+    app.router.add_get("/api/legacy/claims", _api_legacy_claims)
+    app.router.add_post("/api/legacy/claims", _api_legacy_claim)
+    app.router.add_get("/api/legacy/claims/{claim_id}", _api_legacy_claim_show)
+    app.router.add_post("/api/admin/legacy/scan", _api_admin_legacy_scan)
+    app.router.add_get("/api/admin/legacy/sources", _api_admin_legacy_sources)
+    app.router.add_get("/api/admin/legacy/claims", _api_admin_legacy_claims)
+    app.router.add_post("/api/admin/legacy/decision", _api_admin_legacy_decision)
+    app.router.add_post("/api/admin/legacy/capture", _api_admin_legacy_capture)
     app.router.add_get("/ws/shell/{allocation_id}", _ws_shell)
     return app
 
@@ -335,7 +362,14 @@ async def _api_apply(request: web.Request) -> web.Response:
             return _json(_error("bad_request", "hours must be an integer"), 400)
         args.extend(["--hours", str(hours_value)])
     image = body.get("image")
-    if isinstance(image, str) and image:
+    env = body.get("env")
+    if isinstance(image, str) and image and isinstance(env, str) and env:
+        return _json(_error("bad_request", "image and env are mutually exclusive"), 400)
+    if isinstance(env, str) and env:
+        if not ENV_REF_RE.fullmatch(env):
+            return _json(_error("bad_request", "env must look like project@v1"), 400)
+        args.extend(["--env", env])
+    elif isinstance(image, str) and image:
         args.extend(["--image", image])
     note = body.get("note")
     if isinstance(note, str) and note:
@@ -382,6 +416,188 @@ async def _api_release(request: web.Request) -> web.Response:
     if not isinstance(allocation_id, str) or not allocation_id:
         return _json(_error("bad_request", "id is required"), 400)
     return await _remote(request, ["release", allocation_id])
+
+
+def _bad(message: str) -> web.Response:
+    return _json(_error("bad_request", message), 400)
+
+
+async def _api_projects(request: web.Request) -> web.Response:
+    return await _remote(request, ["project", "list"])
+
+
+async def _api_project_create(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    name = body.get("name")
+    if not isinstance(name, str) or not PROJECT_RE.fullmatch(name):
+        return _bad("name must be 1-64 letters, digits, dot, underscore or hyphen")
+    return await _remote(request, ["project", "create", "--name", name])
+
+
+async def _api_project_show(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    if not PROJECT_RE.fullmatch(name):
+        return _bad("invalid project name")
+    return await _remote(request, ["project", "show", name])
+
+
+async def _api_project_archive(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    if not PROJECT_RE.fullmatch(name):
+        return _bad("invalid project name")
+    return await _remote(request, ["project", "archive", name])
+
+
+async def _api_environments(request: web.Request) -> web.Response:
+    project = request.query.get("project", "")
+    if not PROJECT_RE.fullmatch(project):
+        return _bad("project query parameter is required")
+    try:
+        limit = int(request.query.get("limit", "50"))
+    except ValueError:
+        return _bad("limit must be an integer")
+    if not 1 <= limit <= 200:
+        return _bad("limit must be between 1 and 200")
+    return await _remote(request, ["env", "list", "--project", project, "--limit", str(limit)])
+
+
+async def _api_env_capture(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    project = body.get("project")
+    allocation_id = body.get("allocation")
+    if not isinstance(project, str) or not PROJECT_RE.fullmatch(project):
+        return _bad("project is required")
+    if not isinstance(allocation_id, str) or not ALLOCATION_RE.fullmatch(allocation_id):
+        return _bad("allocation is required")
+    return await _remote(
+        request,
+        ["env", "capture", "--allocation", allocation_id, "--project", project],
+    )
+
+
+async def _api_environment(request: web.Request) -> web.Response:
+    ref = request.match_info["ref"]
+    if not ENV_REF_RE.fullmatch(ref):
+        return _bad("invalid environment ref")
+    return await _remote(request, ["env", "show", ref])
+
+
+async def _api_environment_diff(request: web.Request) -> web.Response:
+    ref = request.match_info["ref"]
+    other = request.query.get("other", "")
+    if not ENV_REF_RE.fullmatch(ref) or not ENV_REF_RE.fullmatch(other):
+        return _bad("other must be a valid environment ref")
+    return await _remote(request, ["env", "diff", other, ref])
+
+
+async def _api_env_build(request: web.Request) -> web.Response:
+    ref = request.match_info["ref"]
+    if not ENV_REF_RE.fullmatch(ref):
+        return _bad("invalid environment ref")
+    return await _remote(request, ["env", "build", ref])
+
+
+async def _api_env_verify(request: web.Request) -> web.Response:
+    ref = request.match_info["ref"]
+    if not ENV_REF_RE.fullmatch(ref):
+        return _bad("invalid environment ref")
+    body = await _json_body(request)
+    allocation_id = body.get("allocation")
+    if not isinstance(allocation_id, str) or not ALLOCATION_RE.fullmatch(allocation_id):
+        return _bad("allocation is required")
+    return await _remote(request, ["env", "verify", ref, "--allocation", allocation_id])
+
+
+async def _api_legacy_sources(request: web.Request) -> web.Response:
+    return await _remote(request, ["legacy", "list"])
+
+
+async def _api_legacy_claims(request: web.Request) -> web.Response:
+    args = ["legacy", "claims"]
+    status = request.query.get("status", "")
+    if status:
+        if status not in CLAIM_STATUSES:
+            return _bad("unknown claim status")
+        args.extend(["--status", status])
+    return await _remote(request, args)
+
+
+async def _api_legacy_claim(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    source = body.get("source")
+    project = body.get("project")
+    reason = body.get("reason", "")
+    if not isinstance(source, str) or not LEGACY_SOURCE_RE.fullmatch(source) or not source:
+        return _bad("source is required")
+    if not isinstance(project, str) or not PROJECT_RE.fullmatch(project):
+        return _bad("project is required")
+    if not isinstance(reason, str) or len(reason) > 1000:
+        return _bad("reason must be at most 1000 characters")
+    args = ["legacy", "claim", source, "--project", project]
+    if reason:
+        args.extend(["--reason", reason])
+    return await _remote(request, args)
+
+
+async def _api_legacy_claim_show(request: web.Request) -> web.Response:
+    claim_id = request.match_info["claim_id"]
+    if not LEGACY_CLAIM_RE.fullmatch(claim_id):
+        return _bad("invalid claim id")
+    return await _remote(request, ["legacy", "show", claim_id])
+
+
+async def _api_admin_legacy_scan(request: web.Request) -> web.Response:
+    return await _remote(request, ["admin", "legacy-scan"], admin=True)
+
+
+async def _api_admin_legacy_sources(request: web.Request) -> web.Response:
+    args = ["admin", "legacy-sources"]
+    status = request.query.get("status", "")
+    if status:
+        if status not in SOURCE_STATUSES:
+            return _bad("unknown source status")
+        args.extend(["--status", status])
+    return await _remote(request, args, admin=True)
+
+
+async def _api_admin_legacy_claims(request: web.Request) -> web.Response:
+    args = ["admin", "legacy-claims"]
+    status = request.query.get("status", "")
+    source = request.query.get("source", "")
+    if status:
+        if status not in CLAIM_STATUSES:
+            return _bad("unknown claim status")
+        args.extend(["--status", status])
+    if source:
+        if not LEGACY_SOURCE_RE.fullmatch(source):
+            return _bad("invalid source id")
+        args.extend(["--source", source])
+    return await _remote(request, args, admin=True)
+
+
+async def _api_admin_legacy_decision(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    claim_id = body.get("id")
+    approve = body.get("approve")
+    note = body.get("note", "")
+    if not isinstance(claim_id, str) or not LEGACY_CLAIM_RE.fullmatch(claim_id):
+        return _bad("id is required")
+    if not isinstance(approve, bool):
+        return _bad("approve must be true or false")
+    if not isinstance(note, str) or len(note) > 1000:
+        return _bad("note must be at most 1000 characters")
+    args = ["admin", "legacy-decide", claim_id, "--approve" if approve else "--reject"]
+    if note:
+        args.extend(["--note", note])
+    return await _remote(request, args, admin=True)
+
+
+async def _api_admin_legacy_capture(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    claim_id = body.get("id")
+    if not isinstance(claim_id, str) or not LEGACY_CLAIM_RE.fullmatch(claim_id):
+        return _bad("id is required")
+    return await _remote(request, ["admin", "legacy-capture", claim_id], admin=True)
 
 
 async def _api_logs(request: web.Request) -> web.Response:

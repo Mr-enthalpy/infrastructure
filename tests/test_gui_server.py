@@ -116,6 +116,122 @@ class FakeRunner:
             data = {"id": args[2], "status": "released"}
         elif args[:2] == ["admin", "reconcile"]:
             data = {"kept": 0}
+        elif args[:2] == ["admin", "legacy-scan"]:
+            data = {"scanned": 2, "dismissed": 1}
+        elif args[:2] == ["admin", "legacy-sources"]:
+            data = {
+                "sources": [
+                    {
+                        "source_id": "src_1",
+                        "container_id": "c" * 64,
+                        "container_name": "old-workspace",
+                        "image": "citespec-base:2024.09",
+                        "state": "running",
+                        "status": "available",
+                        "created_at": "2025-03-01T10:00:00Z",
+                        "scanned_at": "2026-10-28T00:00:00Z",
+                    }
+                ]
+            }
+        elif args[:2] == ["admin", "legacy-claims"]:
+            data = {
+                "claims": [
+                    {
+                        "claim_id": "clm_1",
+                        "status": "pending",
+                        "member_id": "m1",
+                        "project_id": "prj_1",
+                        "reason": "my old runs",
+                        "source": {"source_id": "src_1", "container_name": "old-workspace"},
+                        "version_id": None,
+                    }
+                ]
+            }
+        elif args[:2] == ["admin", "legacy-decide"]:
+            data = {
+                "claim": {
+                    "claim_id": args[2],
+                    "status": "approved" if "--approve" in args else "rejected",
+                }
+            }
+        elif args[:2] == ["admin", "legacy-capture"]:
+            data = {
+                "version": {"ref": "alice-proj@v1", "capture_fidelity": "partial"},
+                "claim": {"claim_id": args[2], "status": "approved"},
+            }
+        elif args[:1] == ["project"]:
+            if args[1] == "list":
+                data = {
+                    "projects": [
+                        {
+                            "name": "alice-proj",
+                            "status": "active",
+                            "versions": 1,
+                            "latest": "alice-proj@v1",
+                        }
+                    ]
+                }
+            elif args[1] == "create":
+                data = {"project": {"name": args[3], "status": "active", "versions": 0}}
+            else:
+                data = {
+                    "project": {"name": args[2], "status": "active", "versions": 0},
+                    "versions": [],
+                }
+        elif args[:1] == ["env"]:
+            if args[1] == "list":
+                data = {
+                    "versions": [
+                        {
+                            "version_id": "ver_1",
+                            "ref": "alice-proj@v1",
+                            "origin": "capture",
+                            "capture_fidelity": "complete",
+                            "verification": "built",
+                            "visibility": "private",
+                            "created_at": "2026-10-28T00:00:00Z",
+                            "sha256": "a" * 64,
+                        }
+                    ]
+                }
+            elif args[1] == "show":
+                data = {
+                    "version": {"ref": args[2], "verification": "built"},
+                    "manifest": {"base": {}, "python": {"packages": []}, "system": {}},
+                    "artifacts": [],
+                    "builds": [],
+                }
+            elif args[1] == "diff":
+                data = {"left": {}, "right": {}, "diff": {"changed": False}}
+            elif args[1] == "build":
+                data = {
+                    "build": {"status": "built", "image_tag": "citespec-env:x"},
+                    "version": {"ref": args[2], "verification": "built"},
+                }
+            elif args[1] == "verify":
+                data = {"version": {"ref": args[2], "verification": "functional_passed"}}
+            else:
+                data = {"version": {"ref": "alice-proj@v1", "capture_fidelity": "complete"}}
+        elif args[:1] == ["legacy"]:
+            if args[1] == "list":
+                data = {
+                    "sources": [
+                        {
+                            "source_id": "src_1",
+                            "container": "c" * 12,
+                            "image": "citespec-base:2024.09",
+                            "state": "running",
+                            "status": "available",
+                            "metadata": {"image": "citespec-base:2024.09"},
+                        }
+                    ]
+                }
+            elif args[1] == "claim":
+                data = {"claim": {"claim_id": "clm_1", "status": "pending"}}
+            elif args[1] == "claims":
+                data = {"claims": [{"claim_id": "clm_1", "status": "pending"}]}
+            else:
+                data = {"claim": {"claim_id": args[2], "status": "pending"}}
         else:
             data = {}
         return {"ok": True, "data": data}
@@ -152,6 +268,7 @@ async def test_index_contains_token_and_server(monitor_config):
         assert monitor_config.server.name in text
         assert "my-queue" in text
         assert "my-jobs" in text
+        assert "tab-environments" in text
     finally:
         await client.close()
 
@@ -843,5 +960,187 @@ async def test_membership_admin_endpoints(monitor_config):
             data=json.dumps({"member_id": "m1"}),
         )
         assert key_missing.status == 400
+    finally:
+        await client.close()
+
+
+async def test_project_and_environment_routes(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        listed = await client.get("/api/projects", headers=_headers())
+        assert listed.status == 200
+        assert (await listed.json())["data"]["projects"][0]["name"] == "alice-proj"
+        created = await client.post(
+            "/api/projects",
+            headers=_headers(),
+            data=json.dumps({"name": "new-proj"}),
+        )
+        assert created.status == 200
+        bad = await client.post(
+            "/api/projects",
+            headers=_headers(),
+            data=json.dumps({"name": "../escape"}),
+        )
+        assert bad.status == 400
+        versions = await client.get(
+            "/api/environments?project=alice-proj",
+            headers=_headers(),
+        )
+        assert versions.status == 200
+        assert (await versions.json())["data"]["versions"][0]["ref"] == "alice-proj@v1"
+        shown = await client.get("/api/environments/alice-proj%40v1", headers=_headers())
+        assert shown.status == 200
+        diffed = await client.get(
+            "/api/environments/alice-proj%40v1/diff?other=alice-proj%40v0",
+            headers=_headers(),
+        )
+        assert diffed.status == 200
+        built = await client.post(
+            "/api/environments/alice-proj%40v1/build",
+            headers=_headers(),
+        )
+        assert built.status == 200
+        verified = await client.post(
+            "/api/environments/alice-proj%40v1/verify",
+            headers=_headers(),
+            data=json.dumps({"allocation": "alloc-1"}),
+        )
+        assert verified.status == 200
+        captured = await client.post(
+            "/api/environments",
+            headers=_headers(),
+            data=json.dumps({"project": "alice-proj", "allocation": "alloc-1"}),
+        )
+        assert captured.status == 200
+        assert runner.calls == [
+            ("member-alias", ["project", "list"]),
+            ("member-alias", ["project", "create", "--name", "new-proj"]),
+            ("member-alias", ["env", "list", "--project", "alice-proj", "--limit", "50"]),
+            ("member-alias", ["env", "show", "alice-proj@v1"]),
+            ("member-alias", ["env", "diff", "alice-proj@v0", "alice-proj@v1"]),
+            ("member-alias", ["env", "build", "alice-proj@v1"]),
+            (
+                "member-alias",
+                ["env", "verify", "alice-proj@v1", "--allocation", "alloc-1"],
+            ),
+            (
+                "member-alias",
+                ["env", "capture", "--allocation", "alloc-1", "--project", "alice-proj"],
+            ),
+        ]
+    finally:
+        await client.close()
+
+
+async def test_apply_forwards_environment_version(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        response = await client.post(
+            "/api/apply",
+            headers=_headers(),
+            data=json.dumps(
+                {"gpus": [], "cpus": 4, "memory_gb": 8, "hours": 2, "env": "alice-proj@v1"}
+            ),
+        )
+        assert response.status == 200
+        applied = runner.calls[-1][1]
+        assert applied[applied.index("--env") + 1] == "alice-proj@v1"
+        conflict = await client.post(
+            "/api/apply",
+            headers=_headers(),
+            data=json.dumps(
+                {
+                    "gpus": [],
+                    "cpus": 4,
+                    "memory_gb": 8,
+                    "image": "citespec-base:2026.10",
+                    "env": "alice-proj@v1",
+                }
+            ),
+        )
+        assert conflict.status == 400
+        invalid = await client.post(
+            "/api/apply",
+            headers=_headers(),
+            data=json.dumps({"gpus": [], "cpus": 4, "memory_gb": 8, "env": "../../x"}),
+        )
+        assert invalid.status == 400
+        assert len(runner.calls) == 1
+    finally:
+        await client.close()
+
+
+async def test_legacy_member_routes(monitor_config):
+    runner = FakeRunner()
+    client = await _client(_app(monitor_config, runner))
+    try:
+        sources = await client.get("/api/legacy/sources", headers=_headers())
+        assert sources.status == 200
+        claims = await client.get("/api/legacy/claims?status=pending", headers=_headers())
+        assert claims.status == 200
+        claim = await client.post(
+            "/api/legacy/claims",
+            headers=_headers(),
+            data=json.dumps({"source": "src_1", "project": "alice-proj", "reason": "my old runs"}),
+        )
+        assert claim.status == 200
+        bad_status = await client.get(
+            "/api/legacy/claims?status=unknown",
+            headers=_headers(),
+        )
+        assert bad_status.status == 400
+        shown = await client.get("/api/legacy/claims/clm_1", headers=_headers())
+        assert shown.status == 200
+        assert runner.calls == [
+            ("member-alias", ["legacy", "list"]),
+            ("member-alias", ["legacy", "claims", "--status", "pending"]),
+            (
+                "member-alias",
+                ["legacy", "claim", "src_1", "--project", "alice-proj", "--reason", "my old runs"],
+            ),
+            ("member-alias", ["legacy", "show", "clm_1"]),
+        ]
+    finally:
+        await client.close()
+
+
+async def test_admin_legacy_routes_use_admin_alias(monitor_config):
+    runner = FakeRunner(admin_alias="admin-alias")
+    client = await _client(_app(monitor_config, runner, admin_alias="admin-alias"))
+    try:
+        scan = await client.post("/api/admin/legacy/scan", headers=_headers())
+        assert scan.status == 200
+        sources = await client.get("/api/admin/legacy/sources?status=available", headers=_headers())
+        assert sources.status == 200
+        claims = await client.get("/api/admin/legacy/claims?status=pending", headers=_headers())
+        assert claims.status == 200
+        approve = await client.post(
+            "/api/admin/legacy/decision",
+            headers=_headers(),
+            data=json.dumps({"id": "clm_1", "approve": True, "note": "ok"}),
+        )
+        reject = await client.post(
+            "/api/admin/legacy/decision",
+            headers=_headers(),
+            data=json.dumps({"id": "clm_1", "approve": False}),
+        )
+        capture = await client.post(
+            "/api/admin/legacy/capture",
+            headers=_headers(),
+            data=json.dumps({"id": "clm_1"}),
+        )
+        assert approve.status == 200
+        assert reject.status == 200
+        assert capture.status == 200
+        assert runner.calls == [
+            ("admin-alias", ["admin", "legacy-scan"]),
+            ("admin-alias", ["admin", "legacy-sources", "--status", "available"]),
+            ("admin-alias", ["admin", "legacy-claims", "--status", "pending"]),
+            ("admin-alias", ["admin", "legacy-decide", "clm_1", "--approve", "--note", "ok"]),
+            ("admin-alias", ["admin", "legacy-decide", "clm_1", "--reject"]),
+            ("admin-alias", ["admin", "legacy-capture", "clm_1"]),
+        ]
     finally:
         await client.close()
