@@ -3847,6 +3847,7 @@ class Broker:
             )
         container_id = str(allocation["container_id"])
         log_path = self._job_log_path(allocation, name)
+        await asyncio.to_thread(self._ensure_job_log, allocation, name)
         existing_bytes = await asyncio.to_thread(self._existing_job_log_size, allocation, name)
         if existing_bytes:
             # Appending to an old log makes `job logs` replay the previous
@@ -3855,7 +3856,6 @@ class Broker:
                 f"job log already exists for '{name}' ({existing_bytes} bytes); "
                 "choose another --name or move the old log out of .citespec-logs"
             )
-        await asyncio.to_thread(self._ensure_job_log, allocation, name)
         await asyncio.to_thread(self.docker.start_job, container_id, name, command_argv)
         with self._connection() as connection:
             store.record_event(
