@@ -90,7 +90,8 @@ citespec-resource admin legacy-capture clm_xxx
   必须显式驳回或让申请人撤回，系统不自动替人做选择。
 - 一个成员对同一来源只能有一条待处理/已批准申请。
 - 已停止的容器不会被启动，也不会 exec；只从归档读取固定路径
-  `/etc/os-release` 与 `/opt/conda/conda-meta`。
+  `/etc/os-release`、`/usr/lib/os-release`（Ubuntu 上前者是指向后者的符号链接）
+  与 `/opt/conda/conda-meta`。
 - 运行中的容器使用与普通采集相同的固定探针，但以 `65534:65534`（nobody）执行。
 - 归档读取有字节与条目上限，拒绝绝对路径、`..` 与 tar-slip。
 - V1 不做 root exec；探针失败时回退到固定路径归档读取，并在版本 notes 中写明。

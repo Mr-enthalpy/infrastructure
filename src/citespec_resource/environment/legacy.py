@@ -26,8 +26,10 @@ PROBE_USER = "65534:65534"
 
 # Fixed archive paths for stopped containers. There is no directory walk and no
 # attempt to guess a Python version: the operator can rebuild from these and
-# mark the result partial.
-ARCHIVE_PATHS = ("/etc/os-release", "/opt/conda/conda-meta")
+# mark the result partial.  ``/etc/os-release`` is a symlink to
+# ``/usr/lib/os-release`` on current systemd distributions, and Docker's
+# ``get_archive`` returns the symlink itself, so the target is listed too.
+ARCHIVE_PATHS = ("/etc/os-release", "/usr/lib/os-release", "/opt/conda/conda-meta")
 ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
 ARCHIVE_MAX_ENTRIES = 4000
 
@@ -131,11 +133,11 @@ def _archive_probe(
     except DockerError as exc:
         notes.append(f"只读归档读取失败：{exc}")
         files = {}
-    os_release = files.get("/etc/os-release", b"")
+    os_release = files.get("/etc/os-release", b"") or files.get("/usr/lib/os-release", b"")
     if os_release:
         probe["os"] = _parse_os_release(os_release)
     else:
-        notes.append("没有读到 /etc/os-release")
+        notes.append("没有读到 /etc/os-release 或 /usr/lib/os-release")
     conda = _conda_packages(files, "/opt/conda/conda-meta", max_packages=max_packages)
     if conda:
         probe["conda"] = conda

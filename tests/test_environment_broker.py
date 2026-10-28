@@ -11,6 +11,7 @@ import pytest
 from citespec_resource.broker.docker_driver import ContainerInfo
 from citespec_resource.broker.server import Broker
 from citespec_resource.db import connect
+from citespec_resource.environment import legacy as env_legacy
 from citespec_resource.gpu_audit import GpuAuditResult
 from citespec_resource.identity import Identity
 from citespec_resource.legacy_audit import LegacyAuditResult
@@ -595,6 +596,35 @@ async def test_legacy_running_capture_uses_the_fixed_probe_as_nobody(tmp_path, l
     twice = await _call(broker, "admin_legacy_capture", {"id": claim_id}, ADMIN)
     assert twice["ok"] is False
     assert twice["error"]["code"] == "conflict"
+
+
+def test_stopped_archive_follows_the_os_release_symlink_target(tmp_path):
+    """``/etc/os-release`` is a symlink to ``/usr/lib/os-release`` on Ubuntu.
+
+    Docker's ``get_archive`` returns the symlink itself, so the fixed archive
+    list includes the target path.
+    """
+
+    docker = FakeDocker()
+    docker.archives["c" * 64] = {
+        "/usr/lib/os-release": b'PRETTY_NAME="Ubuntu 22.04.5 LTS"\n',
+        "/opt/conda/conda-meta/numpy-2.0.0.json": json.dumps(
+            {"name": "numpy", "version": "2.0.0"}
+        ).encode("utf-8"),
+    }
+    notes: list[str] = []
+
+    probe = env_legacy._archive_probe(
+        docker,
+        "c" * 64,
+        notes,
+        max_packages=10,
+        reason="",
+    )
+
+    assert probe["os"]["PRETTY_NAME"] == "Ubuntu 22.04.5 LTS"
+    assert probe["conda"] == [{"name": "numpy", "version": "2.0.0"}]
+    assert "/usr/lib/os-release" in docker.archive_calls[-1][1]
 
 
 async def test_legacy_stopped_capture_reads_archives_without_exec(tmp_path, legacy_config):
