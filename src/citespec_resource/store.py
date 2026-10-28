@@ -150,14 +150,17 @@ def allocation_to_dict(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     gpus = _gpu_refs(connection, str(row["id"]))
+    status = str(row["status"])
     expires_at = datetime.fromisoformat(str(row["expires_at"]))
     current = now or utcnow()
-    remaining = max(0, int((expires_at - current).total_seconds()))
+    # Only a running lease has a meaningful countdown; reporting one for a
+    # released or failed allocation looks like it is still consuming the GPU.
+    remaining = max(0, int((expires_at - current).total_seconds())) if status == "active" else None
     return {
         "id": str(row["id"]),
         "owner_uid": int(row["owner_uid"]),
         "owner": str(row["owner_name"]),
-        "status": str(row["status"]),
+        "status": status,
         "image": str(row["image"]),
         "cpus": float(row["cpus"]),
         "memory_gb": int(row["memory_gb"]),

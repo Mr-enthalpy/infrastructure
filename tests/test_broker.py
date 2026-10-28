@@ -643,6 +643,27 @@ async def test_second_apply_for_same_gpu_is_busy(tmp_path, active_config):
     assert second["error"]["code"] == "gpu_busy"
 
 
+async def test_gpu_busy_tells_the_member_how_to_queue(tmp_path, active_config):
+    config = replace(active_config, hardware=replace(active_config.hardware, gpu_count=2))
+    broker, _ = _broker(tmp_path, config, docker=FakeDocker(gpu_count=2))
+    first = await _call(
+        broker,
+        "apply",
+        {"gpu_count": 2, "cpus": 8, "memory_gb": 32},
+        ALICE,
+    )
+    assert first["ok"] is True
+    second = await _call(
+        broker,
+        "apply",
+        {"gpu_count": 1, "cpus": 8, "memory_gb": 32, "queue": False},
+        BOB,
+    )
+    assert second["ok"] is False
+    assert second["error"]["code"] == "gpu_busy"
+    assert "--no-queue" in second["error"]["message"]
+
+
 async def test_monitor_mode_rejects_apply(tmp_path, monitor_config):
     broker, _ = _broker(tmp_path, monitor_config)
     response = await _call(
@@ -1760,6 +1781,40 @@ async def test_job_start_accepts_copy_paste_shell_command(tmp_path, active_confi
     ]
 
 
+@pytest.mark.linux
+@pytest.mark.skipif(
+    not workspace_io.supported(),
+    reason="descriptor-relative job logs require Linux",
+)
+async def test_job_start_refuses_to_append_to_an_old_log(tmp_path, active_config):
+    broker, fake = _broker(tmp_path, active_config)
+    applied = await _call(broker, "apply", {"gpus": [2], "cpus": 8, "memory_gb": 32}, ALICE)
+    allocation_id = applied["data"]["id"]
+    log_dir = Path(active_config.server.workspace_root) / ALICE.username / ".citespec-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "train.log").write_bytes(b"old session\n")
+
+    refused = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "train", "command": "python train.py"},
+        ALICE,
+    )
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "conflict"
+    assert fake.started_job_commands == []
+
+    # An empty leftover from a failed start is not stale output.
+    (log_dir / "train.log").write_bytes(b"")
+    started = await _call(
+        broker,
+        "job_start",
+        {"id": allocation_id, "name": "train", "command": "python train.py"},
+        ALICE,
+    )
+    assert started["ok"] is True
+
+
 async def test_job_files_survive_release(tmp_path, active_config):
     broker, _ = _broker(tmp_path, active_config)
     applied = await _call(broker, "apply", {"gpus": [3], "cpus": 8, "memory_gb": 32}, ALICE)
@@ -1769,6 +1824,7 @@ async def test_job_files_survive_release(tmp_path, active_config):
     (log_dir / "train.log").write_bytes(b"epoch 1\nepoch 2\n")
     released = await _call(broker, "release", {"id": allocation_id}, ALICE)
     assert released["ok"] is True
+    assert released["data"]["remaining_seconds"] is None
     files = await _call(broker, "job_files", {"id": allocation_id}, ALICE)
     assert files["ok"] is True
     assert files["data"]["files"] == [{"name": "train.log", "bytes": 16}]

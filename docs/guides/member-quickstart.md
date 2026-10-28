@@ -79,6 +79,13 @@
   Python 包用 `pip install --user`，`HOME` 指向 `/workspace`，包落在
   `/workspace/.local` 并随工作区保留。只有管理员明确开放 development profile 时
   才有容器 sudo。`/workspace` 之外的修改会随容器销毁。
+- 容器内 `nproc` 显示的是宿主机核数，不是租约里申请的 CPU 数。创建容器时已按租约
+  写入 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、
+  `NUMEXPR_NUM_THREADS`；在同一个容器里并发跑多个进程时，请按进程数再下调
+  （例如两个训练各设一半），否则线程超订会让所有进程一起变慢。
+- 容器镜像里通常没有你 UID 的 passwd 项，`id -un` / `whoami` 可能报
+  "cannot find name for user ID"。这是预期行为，脚本请用 `id -u` 取数字 UID；
+  不影响训练和文件权限。
 - 本地工作台：在你自己的电脑运行 `citespec-resource gui`。
 - VS Code：从工作台的"VS Code"按钮进入，或 `citespec-resource vscode <工作环境>`。
 - 直接执行 `bash` / `docker` / `nvidia-smi` 等宿主机命令会被拒绝，
@@ -110,3 +117,11 @@
 添加公钥会立即同步到服务器中央公钥文件；撤销公钥会立即关闭该成员的 Broker
 连接，并让旧 SSH ControlMaster 不能继续建立新的受管连接。撤销前确认自己还有
 另一个可用公钥，否则需要联系管理员恢复。
+
+`job start --name` 的名字同时决定持久日志文件名：同一工作区里，只要
+`/workspace/.citespec-logs/<名字>.log` 还有内容，再次使用该名字启动会被拒绝
+（避免 `job logs` 回放上一次的日志）。换一个名字，或先把旧日志移出
+`.citespec-logs/`。
+
+非 JSON 输出在交互式控制台按系统编码显示；重定向到文件或管道时统一为 UTF-8。
+脚本或 Agent 请优先解析 `--json`，不要依赖中文文本的标点。

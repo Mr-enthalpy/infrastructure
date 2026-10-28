@@ -63,6 +63,12 @@ Reconnect and attach again, or use `job logs` without attaching. A completed
 command remains readable in its log even though it no longer appears in
 `job list`.
 
+The log path is derived from the job name, so a name identifies one log for the
+life of the workspace. Starting a job with a name whose log already has content
+is refused with `conflict`; otherwise `job logs` would replay the earlier run and
+look like the new job wrote nothing. Use a new name, or move the old
+`.citespec-logs/<name>.log` out of the way first.
+
 Operational requirements:
 
 - Jobs run as the configured `policy.container_user` (default `member`, mapped to
@@ -71,6 +77,10 @@ Operational requirements:
 - `job stop` terminates the tmux session and its process tree. Application-level
   checkpointing is required for graceful training recovery; stopping a training
   process is not a graceful shutdown.
+- `nproc` inside the container reports host CPUs, not the leased CPU count. The
+  broker seeds `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and
+  `NUMEXPR_NUM_THREADS` from the allocation; lower them per process when several
+  trainings share one container, or they will oversubscribe the quota.
 - `docker logs` shows only the container entrypoint. Use `job logs` for job
   output.
 - The broker records `job_started` and `job_stopped` audit events.
