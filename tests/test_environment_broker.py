@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from citespec_resource.broker.docker_driver import ContainerInfo
 from citespec_resource.broker.server import Broker
 from citespec_resource.db import connect
 from citespec_resource.gpu_audit import GpuAuditResult
@@ -398,3 +399,233 @@ async def test_build_requires_the_builds_gate(tmp_path, env_config):
     assert denied["ok"] is False
     assert denied["error"]["code"] == "forbidden"
     assert "environment_builds_enabled" in denied["error"]["message"]
+
+
+# -- legacy containers ------------------------------------------------------
+
+
+@pytest.fixture
+def legacy_config(active_config):
+    return replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            environment_enabled=True,
+            legacy_claims_enabled=True,
+        ),
+    )
+
+
+def _legacy_container(**kwargs):
+    payload = {
+        "id": "c" * 64,
+        "name": "old-workspace",
+        "image": "citespec-base:2024.09",
+        "status": "running",
+        "labels": {},
+        "created": "2025-03-01T10:00:00Z",
+        "image_id": "sha256:" + "d" * 64,
+    }
+    payload.update(kwargs)
+    return ContainerInfo(**payload)
+
+
+async def _legacy_source_id(broker, docker):
+    scanned = await _call(broker, "admin_legacy_scan", {}, ADMIN)
+    assert scanned["ok"] is True, scanned
+    listed = await _call(broker, "admin_legacy_sources", {}, ADMIN)
+    assert listed["ok"] is True, listed
+    return listed["data"]["sources"][0]["source_id"]
+
+
+async def test_legacy_scan_skips_managed_and_dismisses_missing(tmp_path, legacy_config):
+    broker, docker = _broker(tmp_path, legacy_config)
+    _provision(tmp_path)
+    docker.add_container(_legacy_container())
+    docker.add_container(
+        _legacy_container(
+            id="e" * 64,
+            name="citespec-managed",
+            labels={"citespec.managed": "true"},
+        )
+    )
+
+    scanned = await _call(broker, "admin_legacy_scan", {}, ADMIN)
+    assert scanned["ok"] is True, scanned
+    assert scanned["data"]["scanned"] == 1
+
+    admin_view = await _call(broker, "admin_legacy_sources", {}, ADMIN)
+    source = admin_view["data"]["sources"][0]
+    assert source["container_name"] == "old-workspace"
+    assert source["status"] == "available"
+
+    member_view = await _call(broker, "legacy_sources", {}, ALICE)
+    assert member_view["ok"] is True, member_view
+    visible = member_view["data"]["sources"][0]
+    assert "container_name" not in visible
+    assert "container_id" not in visible
+    assert "labels" not in visible["metadata"]
+
+    docker.containers.clear()
+    rescanned = await _call(broker, "admin_legacy_scan", {}, ADMIN)
+    assert rescanned["data"] == {"scanned": 0, "dismissed": 1}
+    after = await _call(broker, "admin_legacy_sources", {}, ADMIN)
+    assert after["data"]["sources"][0]["status"] == "dismissed"
+
+
+async def test_legacy_commands_require_the_gate(tmp_path, env_config):
+    broker, docker = _broker(tmp_path, env_config)
+    _provision(tmp_path)
+    denied = await _call(broker, "legacy_sources", {}, ALICE)
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "forbidden"
+    assert "legacy_claims_enabled" in denied["error"]["message"]
+
+
+async def test_legacy_claim_needs_approval_and_conflicts_are_not_auto_resolved(
+    tmp_path, legacy_config
+):
+    broker, docker = _broker(tmp_path, legacy_config)
+    _provision(tmp_path)
+    docker.add_container(_legacy_container())
+    source_id = await _legacy_source_id(broker, docker)
+
+    await _call(broker, "project_create", {"name": "alice-proj"}, ALICE)
+    await _call(broker, "project_create", {"name": "bob-proj"}, BOB)
+
+    alice_claim = await _call(
+        broker,
+        "legacy_claim",
+        {"source": source_id, "project": "alice-proj", "reason": "my old runs"},
+        ALICE,
+    )
+    assert alice_claim["ok"] is True, alice_claim
+    assert alice_claim["data"]["claim"]["status"] == "pending"
+    bob_claim = await _call(
+        broker,
+        "legacy_claim",
+        {"source": source_id, "project": "bob-proj", "reason": "mine"},
+        BOB,
+    )
+    assert bob_claim["ok"] is True, bob_claim
+    bob_claim_id = bob_claim["data"]["claim"]["claim_id"]
+    alice_claim_id = alice_claim["data"]["claim"]["claim_id"]
+
+    contested = await _call(
+        broker, "admin_legacy_decide", {"id": alice_claim_id, "approve": True}, ADMIN
+    )
+    assert contested["ok"] is False
+    assert contested["error"]["code"] == "conflict"
+
+    rejected = await _call(
+        broker,
+        "admin_legacy_decide",
+        {"id": bob_claim_id, "approve": False, "note": "belongs to alice"},
+        ADMIN,
+    )
+    assert rejected["ok"] is True, rejected
+    approved = await _call(
+        broker, "admin_legacy_decide", {"id": alice_claim_id, "approve": True}, ADMIN
+    )
+    assert approved["ok"] is True, approved
+    assert approved["data"]["claim"]["status"] == "approved"
+
+    bob_view = await _call(broker, "legacy_claim_show", {"id": alice_claim_id}, BOB)
+    assert bob_view["ok"] is False
+    assert bob_view["error"]["code"] == "forbidden"
+
+    bob_again = await _call(
+        broker,
+        "legacy_claim",
+        {"source": source_id, "project": "bob-proj"},
+        BOB,
+    )
+    assert bob_again["ok"] is False
+    assert bob_again["error"]["code"] == "conflict"
+
+
+async def test_legacy_running_capture_uses_the_fixed_probe_as_nobody(tmp_path, legacy_config):
+    broker, docker = _broker(tmp_path, legacy_config)
+    _provision(tmp_path)
+    docker.add_container(_legacy_container())
+    docker.images["citespec-base:2024.09"] = {
+        "id": "sha256:" + "f" * 64,
+        "digests": ["sha256:" + "f" * 64],
+        "size": 2048,
+    }
+    docker.exec_output = (0, json.dumps(PROBE_NO_APT), "")
+    source_id = await _legacy_source_id(broker, docker)
+    await _call(broker, "project_create", {"name": "alice-proj"}, ALICE)
+    claim = await _call(
+        broker,
+        "legacy_claim",
+        {"source": source_id, "project": "alice-proj"},
+        ALICE,
+    )
+    claim_id = claim["data"]["claim"]["claim_id"]
+
+    early = await _call(broker, "admin_legacy_capture", {"id": claim_id}, ADMIN)
+    assert early["ok"] is False
+    assert early["error"]["code"] == "conflict"
+
+    await _call(broker, "admin_legacy_decide", {"id": claim_id, "approve": True}, ADMIN)
+    captured = await _call(broker, "admin_legacy_capture", {"id": claim_id}, ADMIN)
+    assert captured["ok"] is True, captured
+    version = captured["data"]["version"]
+    assert version["origin"] == "legacy_claim"
+    assert version["capture_fidelity"] == "complete"
+    assert version["ref"] == "alice-proj@v1"
+    assert captured["data"]["claim"]["version_id"] == version["version_id"]
+
+    container_id, argv, user = docker.exec_calls[-1]
+    assert container_id == "c" * 64
+    assert argv[:3] == ["python3", "-I", "-S"]
+    assert user == "65534:65534"
+    assert docker.archive_calls == []
+
+    shown = await _call(broker, "env_show", {"ref": "alice-proj@v1"}, ALICE)
+    manifest = shown["data"]["manifest"]
+    assert manifest["origin"]["type"] == "legacy_claim"
+    assert manifest["origin"]["source_id"] == source_id
+    assert manifest["python"]["packages"] == [{"name": "torch", "version": "2.7.1"}]
+
+    twice = await _call(broker, "admin_legacy_capture", {"id": claim_id}, ADMIN)
+    assert twice["ok"] is False
+    assert twice["error"]["code"] == "conflict"
+
+
+async def test_legacy_stopped_capture_reads_archives_without_exec(tmp_path, legacy_config):
+    broker, docker = _broker(tmp_path, legacy_config)
+    _provision(tmp_path)
+    container_id = "s" * 64
+    docker.add_container(_legacy_container(id=container_id, name="stopped-old", status="exited"))
+    docker.archives[container_id] = {
+        "/etc/os-release": b'PRETTY_NAME="Ubuntu 22.04.5 LTS"\n',
+        "/opt/conda/conda-meta/numpy-1.26.4.json": json.dumps(
+            {"name": "numpy", "version": "1.26.4"}
+        ).encode("utf-8"),
+    }
+    source_id = await _legacy_source_id(broker, docker)
+    await _call(broker, "project_create", {"name": "alice-proj"}, ALICE)
+    claim = await _call(
+        broker,
+        "legacy_claim",
+        {"source": source_id, "project": "alice-proj"},
+        ALICE,
+    )
+    claim_id = claim["data"]["claim"]["claim_id"]
+    await _call(broker, "admin_legacy_decide", {"id": claim_id, "approve": True}, ADMIN)
+
+    captured = await _call(broker, "admin_legacy_capture", {"id": claim_id}, ADMIN)
+    assert captured["ok"] is True, captured
+    version = captured["data"]["version"]
+    assert version["capture_fidelity"] == "partial"
+    assert docker.exec_calls == []
+    assert docker.archive_calls[-1][0] == container_id
+    notes = " ".join(version["notes"])
+    assert "容器已停止" in notes
+
+    shown = await _call(broker, "env_show", {"ref": "alice-proj@v1"}, ALICE)
+    manifest = shown["data"]["manifest"]
+    assert manifest["python"]["packages"] == [{"name": "numpy", "version": "1.26.4"}]
+    assert manifest["origin"]["type"] == "legacy_claim"

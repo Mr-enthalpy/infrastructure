@@ -27,6 +27,8 @@ from ..enrollment import store as intake_store
 from ..environment import authorization as env_authz
 from ..environment import builder as env_builder
 from ..environment import capture as env_capture
+from ..environment import legacy as env_legacy
+from ..environment import models as env_models
 from ..environment import normalize as env_normalize
 from ..environment import service as env_service
 from ..environment import store as env_store
@@ -88,6 +90,7 @@ from ..workspace_quota import (
 )
 from . import admin_auth, workspace_io
 from .docker_driver import (
+    LABEL_MANAGED,
     ContainerInfo,
     DockerBackend,
     DockerDriver,
@@ -118,6 +121,15 @@ ENVIRONMENT_COMMANDS = frozenset(
         "env_diff",
         "env_build",
         "env_verify",
+        "legacy_sources",
+        "legacy_claim",
+        "legacy_claim_list",
+        "legacy_claim_show",
+        "admin_legacy_scan",
+        "admin_legacy_sources",
+        "admin_legacy_claims",
+        "admin_legacy_decide",
+        "admin_legacy_capture",
     }
 )
 
@@ -3782,6 +3794,371 @@ class Broker:
             removed.append(tag)
         return removed
 
+    # ------------------------------------------------------------------
+    # Legacy containers (architecture §8)
+    # ------------------------------------------------------------------
+
+    def _require_legacy(self) -> None:
+        self._require_environment()
+        if not self.config.policy.legacy_claims_enabled:
+            raise Forbidden(
+                "旧容器认领尚未启用；需要管理员在服务端配置中打开 policy.legacy_claims_enabled"
+            )
+
+    @staticmethod
+    def _legacy_source_view(source: dict[str, Any], *, admin: bool) -> dict[str, Any]:
+        try:
+            metadata = json.loads(str(source["sanitized_metadata"] or "{}"))
+        except ValueError:
+            metadata = {}
+        view: dict[str, Any] = {
+            "source_id": str(source["source_id"]),
+            # Container names can carry the previous owner's account name, so
+            # members only see an opaque prefix and the sanitized metadata.
+            "container": str(source["container_id"])[:12],
+            "image": str(source["image_ref"]),
+            "state": str(source["state_at_scan"]),
+            "created_at": str(source["container_created_at"]),
+            "status": str(source["status"]),
+            "scanned_at": str(source["scanned_at"]),
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        }
+        if admin:
+            view["server_id"] = str(source["server_id"])
+            view["container_id"] = str(source["container_id"])
+            view["container_name"] = str(source["container_name"])
+            view["image_id"] = str(source["image_id"])
+        return view
+
+    def _legacy_claim_view(
+        self,
+        connection: Any,
+        claim: dict[str, Any],
+        *,
+        admin: bool,
+    ) -> dict[str, Any]:
+        source = env_store.get_legacy_source(connection, str(claim["source_id"]))
+        view: dict[str, Any] = {
+            "claim_id": str(claim["claim_id"]),
+            "source": self._legacy_source_view(source, admin=admin),
+            "member_id": str(claim["member_id"]),
+            "project_id": str(claim["project_id"]),
+            "reason": str(claim["reason"]),
+            "status": str(claim["status"]),
+            "review_note": str(claim["review_note"]),
+            "reviewed_at": str(claim["reviewed_at"]),
+            "created_at": str(claim["created_at"]),
+            "updated_at": str(claim["updated_at"]),
+            "version_id": claim["version_id"],
+        }
+        if claim["version_id"]:
+            try:
+                context = env_store.version_context(connection, str(claim["version_id"]))
+            except EnvironmentError:
+                context = None
+            if context is not None:
+                view["version"] = env_service.summary(context)
+        if admin:
+            view["reviewer"] = str(claim["reviewer"])
+        return view
+
+    def _legacy_sources(self, identity: Identity) -> dict[str, Any]:
+        self._require_legacy()
+        with self._connection() as connection:
+            member_id = env_authz.require_active_member(
+                connection, uid=identity.uid, now=self._now()
+            )
+            source_ids = {
+                str(source["source_id"])
+                for source in env_store.list_legacy_sources(
+                    connection, status=env_models.SOURCE_AVAILABLE
+                )
+            }
+            for claim in env_store.list_claims(connection, member_id=member_id):
+                source_ids.add(str(claim["source_id"]))
+            sources = [
+                env_store.get_legacy_source(connection, source_id)
+                for source_id in sorted(source_ids)
+            ]
+            return {
+                "sources": [self._legacy_source_view(source, admin=False) for source in sources]
+            }
+
+    def _legacy_claim(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_legacy()
+        source_id = args.get("source")
+        if not isinstance(source_id, str) or not source_id:
+            raise BadRequest("source must be a non-empty string")
+        reason = args.get("reason", "")
+        if not isinstance(reason, str):
+            raise BadRequest("reason must be a string")
+        now = self._now()
+        with self._connection() as connection:
+            member_id = env_authz.require_active_member(connection, uid=identity.uid, now=now)
+            project = env_authz.require_project(
+                connection,
+                uid=identity.uid,
+                is_admin=identity.is_admin,
+                name=self._env_project_arg(args),
+                now=now,
+            )
+            source = env_store.get_legacy_source(connection, source_id)
+            if source["status"] != env_models.SOURCE_AVAILABLE:
+                raise Conflict("该旧容器已被认领或已下架")
+            claim = env_store.create_claim(
+                connection,
+                source_id=source_id,
+                member_id=member_id,
+                project_id=str(project["project_id"]),
+                reason=reason[:1000],
+                now=now,
+            )
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_legacy_claim",
+                detail={
+                    "claim_id": claim["claim_id"],
+                    "source_id": source_id,
+                    "project_id": project["project_id"],
+                },
+                now=now,
+            )
+            return {"claim": self._legacy_claim_view(connection, claim, admin=False)}
+
+    def _legacy_claim_list(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_legacy()
+        status = args.get("status")
+        if status is not None and status not in env_models.CLAIM_STATUSES:
+            raise BadRequest("status is not a known claim state")
+        with self._connection() as connection:
+            member_id = env_authz.require_active_member(
+                connection, uid=identity.uid, now=self._now()
+            )
+            claims = env_store.list_claims(connection, member_id=member_id, status=status)
+            return {
+                "claims": [
+                    self._legacy_claim_view(connection, claim, admin=False) for claim in claims
+                ]
+            }
+
+    def _legacy_claim_show(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_legacy()
+        claim_id = args.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            raise BadRequest("id must be a non-empty string")
+        now = self._now()
+        with self._connection() as connection:
+            member_id = env_authz.require_active_member(connection, uid=identity.uid, now=now)
+            claim = env_store.get_claim(connection, claim_id)
+            env_authz.require_claim_owner(claim, member_id=member_id, is_admin=identity.is_admin)
+            return {"claim": self._legacy_claim_view(connection, claim, admin=False)}
+
+    async def _admin_legacy_scan(self, identity: Identity) -> dict[str, Any]:
+        self._require_legacy()
+        containers = await asyncio.to_thread(self.docker.list_containers)
+        candidates = [
+            container for container in containers if container.labels.get(LABEL_MANAGED) != "true"
+        ]
+        server_id = self.config.server.name
+        now = self._now()
+        dismissed = 0
+        with self._connection() as connection:
+            for container in candidates:
+                env_store.record_legacy_source(
+                    connection,
+                    server_id=server_id,
+                    container_id=container.id,
+                    image_ref=container.image,
+                    image_id=container.image_id,
+                    container_name=container.name,
+                    state_at_scan=container.status,
+                    container_created_at=container.created,
+                    sanitized_metadata=env_legacy.sanitized_metadata(container),
+                    now=now,
+                )
+            live_ids = {container.id for container in candidates}
+            for source in env_store.list_legacy_sources(connection):
+                if str(source["server_id"]) != server_id:
+                    continue
+                if source["status"] != env_models.SOURCE_AVAILABLE:
+                    continue
+                if str(source["container_id"]) in live_ids:
+                    continue
+                env_store.set_legacy_source_status(
+                    connection, str(source["source_id"]), env_models.SOURCE_DISMISSED
+                )
+                dismissed += 1
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_legacy_scan",
+                detail={"scanned": len(candidates), "dismissed": dismissed},
+                now=now,
+            )
+        return {"scanned": len(candidates), "dismissed": dismissed}
+
+    def _admin_legacy_sources(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_legacy()
+        status = args.get("status")
+        if status is not None and status not in env_models.SOURCE_STATUSES:
+            raise BadRequest("status is not a known source state")
+        with self._connection() as connection:
+            sources = env_store.list_legacy_sources(connection, status=status)
+            return {"sources": [self._legacy_source_view(source, admin=True) for source in sources]}
+
+    def _admin_legacy_claims(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_legacy()
+        status = args.get("status")
+        if status is not None and status not in env_models.CLAIM_STATUSES:
+            raise BadRequest("status is not a known claim state")
+        source_id = args.get("source")
+        with self._connection() as connection:
+            claims = env_store.list_claims(connection, status=status)
+            if source_id is not None:
+                claims = [claim for claim in claims if claim["source_id"] == source_id]
+            return {
+                "claims": [
+                    self._legacy_claim_view(connection, claim, admin=True) for claim in claims
+                ]
+            }
+
+    def _admin_legacy_decide(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_legacy()
+        claim_id = args.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            raise BadRequest("id must be a non-empty string")
+        approve = args.get("approve")
+        if not isinstance(approve, bool):
+            raise BadRequest("approve must be true or false")
+        note = args.get("note", "")
+        if not isinstance(note, str):
+            raise BadRequest("note must be a string")
+        now = self._now()
+        with self._connection() as connection:
+            claim = env_store.decide_claim(
+                connection,
+                claim_id,
+                approve=approve,
+                reviewer=f"uid:{identity.uid}",
+                note=note[:1000],
+                now=now,
+            )
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_legacy_decide",
+                detail={
+                    "claim_id": claim_id,
+                    "source_id": claim["source_id"],
+                    "approve": approve,
+                },
+                now=now,
+            )
+            return {"claim": self._legacy_claim_view(connection, claim, admin=True)}
+
+    async def _admin_legacy_capture(
+        self, identity: Identity, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require_legacy()
+        claim_id = args.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            raise BadRequest("id must be a non-empty string")
+        policy = self.config.policy
+        with self._connection() as connection:
+            claim = env_store.get_claim(connection, claim_id)
+            if claim["status"] != env_models.CLAIM_APPROVED:
+                raise Conflict("只有已批准的认领才能生成环境版本")
+            if claim["version_id"]:
+                raise Conflict("该认领已经生成过环境版本")
+            source = env_store.get_legacy_source(connection, str(claim["source_id"]))
+            project = env_store.get_project(connection, str(claim["project_id"]))
+            if project["status"] != env_models.PROJECT_ACTIVE:
+                raise Conflict("项目已归档，不能再生成环境版本")
+            profile = env_store.default_profile(connection, str(project["project_id"]))
+            if (
+                env_store.count_versions(connection, str(profile["profile_id"]))
+                >= policy.env_max_versions_per_project
+            ):
+                raise Conflict(
+                    f"项目 {project['name']} 已达到 {policy.env_max_versions_per_project} "
+                    "个版本上限，请先清理旧版本"
+                )
+
+        container = await asyncio.to_thread(self.docker.get_container, str(source["container_id"]))
+        if container is None:
+            raise Conflict("旧容器已不存在，无法采集；请让管理员重新扫描")
+        captured = await asyncio.to_thread(
+            env_legacy.capture_container,
+            self.docker,
+            container,
+            max_packages=policy.env_max_packages,
+        )
+        details: dict[str, Any] = {}
+        try:
+            details = await asyncio.to_thread(
+                self.docker.image_details, str(source["image_ref"] or container.image)
+            )
+        except DockerError:
+            details = {}
+        digests = details.get("digests") if isinstance(details, dict) else None
+        base_digest = str(digests[0]) if isinstance(digests, list) and digests else ""
+        result = env_capture.build_manifest(
+            project_name=str(project["name"]),
+            probe=captured.probe,
+            base_image=str(source["image_ref"] or container.image),
+            base_digest=base_digest,
+            lockfiles=[],
+            max_packages=policy.env_max_packages,
+            origin=env_models.ORIGIN_LEGACY,
+            origin_source_id=str(source["source_id"]),
+        )
+        result.notes.extend(captured.notes)
+        try:
+            normalized = env_normalize.normalize_manifest(
+                result.manifest, max_packages=policy.env_max_packages
+            )
+        except ManifestError as exc:
+            raise BadRequest(str(exc)) from exc
+        if len(normalized.text.encode("utf-8")) > policy.env_max_manifest_bytes:
+            raise BadRequest("环境 manifest 超过大小上限")
+
+        now = self._now()
+        with self._connection() as connection:
+            version = env_store.create_version(
+                connection,
+                profile_id=str(profile["profile_id"]),
+                manifest_text=normalized.text,
+                sha256=normalized.sha256,
+                origin=env_models.ORIGIN_LEGACY,
+                capture_fidelity=result.fidelity,
+                created_by_member_id=str(claim["member_id"]),
+                now=now,
+            )
+            claim = env_store.link_claim_version(
+                connection, claim_id, str(version["version_id"]), now=now
+            )
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_legacy_capture",
+                detail={
+                    "claim_id": claim_id,
+                    "source_id": source["source_id"],
+                    "version_id": version["version_id"],
+                    "fidelity": result.fidelity,
+                },
+                now=now,
+            )
+            summary = env_service.summary(
+                env_store.version_context(connection, str(version["version_id"]))
+            )
+            summary["notes"] = result.notes
+            return {
+                "version": summary,
+                "claim": self._legacy_claim_view(connection, claim, admin=True),
+            }
+
     def _owner_gid(self, uid: int) -> int:
         if os.name == "posix":
             try:
@@ -3853,6 +4230,38 @@ class Broker:
             if command == "env_verify":
                 self._check_args(args, {"ref", "allocation"})
                 return await self._env_verify(identity, args)
+            if command == "legacy_sources":
+                self._check_args(args)
+                return self._legacy_sources(identity)
+            if command == "legacy_claim":
+                self._check_args(args, {"source", "project", "reason"})
+                return self._legacy_claim(identity, args)
+            if command == "legacy_claim_list":
+                self._check_args(args, {"status"})
+                return self._legacy_claim_list(identity, args)
+            if command == "legacy_claim_show":
+                self._check_args(args, {"id"})
+                return self._legacy_claim_show(identity, args)
+            if command == "admin_legacy_scan":
+                self._check_args(args)
+                self._require_admin(identity)
+                return await self._admin_legacy_scan(identity)
+            if command == "admin_legacy_sources":
+                self._check_args(args, {"status"})
+                self._require_admin(identity)
+                return self._admin_legacy_sources(args)
+            if command == "admin_legacy_claims":
+                self._check_args(args, {"status", "source"})
+                self._require_admin(identity)
+                return self._admin_legacy_claims(args)
+            if command == "admin_legacy_decide":
+                self._check_args(args, {"id", "approve", "note"})
+                self._require_admin(identity)
+                return self._admin_legacy_decide(identity, args)
+            if command == "admin_legacy_capture":
+                self._check_args(args, {"id"})
+                self._require_admin(identity)
+                return await self._admin_legacy_capture(identity, args)
             raise BadRequest(f"unknown environment command: {command}")
         except EnvironmentNotFound as exc:
             raise NotFound(str(exc)) from exc

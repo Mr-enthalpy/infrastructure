@@ -61,6 +61,7 @@ file_app = typer.Typer(no_args_is_help=True, help="Restricted workspace file tra
 queue_app = typer.Typer(no_args_is_help=True, help="Queued allocation requests.")
 project_app = typer.Typer(no_args_is_help=True, help="科研项目与长期环境记忆。")
 env_app = typer.Typer(no_args_is_help=True, help="环境版本的保存、查看与重建。")
+legacy_app = typer.Typer(no_args_is_help=True, help="旧容器的扫描与认领申请。")
 app.add_typer(config_app, name="config")
 app.add_typer(admin_app, name="admin")
 app.add_typer(job_app, name="job")
@@ -69,6 +70,7 @@ app.add_typer(file_app, name="file")
 app.add_typer(queue_app, name="queue")
 app.add_typer(project_app, name="project")
 app.add_typer(env_app, name="env")
+app.add_typer(legacy_app, name="legacy")
 
 ALLOCATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -2587,6 +2589,222 @@ def env_verify_command(
     typer.echo(
         f"verified: {data['version']['ref']}  verification={data['version']['verification']}"
     )
+
+
+@legacy_app.command("list")
+def legacy_list_command(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出可供认领的旧容器（只显示脱敏信息）。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "legacy_sources", json_output)
+    if json_output:
+        return
+    sources = data.get("sources", [])
+    if not sources:
+        typer.echo("没有可认领的旧容器；请让管理员先运行 admin legacy-scan")
+        return
+    for source in sources:
+        metadata = source.get("metadata", {})
+        typer.echo(
+            f"{source['source_id']}  {source['container']}  state={source['state']}  "
+            f"status={source['status']}  image={metadata.get('image') or source['image']}"
+        )
+
+
+@legacy_app.command("claim")
+def legacy_claim_command(
+    ctx: typer.Context,
+    source: str = typer.Argument(..., help="旧容器来源 id（legacy list 输出的第一列）。"),
+    project: str = typer.Option(..., "--project", help="认领后要保存到的项目名。"),
+    reason: str = typer.Option("", "--reason", help="为什么这个容器属于你的项目。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """提交认领申请；管理员批准后才会采集并生成环境版本。"""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "legacy_claim",
+        json_output,
+        source=source,
+        project=project,
+        reason=reason,
+    )
+    if json_output:
+        return
+    claim = data["claim"]
+    typer.echo(f"submitted {claim['claim_id']}  status={claim['status']}")
+    typer.echo("  等待管理员在 admin legacy-claims 中审核")
+
+
+@legacy_app.command("claims")
+def legacy_claims_command(
+    ctx: typer.Context,
+    status: str = typer.Option("", "--status", help="pending / approved / rejected / conflict。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出我提交过的认领申请。"""
+    config = _load(ctx)
+    args: dict[str, object] = {}
+    if status:
+        args["status"] = status
+    data = _request(_make_client(config), "legacy_claim_list", json_output, **args)
+    if json_output:
+        return
+    claims = data.get("claims", [])
+    if not claims:
+        typer.echo("还没有认领申请")
+        return
+    for claim in claims:
+        version = claim.get("version") or {}
+        typer.echo(
+            f"{claim['claim_id']}  status={claim['status']}  "
+            f"source={claim['source']['source_id']}  version={version.get('ref') or '-'}"
+        )
+        if claim.get("review_note"):
+            typer.echo(f"  管理员说明: {claim['review_note']}")
+
+
+@legacy_app.command("show")
+def legacy_show_command(
+    ctx: typer.Context,
+    claim_id: str = typer.Argument(..., help="认领申请 id。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """查看一条认领申请的详情与审核结果。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "legacy_claim_show", json_output, id=claim_id)
+    if json_output:
+        return
+    claim = data["claim"]
+    typer.echo(f"{claim['claim_id']}  status={claim['status']}  project={claim['project_id']}")
+    typer.echo(f"  source: {claim['source']['source_id']}  image={claim['source']['image']}")
+    if claim.get("reason"):
+        typer.echo(f"  reason: {claim['reason']}")
+    if claim.get("review_note"):
+        typer.echo(f"  review: {claim['review_note']}")
+    version = claim.get("version") or {}
+    if version:
+        typer.echo(f"  version: {version.get('ref')}  fidelity={version.get('capture_fidelity')}")
+
+
+@admin_app.command("legacy-scan")
+def admin_legacy_scan(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """扫描主机上的非托管容器，登记为可认领来源。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "admin_legacy_scan", json_output)
+    if json_output:
+        return
+    typer.echo(f"scanned={data['scanned']}  dismissed={data['dismissed']}")
+
+
+@admin_app.command("legacy-sources")
+def admin_legacy_sources(
+    ctx: typer.Context,
+    status: str = typer.Option("", "--status", help="available / claimed / dismissed。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出所有旧容器来源，供管理员核对。"""
+    config = _load(ctx)
+    args: dict[str, object] = {}
+    if status:
+        args["status"] = status
+    data = _request(_make_client(config), "admin_legacy_sources", json_output, **args)
+    if json_output:
+        return
+    sources = data.get("sources", [])
+    if not sources:
+        typer.echo("没有登记旧容器来源")
+        return
+    for source in sources:
+        typer.echo(
+            f"{source['source_id']}  {source['container_id'][:12]}  "
+            f"{source['container_name']}  state={source['state']}  status={source['status']}  "
+            f"image={source['image']}"
+        )
+
+
+@admin_app.command("legacy-claims")
+def admin_legacy_claims(
+    ctx: typer.Context,
+    status: str = typer.Option("", "--status", help="pending / approved / rejected / conflict。"),
+    source: str = typer.Option("", "--source", help="只看某个来源的申请。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出认领申请及其审核状态。"""
+    config = _load(ctx)
+    args: dict[str, object] = {}
+    if status:
+        args["status"] = status
+    if source:
+        args["source"] = source
+    data = _request(_make_client(config), "admin_legacy_claims", json_output, **args)
+    if json_output:
+        return
+    claims = data.get("claims", [])
+    if not claims:
+        typer.echo("没有认领申请")
+        return
+    for claim in claims:
+        typer.echo(
+            f"{claim['claim_id']}  status={claim['status']}  member={claim['member_id']}  "
+            f"source={claim['source']['source_id']}  project={claim['project_id']}"
+        )
+        if claim.get("reason"):
+            typer.echo(f"  reason: {claim['reason']}")
+
+
+@admin_app.command("legacy-decide")
+def admin_legacy_decide(
+    ctx: typer.Context,
+    claim_id: str = typer.Argument(..., help="认领申请 id。"),
+    approve: bool = typer.Option(
+        False,
+        "--approve/--reject",
+        help="批准或驳回；同一来源还有其他待处理申请时批准会被拒绝。",
+    ),
+    note: str = typer.Option("", "--note", help="审核说明（会反馈给申请人）。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """批准或驳回一条认领申请。"""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "admin_legacy_decide",
+        json_output,
+        id=claim_id,
+        approve=approve,
+        note=note,
+    )
+    if json_output:
+        return
+    claim = data["claim"]
+    typer.echo(f"{claim['claim_id']}  status={claim['status']}")
+
+
+@admin_app.command("legacy-capture")
+def admin_legacy_capture(
+    ctx: typer.Context,
+    claim_id: str = typer.Argument(..., help="已批准的认领申请 id。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """对已批准的旧容器做只读采集，生成一个 partial 环境版本。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "admin_legacy_capture", json_output, id=claim_id)
+    if json_output:
+        return
+    version = data["version"]
+    typer.echo(
+        f"saved {version['ref']}  fidelity={version['capture_fidelity']}  "
+        f"origin={version['origin']}"
+    )
+    for note in version.get("notes", []):
+        typer.echo(f"  - {note}")
+    typer.echo("  下一步: citespec-resource env build " + str(version["ref"]))
 
 
 @app.command("release")
