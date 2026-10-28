@@ -294,6 +294,39 @@ def test_installer_reads_the_sudo_listing_not_the_exit_status(tmp_path, listing,
     assert result.returncode == expected, result.stdout + result.stderr
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="POSIX venv layout")
+def test_installer_rewrites_the_staged_venv_prefix(tmp_path):
+    """Regression: a promoted staging venv kept dead shebangs in bin/."""
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert 'rewrite_venv_prefix "$VENV_STAGING" "$VENV_TARGET"' in source
+    assert source.index('rewrite_venv_prefix "$VENV_STAGING"') < source.index("\n    switch_venv\n")
+    start = source.index("rewrite_venv_prefix() {")
+    end = source.index("\n}\n", start) + len("\n}\n")
+    helper = source[start:end]
+
+    staging = tmp_path / ".staging-0.1.1-1"
+    target = tmp_path / "venv-0.1.1-1"
+    (target / "bin").mkdir(parents=True)
+    entry_point = target / "bin" / "citespec-resource"
+    entry_point.write_text(f"#!{staging}/bin/python\nprint('x')\n", encoding="utf-8")
+    activate = target / "bin" / "activate"
+    activate.write_text(f"VIRTUAL_ENV={staging}\n", encoding="utf-8")
+    binary = target / "bin" / "compiled-helper"
+    binary.write_bytes(b"\x00" + str(staging).encode() + b"\x00")
+
+    script = (
+        "set -u\n"
+        'fail() { echo "FAIL: $1"; exit 1; }\n' + helper + "\n"
+        f'rewrite_venv_prefix "{staging}" "{target}"\n'
+    )
+    result = subprocess.run([BASH, "-c", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert entry_point.read_text(encoding="utf-8") == f"#!{target}/bin/python\nprint('x')\n"
+    assert activate.read_text(encoding="utf-8") == f"VIRTUAL_ENV={target}\n"
+    # Compiled helpers are not rewritten; the check must not corrupt binaries.
+    assert binary.read_bytes() == b"\x00" + str(staging).encode() + b"\x00"
+
+
 def test_installer_has_transactional_backup_and_rollback():
     source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "trap on_exit EXIT" in source
