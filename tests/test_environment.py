@@ -7,8 +7,10 @@ import sqlite3
 import pytest
 
 from citespec_resource import config as config_module
+from citespec_resource import store
 from citespec_resource.db import init_db
 from citespec_resource.environment import authorization as env_authz
+from citespec_resource.environment import builder as env_builder
 from citespec_resource.environment import models
 from citespec_resource.environment import store as env_store
 from citespec_resource.environment.normalize import digest_text, normalize_manifest
@@ -386,3 +388,75 @@ mode = "monitor"
     )
     with pytest.raises(ValueError, match="environment_builds_enabled"):
         config_module.load_config(path)
+
+
+def test_queue_and_admission_carry_the_environment_snapshot(connection):
+    member_id = _member(connection, 1001, "alice")
+    project = env_store.create_project(connection, owner_member_id=member_id, name="proj")
+    profile = env_store.default_profile(connection, project["project_id"])
+    version = _version(connection, member_id=member_id, profile_id=profile["profile_id"])
+    build = env_store.create_build(
+        connection,
+        version_id=version["version_id"],
+        server_id="server-a",
+        base_image="citespec-base:2026.10",
+        image_tag="citespec-env:test",
+    )
+    image_id = "sha256:" + "3" * 64
+    queue_id = store.create_queue_request(
+        connection,
+        owner_uid=1001,
+        owner_name="alice",
+        requested_gpus=[],
+        cpus=1,
+        memory_gb=1,
+        hours=1,
+        image=build["image_tag"],
+        workspace="/tmp/workspace",
+        note="",
+        max_queue_length=10,
+        max_queued_allocations_per_user=10,
+        max_queue_hours=24,
+        env_version_id=version["version_id"],
+        env_build_id=build["build_id"],
+        image_id=image_id,
+    )
+    queued = store.get_queue_request(connection, queue_id)
+    assert queued["env_version_id"] == version["version_id"]
+    assert queued["env_build_id"] == build["build_id"]
+    assert queued["image_id"] == image_id
+
+    allocation_id = store.admit_next_queued(
+        connection,
+        max_cpus=8,
+        max_memory_gb=64,
+        max_cpus_per_user=8,
+        max_memory_gb_per_user=64,
+        max_gpus_per_user=4,
+        max_active_allocations_per_user=4,
+        now=None,
+    )
+    assert allocation_id is not None
+    allocation = store.get_allocation(connection, allocation_id)
+    assert allocation["env_version_id"] == version["version_id"]
+    assert allocation["env_build_id"] == build["build_id"]
+    assert allocation["image_id"] == image_id
+    assert allocation["image"] == build["image_tag"]
+
+
+def test_build_inputs_are_deterministic():
+    requirements = env_builder.requirements_from_manifest(
+        {
+            "python": {
+                "packages": [
+                    {"name": "torch", "version": "2.7.1"},
+                    {"name": "numpy", "version": ""},
+                ]
+            }
+        }
+    )
+    assert requirements == "torch==2.7.1\nnumpy\n"
+    tag = env_builder.image_tag_for("ver_abc123", "bld_0123456789abcdef")
+    assert tag.startswith("citespec-env:")
+    assert env_builder.image_tag_for("ver_abc123", "bld_0123456789abcdef") == tag
+    assert env_builder.image_tag_for("ver_abc123", "bld_fedcba9876543210") != tag
