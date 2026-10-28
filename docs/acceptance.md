@@ -29,6 +29,10 @@ allocations and temporary holder containers it creates and removes its own
 temporary holder container on exit. It does not delete workspaces or other
 users' containers.
 
+Section 6 is the real research-agent end-to-end phase. It does not block the
+first monitor-mode installation, but it must pass before the service is offered
+to additional lab members.
+
 ## 2. Preconditions and execution context
 
 Run the harness as root on the server. Root's SSH configuration must be able to
@@ -377,7 +381,125 @@ the live instance, use one-time accounts and remove them after the test. A core
 PASS does not cover external HTTPS onboarding, VS Code, file transfer, or the
 container-root/host-GPU 5.6 gate.
 
-## 6. Evidence to retain
+## 6. Real research-agent end-to-end acceptance (C-4)
+
+### 6.1 Purpose
+
+This phase verifies that the deployed system supports real research work, not
+only correct allocation bookkeeping. An independent research agent must complete
+a real, scoped-down training task through the supported member entry points and
+report its experience without being told the expected administrator answers.
+
+It does not block the first monitor-mode installation. It must pass before the
+service is offered to additional lab members. It complements, and does not
+replace, Sections 4, 5, and 5.8.
+
+### 6.2 Preconditions
+
+- Sections 3 and 4 pass on the same host, and the member-facing entry points
+  (central SSH keys, CLI, broker socket, workspace) are in their accepted state.
+- One dedicated ordinary member identity, created or enabled by the
+  administrator before the test. The agent receives only that member's own key
+  pair (registered through the supported `admin members key-add` flow), its
+  connection details, the project description, and
+  `docs/guides/member-quickstart.md`. It must not receive broker internals, the
+  state database, administrator instructions, recovery runbooks, or any
+  administrator credential.
+- The identity has no host sudo, no Docker group, no `citespec-admins`, no
+  `citespec-gpu` membership, and no interactive host shell.
+- An approved GPU count, maximum wall time, and storage budget that cannot
+  affect other research tasks; no other allocation on the selected GPU.
+- development profile, container sudo, and VS Code are not enabled for this test
+  unless their gates (Sections 5.1-5.6) have passed. No temporary bypass is
+  permitted.
+
+### 6.3 Task
+
+Choose a real training task from an existing research project and scale the
+data, epochs, or model so it completes inside the approved lease. It must use
+the project's own code and a representative data path, and must produce actual
+parameter updates, training logs, model checkpoints, and interpretable
+evaluation metrics. `nvidia-smi`, a CUDA smoke test, or an empty loop is not a
+completed task.
+
+### 6.4 Procedure
+
+1. The agent reads the member quickstart and establishes the member connection
+   without administrator help.
+2. The agent obtains one GPU through the normal apply/queue path and confirms
+   which resources it owns.
+3. The agent places code and data in its own workspace and prepares Python and
+   other dependencies through the currently supported path.
+4. The agent starts training in the authorized container and observes logs, GPU
+   use, and storage use.
+5. During training, the agent disconnects and reconnects at least one SSH or
+   agent session, and confirms the task does not end because the client
+   disconnected.
+6. The agent completes the predefined target, saves checkpoints, metrics, and
+   logs, and confirms the results are still in the persistent workspace.
+7. The agent releases the resources and states which environment changes died
+   with the container and which results were retained.
+8. The agent submits an independent experience report (Section 6.6) without
+   knowing the administrator's expected answers.
+
+### 6.5 Pass criteria
+
+| Dimension | Requirement |
+|---|---|
+| Identity isolation | The whole run uses the ordinary member identity; no administrator credential and no host privilege |
+| Resource admission | The agent gets the authorized GPU and cannot use an unallocated device |
+| Environment setup | Dependencies can be prepared through the documented supported path |
+| Real training | The predefined task completes with credible checkpoints, logs, and metrics |
+| Disconnect recovery | A client disconnect does not end work that is expected to keep running |
+| Persistence | Research results remain in the workspace; the disposable environment behaves as documented |
+| Release | Resources are reclaimed at the end; no abnormal leftover use |
+| Privilege boundary | No host administrative access was obtained while solving experience problems |
+
+### 6.6 Agent experience report
+
+The agent records:
+
+| Observation | What to report |
+|---|---|
+| Time to first start | Time from reading the guide to the first real training step |
+| Friction | Steps that were unclear, repetitive, or easy to get wrong |
+| Environment management | Limits hit while installing system packages, configuring Python, or adjusting dependencies |
+| CLI/GUI | What was convenient; which prompts lacked a next step |
+| Failure handling | Which errors occurred and whether the agent could diagnose and resolve them alone |
+| External help | How often and why an administrator or another person had to intervene |
+| Agent automation fit | Commands that script well; flows that force interactive input |
+| Verdict | Whether the agent would keep using it for daily research; the top three improvements |
+
+Retain the key commands, redacted error output, the operation timeline, and the
+training artifacts.
+
+### 6.7 Verdicts
+
+- **Core pass**: the real training run completes, permissions and resource state
+  are correct, and no unexpected data is lost.
+- **Core failure**: the documented member workflow cannot complete, resource
+  isolation is broken, the task stops without cause, or results are lost. Fix
+  before rollout.
+- **Experience issue**: training completes but the workflow is cumbersome,
+  errors are unclear, dependency setup is painful, or repeated human help was
+  needed. Add to the UX backlog.
+- **Feature not yet open**: the run is limited by development profile, container
+  sudo, or VS Code gates that have not passed. Record it as a Section 5 priority;
+  it is not a blocker for the base deployment.
+- **Project-side issue**: model, data, or training-configuration problems,
+  recorded separately from resource-management problems.
+
+### 6.8 Boundaries
+
+- The test identity, SSH key, and resources are administered by the
+  administrator. The agent must not solve problems by using administrator
+  access.
+- Keep the workspace, logs, and checkpoints for review after the test; cleanup is
+  confirmed by the administrator.
+- A core pass is host-specific. Re-run after storage, GPU driver, container
+  profile, or member entry-point changes.
+
+## 7. Evidence to retain
 
 Retain the complete command output and the following artifacts:
 
@@ -400,9 +522,11 @@ Retain the complete command output and the following artifacts:
 - browser screenshot/output for application, receipt, approval, and setup
   fingerprint confirmation; the generated workstation profile with secrets
   redacted;
+- for Section 6, the agent's command log, redacted errors, operation timeline,
+  experience report, and the resulting checkpoints, metrics, and training logs;
 - operator name, timestamps, and approval reference for every state change.
 
-## 7. Abort and recovery criteria
+## 8. Abort and recovery criteria
 
 Abort the procedure immediately and preserve logs if any of the following
 occurs:
@@ -413,7 +537,11 @@ occurs:
 - another user's container or workspace is affected;
 - a queue request jumps ahead of an unexpired queued request;
 - a security gate fails open;
-- the broker cannot be stopped or restarted cleanly.
+- the broker cannot be stopped or restarted cleanly;
+- a real training run loses checkpoints or logs that should have persisted in
+  the workspace;
+- the agent obtained host administrative access while working around an
+  experience problem.
 
 After aborting, release only the test allocations created by the harness, remove
 only the harness-created temporary container, and leave existing training

@@ -540,7 +540,8 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
   申请页/回执/限流、Broker 闸门/幂等、GUI 路由。
 - `tests/test_onboarding.py`、`tests/test_cli.py`：主机指纹、setup/join/me、
   自动中继与幂等键。
-- `docs/acceptance.md`：目标机验收清单，5.8 是成员闭环。
+- `docs/acceptance.md`：目标机验收清单，5.8 是成员闭环，§6 是真实科研
+  Agent 端到端训练验收（C-4）。
 - `docs/queue.md`：队列状态和公平性语义。
 - `docs/jobs-and-transfer.md`：job 和受限文件传输。
 - `docs/legacy-access-revocation.md`：legacy 管理员权限撤销。
@@ -561,6 +562,7 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
 | P1 | 客户端打包/自动更新 | `v0.1.0` 已发布；Windows/Linux 构建和发布资产校验通过 | 成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
+| P1 | 真实科研 Agent 端到端（C-4） | 未执行 | 普通成员仅凭正式指南完成受控真实训练并提交体验报告；不阻塞 monitor，向更多成员推广前完成 |
 | P2 | VS Code / 文件传输 | 关闭 | 5.6、容器 sshd、隧道、配额和 TOCTOU 验收通过 |
 | P2 | `setup` 图形化密钥配置 | CLI only | GUI 首屏可选择/生成密钥 |
 | P2 | 历史容器、备份归档、扫描噪声 | 待清理 | 资源标注清楚，扫描输出可读 |
@@ -572,7 +574,8 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
   restricted profile。
 - development profile 需要 `overlay2` + XFS + `prjquota`/`pquota`、workspace
   `nosuid`，并先通过 5.6。
-- `install_server.sh` 会拒绝与 systemd 模板不一致的 `workspace_root`；`state_db`
+- `install_server.sh` 在 `workspace_root` 与静态 unit 路径不一致时生成 broker、
+  logrotate、disk-check、provision 四份 `10-workspace.conf` drop-in；`state_db`
   等自定义路径仍需同步 systemd `ReadWritePaths`。执行器写路径固定为 `/etc`、
   `/home`、`/home/data1/citespec-users` 和 spool。
 - 旧 `create_user.sh`/home 公钥流程不再用于成员；已有账号通过显式 legacy import
