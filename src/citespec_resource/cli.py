@@ -2560,11 +2560,21 @@ def env_diff_command(
 def env_build_command(
     ctx: typer.Context,
     ref: str = typer.Argument(..., help="环境引用，例如 reconstruction@v1。"),
+    timeout: int = typer.Option(
+        3600,
+        "--timeout",
+        min=1,
+        help="等待构建完成的秒数；服务端的构建上限由策略控制。",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """按环境版本重建一个可复用的镜像（不占 GPU）。"""
     config = _load(ctx)
-    data = _request(_make_client(config), "env_build", json_output, ref=ref)
+    client = _make_client(config)
+    # A build normally takes minutes: the default 10 s socket timeout would
+    # report broker_unavailable while the broker keeps building.
+    client.timeout = float(timeout)
+    data = _request(client, "env_build", json_output, ref=ref)
     if json_output:
         return
     build = data["build"]

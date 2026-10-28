@@ -1198,6 +1198,30 @@ def test_environment_commands_relay_from_a_workstation(tmp_path, monkeypatch, ar
     assert recorded["argv"][-1] == "citespec-resource " + " ".join(argv)
 
 
+@pytest.mark.parametrize("extra, expected", [([], 3600.0), (["--timeout", "60"], 60.0)])
+def test_env_build_waits_longer_than_the_default_socket_timeout(monkeypatch, extra, expected):
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "build": {
+                    "status": "built",
+                    "image_tag": "citespec-env:abc",
+                    "image_id": "sha256:" + "a" * 64,
+                    "detail": "重建成功",
+                },
+                "version": {"ref": "reconstruction@v1", "verification": "built"},
+            },
+        }
+    )
+
+    result = _invoke(monkeypatch, fake, ["env", "build", "reconstruction@v1", "--json", *extra])
+
+    assert result.exit_code == 0
+    assert fake.timeout == expected
+    assert fake.calls == [("env_build", {"ref": "reconstruction@v1"})]
+
+
 def test_workstation_defaults_to_relay_without_socket(tmp_path, monkeypatch):
     import subprocess as subprocess_module
     import sys as sys_module

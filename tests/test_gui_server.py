@@ -23,9 +23,13 @@ class FakeRunner:
         self.min_client_protocol: int | None = None
         self.server_version = ""
         self.calls: list[tuple[str, list[str]]] = []
+        self.timeouts: list[float | None] = []
 
-    async def run(self, alias: str, args: list[str]) -> dict[str, Any]:
+    async def run(
+        self, alias: str, args: list[str], *, timeout: float | None = None
+    ) -> dict[str, Any]:
         self.calls.append((alias, list(args)))
+        self.timeouts.append(timeout)
         if args[:2] == ["admin", "users"] and not self.admin_alias:
             return {
                 "ok": False,
@@ -1013,6 +1017,8 @@ async def test_project_and_environment_routes(monitor_config):
             data=json.dumps({"project": "alice-proj", "allocation": "alloc-1"}),
         )
         assert captured.status == 200
+        assert runner.timeouts[5] == gui_server.ENV_BUILD_TIMEOUT_SECONDS
+        assert runner.timeouts[6] == gui_server.ENV_SLOW_OPERATION_TIMEOUT_SECONDS
         assert runner.calls == [
             ("member-alias", ["project", "list"]),
             ("member-alias", ["project", "create", "--name", "new-proj"]),
