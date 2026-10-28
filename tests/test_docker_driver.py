@@ -161,6 +161,38 @@ def test_list_gpus_parses_nvidia_smi(monkeypatch, active_config):
     assert gpus[1].compute_pids == ()
 
 
+def test_gpu_container_mounts_injected_tool_target(monkeypatch, active_config, tmp_path):
+    """Regression (C4-3): the shim wrapper needs nvidia-smi.real inside."""
+    real = tmp_path / "nvidia-smi.real"
+    real.write_bytes(b"binary")
+    wrapper = tmp_path / "nvidia-smi"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(docker_driver, "NVIDIA_SMI", wrapper)
+    monkeypatch.setattr(docker_driver, "NVIDIA_SMI_REAL", real)
+    driver = DockerDriver(active_config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    driver.create_container(_allocation(tmp_path))
+    volumes = fake_client.containers.run_kwargs["volumes"]
+    assert volumes[str(real)] == {"bind": str(real), "mode": "ro"}
+
+
+def test_cpu_container_does_not_mount_gpu_tools(monkeypatch, active_config, tmp_path):
+    real = tmp_path / "nvidia-smi.real"
+    real.write_bytes(b"binary")
+    wrapper = tmp_path / "nvidia-smi"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(docker_driver, "NVIDIA_SMI", wrapper)
+    monkeypatch.setattr(docker_driver, "NVIDIA_SMI_REAL", real)
+    driver = DockerDriver(active_config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    allocation = replace(_allocation(tmp_path), gpus=())
+    driver.create_container(allocation)
+    volumes = fake_client.containers.run_kwargs["volumes"]
+    assert str(real) not in volumes
+
+
 def test_create_container_uses_expected_isolation(monkeypatch, active_config, tmp_path):
     driver = DockerDriver(active_config)
     fake_client = FakeClient()

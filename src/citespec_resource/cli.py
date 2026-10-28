@@ -1094,6 +1094,68 @@ AUTO_RELAY_COMMANDS = {
 }
 
 
+START_UNSUPPORTED_MARKERS = (
+    "不支持的子命令 start",
+    "no such command 'start'",
+    'no such command "start"',
+    "unsupported subcommand start",
+)
+
+
+def _relay_bytes(stream: Any, data: bytes) -> None:
+    """Write relayed output without re-encoding it for the local console."""
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+        return
+    stream.write(data.decode("utf-8", "replace"))
+    stream.flush()
+
+
+def _start_unsupported(output: bytes) -> bool:
+    text = output.decode("utf-8", "replace").lower()
+    return any(marker in text for marker in START_UNSUPPORTED_MARKERS)
+
+
+def _start_as_apply(rest: list[str]) -> list[str] | None:
+    """Translate ``start`` options into the ``apply`` form older servers know.
+
+    The workstation package always relays ``start`` to the server so presets
+    and budgets come from server configuration. A server CLI that predates
+    ``start`` (0.1.0) only rejects the subcommand; every option used here maps
+    onto ``apply``. Presets and unknown/newer options cannot be translated
+    without guessing, so those return ``None``.
+    """
+    translated = ["apply"]
+    args = rest[1:]
+    index = 0
+    gpu_count_given = False
+    while index < len(args):
+        token = args[index]
+        if token in {"--gpu-count", "--hours", "--idempotency-key"}:
+            if index + 1 >= len(args):
+                return None
+            translated.extend([token, args[index + 1]])
+            gpu_count_given = gpu_count_given or token == "--gpu-count"
+            index += 2
+        elif token.startswith(("--gpu-count=", "--hours=", "--idempotency-key=")):
+            translated.append(token)
+            gpu_count_given = gpu_count_given or token.startswith("--gpu-count=")
+            index += 1
+        elif token == "--json":
+            translated.append(token)
+            index += 1
+        elif token == "--open" or token.startswith("--open="):
+            index += 2 if token == "--open" else 1
+        else:
+            return None
+    if not gpu_count_given:
+        translated.extend(["--gpu-count", "1"])
+    translated.extend(["--cpus", "8", "--memory", "32"])
+    return translated
+
+
 def _dispatch_remote(alias: str, rest: list[str]) -> NoReturn:
     """Run `citespec-resource <rest>` on the given SSH alias and relay the result.
 
@@ -1130,8 +1192,44 @@ def _dispatch_remote(alias: str, rest: list[str]) -> NoReturn:
         alias,
         shlex.join(["citespec-resource", *rest]),
     ]
+    if rest[0] == "start":
+        _dispatch_remote_start(argv, rest)
     try:
         completed = subprocess.run(argv, check=False)
+    except OSError as exc:
+        _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
+    raise SystemExit(completed.returncode)
+
+
+def _dispatch_remote_start(argv: list[str], rest: list[str]) -> NoReturn:
+    """Relay ``start``; fall back to ``apply`` when the server predates it."""
+    try:
+        completed = subprocess.run(argv, capture_output=True, check=False)
+    except OSError as exc:
+        _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
+    output = (completed.stdout or b"") + (completed.stderr or b"")
+    if completed.returncode == 0 or not _start_unsupported(output):
+        _relay_bytes(sys.stdout, completed.stdout or b"")
+        _relay_bytes(sys.stderr, completed.stderr or b"")
+        raise SystemExit(completed.returncode)
+    translated = _start_as_apply(rest)
+    if translated is None:
+        _relay_bytes(sys.stdout, completed.stdout or b"")
+        _relay_bytes(sys.stderr, completed.stderr or b"")
+        typer.echo(
+            "服务端 CLI 不支持 start，本次参数（如 --preset）无法自动换算为 apply；"
+            "请改用 apply，或让管理员升级服务端。",
+            err=True,
+        )
+        raise SystemExit(completed.returncode)
+    typer.echo(
+        "服务端 CLI 不支持 start，已自动改用 apply（默认 --cpus 8 --memory 32）；"
+        "服务端升级后可继续使用 start。",
+        err=True,
+    )
+    fallback = [*argv[:-1], shlex.join(["citespec-resource", *translated])]
+    try:
+        completed = subprocess.run(fallback, check=False)
     except OSError as exc:
         _fail("ssh_unavailable", f"cannot start ssh: {exc}", False)
     raise SystemExit(completed.returncode)

@@ -31,6 +31,14 @@ LABEL_ALLOCATION = "citespec.allocation"
 LABEL_GPUS = "citespec.gpus"
 LABEL_PROFILE = "citespec.profile"
 
+# ``install_server.sh`` keeps NVIDIA's tool at ``nvidia-smi.real`` and puts a
+# shim wrapper at ``nvidia-smi`` so the tool cannot chmod host GPU device nodes
+# away from the broker-only policy. The NVIDIA runtime injects only
+# ``nvidia-smi`` into containers, so the wrapper's target must be mounted too
+# or every container sees ``nvidia-smi.real: not found`` (C4-3).
+NVIDIA_SMI = Path("/usr/bin/nvidia-smi")
+NVIDIA_SMI_REAL = Path("/usr/bin/nvidia-smi.real")
+
 # sudo inside the disposable development container needs a small set of
 # capabilities. Nothing here grants host privileges or host namespaces.
 DEV_CAPABILITIES = (
@@ -48,6 +56,18 @@ DEV_CAPABILITIES = (
     # CAP_SYS_CHROOT the container sshd dies before the SSH banner.
     "SYS_CHROOT",
 )
+
+
+def _nvidia_smi_mounts() -> dict[str, dict[str, str]]:
+    """Host NVIDIA tools that the runtime does not inject into containers.
+
+    Only the wrapper at ``/usr/bin/nvidia-smi`` is injected; its target has to
+    be provided read-only. Fresh installs without the wrapper keep the plain
+    binary and need no extra mount.
+    """
+    if not (NVIDIA_SMI.is_file() and NVIDIA_SMI_REAL.is_file()):
+        return {}
+    return {str(NVIDIA_SMI_REAL): {"bind": str(NVIDIA_SMI_REAL), "mode": "ro"}}
 
 
 @dataclass(frozen=True)
@@ -605,6 +625,14 @@ class DockerDriver:
                 "NVIDIA_VISIBLE_DEVICES": "void",
                 "NVIDIA_DRIVER_CAPABILITIES": "void",
             }
+        volumes: dict[str, dict[str, str]] = {
+            allocation.workspace: {
+                "bind": "/workspace",
+                "mode": "rw",
+            }
+        }
+        if allocation.gpus:
+            volumes.update(_nvidia_smi_mounts())
         kwargs: dict[str, Any] = {
             "command": ["sleep", "infinity"],
             "detach": True,
@@ -614,12 +642,7 @@ class DockerDriver:
             "mem_limit": f"{allocation.memory_gb}g",
             "memswap_limit": f"{allocation.memory_gb}g",
             "pids_limit": self.config.policy.pids_limit,
-            "volumes": {
-                allocation.workspace: {
-                    "bind": "/workspace",
-                    "mode": "rw",
-                }
-            },
+            "volumes": volumes,
             "working_dir": "/workspace",
             "environment": {
                 "HOME": home,

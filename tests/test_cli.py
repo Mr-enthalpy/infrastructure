@@ -669,6 +669,102 @@ def test_remote_mode_rejects_local_only_commands(monkeypatch):
         assert result.exit_code != 0, head
 
 
+def test_start_fallback_translation_covers_documented_defaults():
+    translated = cli._start_as_apply(["start", "--hours", "4", "--json"])
+    assert translated[:2] == ["apply", "--hours"]
+    assert "--gpu-count" in translated and translated[translated.index("--gpu-count") + 1] == "1"
+    assert translated[translated.index("--cpus") + 1] == "8"
+    assert translated[translated.index("--memory") + 1] == "32"
+    assert "--json" in translated
+
+
+def test_start_fallback_translation_keeps_zero_gpu_count():
+    translated = cli._start_as_apply(["start", "--gpu-count", "0"])
+    assert translated is not None
+    assert translated[translated.index("--gpu-count") + 1] == "0"
+
+
+def test_start_fallback_translation_rejects_presets_and_unknown_options():
+    assert cli._start_as_apply(["start", "--preset", "standard"]) is None
+    assert cli._start_as_apply(["start", "--future-option", "x"]) is None
+
+
+def test_start_falls_back_to_apply_when_server_lacks_it(monkeypatch):
+    import subprocess as subprocess_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        if len(calls) == 1:
+            return subprocess_module.CompletedProcess(
+                argv,
+                2,
+                stdout=b"",
+                stderr="citespec-resource: 不支持的子命令 start\n".encode(),
+            )
+        return subprocess_module.CompletedProcess(argv, 0, stdout=b'{"ok": true}\n', stderr=b"")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(cli, "_relay_bytes", lambda stream, data: None)
+    with pytest.raises(SystemExit) as exited:
+        cli._dispatch_remote("example-gpu", ["start", "--gpu-count", "1", "--hours", "4", "--json"])
+    assert exited.value.code == 0
+    assert calls[0][1].get("capture_output") is True
+    fallback = calls[1][0][-1]
+    assert fallback.startswith("citespec-resource apply")
+    assert "--gpu-count 1" in fallback
+    assert "--hours 4" in fallback
+    assert "--cpus 8" in fallback
+    assert "--memory 32" in fallback
+    assert "--json" in fallback
+
+
+def test_start_relays_unchanged_when_server_supports_it(monkeypatch):
+    import subprocess as subprocess_module
+
+    calls = []
+    relayed = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess_module.CompletedProcess(argv, 0, stdout=b"queued\n", stderr=b"")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(cli, "_relay_bytes", lambda stream, data: relayed.append(data))
+    with pytest.raises(SystemExit) as exited:
+        cli._dispatch_remote("example-gpu", ["start", "--gpu-count", "1"])
+    assert exited.value.code == 0
+    assert len(calls) == 1
+    assert relayed == [b"queued\n", b""]
+
+
+def test_start_fallback_reports_when_preset_cannot_be_translated(monkeypatch, capsys):
+    import subprocess as subprocess_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess_module.CompletedProcess(
+            argv,
+            2,
+            stdout=b"",
+            stderr="citespec-resource: 不支持的子命令 start\n".encode(),
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "ssh")
+    monkeypatch.setattr(cli, "_relay_bytes", lambda stream, data: None)
+    with pytest.raises(SystemExit) as exited:
+        cli._dispatch_remote("example-gpu", ["start", "--preset", "standard"])
+    assert exited.value.code == 2
+    assert len(calls) == 1
+    assert "apply" in capsys.readouterr().err
+
+
 def test_connect_command_builds_ssh_relay(monkeypatch):
     import subprocess as subprocess_module
 
