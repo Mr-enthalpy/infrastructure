@@ -1207,6 +1207,11 @@ PY
 fi
 
 run install -d -o root -g root -m 0750 "$STATE_DIR"
+# Environment builds keep their venv and generated Dockerfile under the broker
+# state directory.  Only root may read it: the builder venv is handed to the
+# member UID inside the build container, never from the host tree.
+run install -d -o root -g root -m 0700 "$STATE_DIR/envs"
+ok "environment build state ready: $STATE_DIR/envs"
 run install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 run install -d -o root -g root -m 0750 "$ALERT_LOG_DIR"
 run install -d -o "$INTAKE_USER" -g "$INTAKE_USER" -m 0700 "$INTAKE_STATE_DIR"
