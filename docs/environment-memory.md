@@ -100,14 +100,16 @@ citespec-resource admin legacy-capture clm_xxx
 - 两阶段构建：CPU-only 构建容器以成员 UID 在 broker 目录内创建 venv，然后生成
   最小 Dockerfile（`FROM` 固定基础镜像 ID + `COPY` venv），`docker build --network none`
   且没有 `RUN` 步骤。
+- venv 使用 `--system-site-packages`：基础镜像里的 conda 包继续可见，venv 只叠加
+  pip/uv 安装的发行包。因此重建结果 = 固定基础镜像 + 成员用 pip 装的那一层。
 - 基础镜像必须仍能解析出与采集时一致的 digest，否则停止构建。
 - **V1 不支持自动 apt 安装系统包**。缺失的系统依赖会记录为未满足需求；管理员需要
   提供一个已包含这些包的基础镜像。
-- **conda 包只记录，不自动重建 conda 环境**。`python.packages` 是解释器
-  实际搜索到的发行包（包括 `pip install --user` 写入的用户 site-packages），
-  构建时用 pip 安装；`python.conda_packages` 保留 conda-meta 的原始清单，供
-  人工核对。`_libgcc_mutex`、`bzip2` 这类 conda-only 包不能 pip 安装，必须由
-  基础镜像提供。
+- **conda 包只记录，不自动重建 conda 环境**。`python.packages` 是解释器实际
+  搜索到的、由 pip/uv 管理的发行包（包括 `pip install --user` 写入的用户
+  site-packages），构建时用 pip 安装；`python.conda_packages` 保留 conda-meta 的
+  原始清单，conda 安装的发行包（如 `conda`、`menuinst`）不在 PyPI 上，由基础镜像
+  提供。
 - 构建缓存按版本保留（默认每版本 2 个），超过 `env_build_cache_gb` 时清理旧镜像。
 
 ## 管理员开关
@@ -140,8 +142,8 @@ env_max_versions_per_project = 50
 ## 已知限制
 
 - 采集是只读快照，不保证逐字节还原；`partial` 版本需要人工补全。
-- conda 环境的构建走 pip，不会复现 conda 的二进制包；conda-only 包需要基础镜像
-  已包含，`python.conda_packages` 只用于核对。
+- conda 环境不会重新求解依赖：基础镜像里的 conda 包按原样继承，只叠加 pip/uv
+  层；升级 conda 包需要新的基础镜像。
 - 锁文件采集有单文件/总量上限，超限会被跳过并在 manifest 中反映。
 - 旧容器停止后其镜像层可能仍可读，但无法证明曾经如何启动；因此 legacy 版本默认
   不是“已构建”，仍需走正常构建与功能验证。

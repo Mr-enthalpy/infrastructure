@@ -54,6 +54,9 @@ def parse_metadata(text):
             version = line[9:].strip()
     return name, version
 
+def installer(path):
+    return read(os.path.join(path, "INSTALLER"), 64).strip().lower()
+
 def packages(root):
     found = []
     for pattern in ("*.dist-info", "*.egg-info"):
@@ -62,7 +65,14 @@ def packages(root):
             if not name:
                 base = os.path.basename(path)
                 name = base.rsplit("-", 1)[0]
-            found.append({"name": name, "version": version})
+            # Conda-managed distributions are part of the pinned base image;
+            # recording them as pip requirements would ask PyPI for packages
+            # such as ``conda`` that only exist on conda channels.
+            found.append({
+                "name": name,
+                "version": version,
+                "installer": installer(path),
+            })
     return found
 
 # ``pip install --user`` (common in read-only containers) lands in the user
@@ -99,6 +109,8 @@ def interpreter(path):
     seen = set()
     for directory in directories:
         for item in packages(directory):
+            if item.get("installer") == "conda":
+                continue
             key = item["name"].lower()
             if key in seen:
                 continue
