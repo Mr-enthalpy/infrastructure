@@ -40,6 +40,7 @@ MEMBER_COMMANDS = frozenset(
         "env_diff",
         "env_build",
         "env_verify",
+        "legacy_sources",
         "legacy_claim",
         "legacy_claim_list",
         "legacy_claim_show",
@@ -70,6 +71,7 @@ NON_ACTIVE_MEMBER_ALLOWED = frozenset(
         "env_list",
         "env_show",
         "env_diff",
+        "legacy_sources",
         "legacy_claim_list",
         "legacy_claim_show",
     }

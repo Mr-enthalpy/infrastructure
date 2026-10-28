@@ -222,6 +222,8 @@ def build_manifest(
     base_digest: str,
     lockfiles: list[Lockfile],
     max_packages: int = DEFAULT_MAX_PACKAGES,
+    origin: str = models.ORIGIN_CAPTURE,
+    origin_source_id: str = "",
 ) -> CaptureResult:
     """Turn probe output into a validated manifest plus a fidelity verdict."""
 
@@ -277,7 +279,7 @@ def build_manifest(
             ],
         },
         "gpu": _gpu_summary(base_image),
-        "origin": {"type": "capture", "source_id": ""},
+        "origin": {"type": origin, "source_id": origin_source_id},
         "notes": notes[:32],
     }
 

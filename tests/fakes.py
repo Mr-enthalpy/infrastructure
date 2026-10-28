@@ -80,6 +80,8 @@ class FakeDocker:
         self.images: dict[str, dict[str, object]] = {}
         self.exec_calls: list[tuple[str, list[str], str | None]] = []
         self.exec_output: tuple[int, str, str] = (0, "", "")
+        self.archive_calls: list[tuple[str, list[str]]] = []
+        self.archives: dict[str, dict[str, bytes]] = {}
         self.builder_calls: list[dict[str, object]] = []
         self.build_image_calls: list[dict[str, object]] = []
         self.removed_images: list[str] = []
@@ -126,6 +128,24 @@ class FakeDocker:
     ) -> tuple[int, str, str]:
         self.exec_calls.append((container_id, list(argv), user))
         return self.exec_output
+
+    def read_container_paths(
+        self,
+        container_id: str,
+        paths: list[str],
+        *,
+        max_bytes: int,
+        max_entries: int,
+    ) -> dict[str, bytes]:
+        self.archive_calls.append((container_id, list(paths)))
+        found: dict[str, bytes] = {}
+        for path in paths:
+            for key, value in self.archives.get(container_id, {}).items():
+                if key == path or key.startswith(path.rstrip("/") + "/"):
+                    found[key] = value[:max_bytes]
+            if len(found) >= max_entries:
+                break
+        return found
 
     def remove_image(self, image: str) -> None:
         self.removed_images.append(image)

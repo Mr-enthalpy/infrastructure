@@ -32,6 +32,7 @@ ALLOWED = {
     "me",
     "project",
     "env",
+    "legacy",
 }
 DENIED_TOKENS = {";", "&&", "||", "|", ">", ">>", "<", "&"}
 

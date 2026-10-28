@@ -1,7 +1,9 @@
+import io
 import os
 import shutil
 import struct
 import subprocess
+import tarfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -112,6 +114,7 @@ class FakeAPI:
         self.exec_create_kwargs: dict | None = None
         self.exec_start_kwargs: dict | None = None
         self.exit_code = 0
+        self.archives: dict[str, bytes] = {}
 
     def exec_create(self, container_id: str, **kwargs) -> dict:
         self.exec_create_kwargs = {"container_id": container_id, **kwargs}
@@ -123,6 +126,12 @@ class FakeAPI:
 
     def exec_inspect(self, exec_id: str) -> dict:
         return {"ExitCode": self.exit_code}
+
+    def get_archive(self, container_id: str, path: str):
+        payload = self.archives.get(path)
+        if payload is None:
+            raise NotFound("missing")
+        return iter([payload]), {"name": path}
 
 
 def _allocation(tmp_path: Path) -> Allocation:
@@ -994,3 +1003,58 @@ def test_storage_preflight_rejects_entitlements_beyond_free_space(
         writable_layer_entitlements_bytes=40 * 1024**3,
     )
     assert allowed[0] is True
+
+
+def _tar_bytes(entries):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def test_read_container_paths_uses_fixed_files_and_rejects_unsafe_names(active_config):
+    driver = DockerDriver(active_config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    fake_client.api.archives["/etc/os-release"] = _tar_bytes(
+        [("os-release", b'PRETTY_NAME="Ubuntu 22.04"\n')]
+    )
+    fake_client.api.archives["/opt/conda/conda-meta"] = _tar_bytes(
+        [
+            ("conda-meta/../../escape.json", b"{}"),
+            ("conda-meta/../escape.json", b"{}"),
+            ("/absolute.json", b"{}"),
+            ("conda-meta/numpy-1.26.4.json", b'{"name": "numpy"}'),
+        ]
+    )
+
+    found = driver.read_container_paths(
+        "container-1",
+        ["/etc/os-release", "/opt/conda/conda-meta", "/missing"],
+        max_bytes=4096,
+        max_entries=10,
+    )
+
+    assert found["/etc/os-release"] == b'PRETTY_NAME="Ubuntu 22.04"\n'
+    assert found["/opt/conda/conda-meta/conda-meta/numpy-1.26.4.json"] == b'{"name": "numpy"}'
+    assert not any("escape" in key or "absolute" in key for key in found)
+
+
+def test_read_container_paths_bounds_total_bytes(active_config):
+    driver = DockerDriver(active_config)
+    fake_client = FakeClient()
+    driver._client = fake_client
+    fake_client.api.archives["/opt/conda/conda-meta"] = _tar_bytes(
+        [("conda-meta/a.json", b"x" * 64), ("conda-meta/b.json", b"y" * 64)]
+    )
+
+    found = driver.read_container_paths(
+        "container-1",
+        ["/opt/conda/conda-meta"],
+        max_bytes=10,
+        max_entries=10,
+    )
+    assert found == {}

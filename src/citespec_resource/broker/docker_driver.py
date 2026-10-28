@@ -11,6 +11,7 @@ import shlex
 import shutil
 import struct
 import subprocess
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -84,6 +85,8 @@ class ContainerInfo:
     status: str
     labels: dict[str, str]
     gpu_refs: tuple[str, ...] = ()
+    created: str = ""
+    image_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,15 @@ class DockerBackend(Protocol):
         user: str | None = None,
     ) -> tuple[int, str, str]: ...
 
+    def read_container_paths(
+        self,
+        container_id: str,
+        paths: list[str],
+        *,
+        max_bytes: int,
+        max_entries: int,
+    ) -> dict[str, bytes]: ...
+
     def storage_preflight(
         self,
         *,
@@ -204,6 +216,35 @@ def matches_managed_allocation(
     if expected_container_id is not None and container.id != expected_container_id:
         return False
     return True
+
+
+def _read_bounded(stream: Any, limit: int) -> bytes:
+    """Read a Docker archive stream into memory, never beyond ``limit`` bytes."""
+
+    chunks: list[bytes] = []
+    total = 0
+    if isinstance(stream, (bytes, bytearray)):
+        return bytes(stream[:limit])
+    for chunk in stream:
+        if not isinstance(chunk, (bytes, bytearray)):
+            continue
+        chunks.append(bytes(chunk))
+        total += len(chunk)
+        if total >= limit:
+            break
+    return b"".join(chunks)[:limit]
+
+
+def _safe_member_name(name: str) -> str | None:
+    """Return a relative archive member name, or None when it is unsafe."""
+
+    cleaned = str(name).replace("\\", "/")
+    if not cleaned or cleaned.startswith("/") or "\x00" in cleaned:
+        return None
+    parts = [part for part in cleaned.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
 
 
 def _socket_recv(sock: Any, size: int) -> bytes:
@@ -551,6 +592,8 @@ class DockerDriver:
             status=str(getattr(container, "status", "") or state.get("Status", "")),
             labels=labels,
             gpu_refs=tuple(dict.fromkeys(refs)),
+            created=str(attrs.get("Created", "")),
+            image_id=str(attrs.get("Image", "")),
         )
 
     def list_containers(self) -> list[ContainerInfo]:
@@ -1048,6 +1091,77 @@ class DockerDriver:
             output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
         )
         return int(info.get("ExitCode", -1)), text, ""
+
+    def read_container_paths(
+        self,
+        container_id: str,
+        paths: list[str],
+        *,
+        max_bytes: int,
+        max_entries: int,
+    ) -> dict[str, bytes]:
+        """Read fixed paths from a container archive without starting or exec'ing it.
+
+        ``get_archive`` works on stopped containers and never runs anything
+        inside the image. Only regular files without absolute or parent
+        components are kept, and both the number of files and the total number
+        of bytes are bounded by the caller.
+        """
+
+        found: dict[str, bytes] = {}
+        remaining = max(0, int(max_bytes))
+        entries = 0
+        for requested in paths:
+            if remaining <= 0 or entries >= max_entries:
+                break
+            try:
+                stream, _stat = self.client.api.get_archive(container_id, requested)
+                raw = _read_bounded(stream, remaining + 8 * 1024 * 1024)
+            except NotFound:
+                continue
+            except DockerException as exc:
+                raise DockerError(
+                    f"cannot read {requested} from container {container_id}: {exc}"
+                ) from exc
+            files: list[tuple[str, bytes]] = []
+            try:
+                archive = tarfile.open(fileobj=io.BytesIO(raw), mode="r|")
+            except tarfile.TarError:
+                continue
+            try:
+                for member in archive:
+                    if entries >= max_entries:
+                        break
+                    if not member.isfile():
+                        continue
+                    relative = _safe_member_name(member.name)
+                    if relative is None:
+                        continue
+                    handle = archive.extractfile(member)
+                    if handle is None:
+                        continue
+                    size = max(0, int(member.size))
+                    if size > remaining:
+                        continue
+                    data = handle.read(remaining + 1)
+                    if len(data) > remaining:
+                        continue
+                    files.append((relative, data))
+                    entries += 1
+            except tarfile.TarError:
+                # A truncated archive still yields the files parsed so far.
+                pass
+            if not files:
+                continue
+            single = (
+                len(files) == 1 and PurePosixPath(files[0][0]).name == PurePosixPath(requested).name
+            )
+            base = requested.rstrip("/")
+            for relative, data in files:
+                key = requested if single else f"{base}/{relative}"
+                found[key] = data
+                remaining -= len(data)
+        return found
 
     @staticmethod
     def _identity_script(
