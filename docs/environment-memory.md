@@ -103,9 +103,10 @@ citespec-resource admin legacy-capture clm_xxx
 - **V1 不支持自动 apt 安装系统包**。缺失的系统依赖会记录为未满足需求；管理员需要
   提供一个已包含这些包的基础镜像。
 - **conda 包只记录，不自动重建 conda 环境**。`python.packages` 是解释器
-  site-packages 中实际存在的发行包，构建时用 pip 安装；`python.conda_packages`
-  保留 conda-meta 的原始清单，供人工核对。`_libgcc_mutex`、`bzip2` 这类 conda-only
-  包不能 pip 安装，必须由基础镜像提供。
+  实际搜索到的发行包（包括 `pip install --user` 写入的用户 site-packages），
+  构建时用 pip 安装；`python.conda_packages` 保留 conda-meta 的原始清单，供
+  人工核对。`_libgcc_mutex`、`bzip2` 这类 conda-only 包不能 pip 安装，必须由
+  基础镜像提供。
 - 构建缓存按版本保留（默认每版本 2 个），超过 `env_build_cache_gb` 时清理旧镜像。
 
 ## 管理员开关

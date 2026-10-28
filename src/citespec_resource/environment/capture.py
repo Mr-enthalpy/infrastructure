@@ -65,13 +65,17 @@ def packages(root):
             found.append({"name": name, "version": version})
     return found
 
+# ``pip install --user`` (common in read-only containers) lands in the user
+# site directory, which is not included in ``site.getsitepackages()``.  The
+# interpreter searches it first, so record it first and let de-duplication keep
+# the version the member actually imports.
 def interpreter(path):
     try:
         result = subprocess.run(
             [path, "-I", "-S", "-c",
              "import json, site, sys; print(json.dumps({\n"
              "  'version': '%d.%d.%d' % sys.version_info[:3],\n"
-             "  'paths': site.getsitepackages(),\n"
+             "  'paths': [site.getusersitepackages()] + site.getsitepackages(),\n"
              "}))"],
             capture_output=True, text=True, timeout=10,
         )
