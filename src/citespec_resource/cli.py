@@ -59,12 +59,16 @@ me_app = typer.Typer(
 )
 file_app = typer.Typer(no_args_is_help=True, help="Restricted workspace file transfer.")
 queue_app = typer.Typer(no_args_is_help=True, help="Queued allocation requests.")
+project_app = typer.Typer(no_args_is_help=True, help="科研项目与长期环境记忆。")
+env_app = typer.Typer(no_args_is_help=True, help="环境版本的保存、查看与重建。")
 app.add_typer(config_app, name="config")
 app.add_typer(admin_app, name="admin")
 app.add_typer(job_app, name="job")
 app.add_typer(me_app, name="me")
 app.add_typer(file_app, name="file")
 app.add_typer(queue_app, name="queue")
+app.add_typer(project_app, name="project")
+app.add_typer(env_app, name="env")
 
 ALLOCATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -2321,6 +2325,218 @@ def queue_wait_command(
         )
         return
     _print_allocation(allocation)
+
+
+def _print_env_version(summary: dict[str, Any]) -> None:
+    typer.echo(
+        f"{summary['ref']}  fidelity={summary['capture_fidelity']}  "
+        f"verification={summary['verification']}  visibility={summary['visibility']}  "
+        f"created={summary['created_at']}"
+    )
+
+
+@project_app.command("create")
+def project_create_command(
+    ctx: typer.Context,
+    name: str = typer.Option(..., "--name", help="项目名，例如 reconstruction。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """创建一个科研项目（自动带一个默认环境档案）。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "project_create", json_output, name=name)
+    if json_output:
+        return
+    project = data["project"]
+    typer.echo(f"created: {project['name']}  versions={project['versions']}")
+
+
+@project_app.command("list")
+def project_list_command(
+    ctx: typer.Context,
+    all_users: bool = typer.Option(False, "--all", help="管理员查看所有项目。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出我的项目。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "project_list", json_output, all=all_users)
+    if json_output:
+        return
+    projects = data.get("projects", [])
+    if not projects:
+        typer.echo("还没有项目；先运行 citespec-resource project create --name <名称>")
+        return
+    for project in projects:
+        typer.echo(
+            f"{project['name']}  status={project['status']}  versions={project['versions']}  "
+            f"latest={project.get('latest') or '-'}"
+        )
+
+
+@project_app.command("show")
+def project_show_command(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="项目名。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """查看项目及其环境版本。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "project_show", json_output, name=name)
+    if json_output:
+        return
+    project = data["project"]
+    typer.echo(f"{project['name']}  status={project['status']}  versions={project['versions']}")
+    versions = data.get("versions", [])
+    if not versions:
+        typer.echo("  还没有保存的环境；在运行中的工作环境里执行 env capture")
+    for version in versions:
+        typer.echo(
+            "  "
+            + "  ".join(
+                (
+                    version["ref"],
+                    f"fidelity={version['capture_fidelity']}",
+                    f"verification={version['verification']}",
+                    f"visibility={version['visibility']}",
+                )
+            )
+        )
+
+
+@project_app.command("archive")
+def project_archive_command(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="项目名。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """归档项目（历史版本仍可查看）。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "project_archive", json_output, name=name)
+    if json_output:
+        return
+    project = data["project"]
+    typer.echo(f"archived: {project['name']}")
+
+
+@env_app.command("capture")
+def env_capture_command(
+    ctx: typer.Context,
+    project: str = typer.Option(..., "--project", help="目标项目名。"),
+    allocation: str = typer.Option(..., "--allocation", help="正在运行的工作环境 id。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """只读采集当前工作环境的依赖，保存为新的不可变版本。"""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "env_capture",
+        json_output,
+        project=project,
+        allocation=allocation,
+    )
+    if json_output:
+        return
+    version = data["version"]
+    typer.echo(
+        f"saved {version['ref']}  fidelity={version['capture_fidelity']}  "
+        f"artifacts={version['artifacts']}"
+    )
+    for note in version.get("notes", []):
+        typer.echo(f"  - {note}")
+
+
+@env_app.command("list")
+def env_list_command(
+    ctx: typer.Context,
+    project: str = typer.Option(..., "--project", help="项目名。"),
+    limit: int = typer.Option(50, "--limit", min=1, max=200),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出项目的环境版本。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "env_list", json_output, project=project, limit=limit)
+    if json_output:
+        return
+    versions = data.get("versions", [])
+    if not versions:
+        typer.echo("还没有环境版本")
+        return
+    for version in versions:
+        _print_env_version(version)
+
+
+@env_app.command("show")
+def env_show_command(
+    ctx: typer.Context,
+    ref: str = typer.Argument(..., help="环境引用，例如 reconstruction@v1。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """查看一个环境版本的 manifest、锁文件与构建记录。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "env_show", json_output, ref=ref)
+    if json_output:
+        return
+    _print_env_version(data["version"])
+    manifest = data.get("manifest", {})
+    base = manifest.get("base", {})
+    typer.echo(f"  base: {base.get('image', '')}  digest={base.get('digest') or '-'}")
+    python = manifest.get("python", {})
+    typer.echo(
+        f"  python: {python.get('version') or 'unknown'} ({python.get('manager') or '-'})  "
+        f"packages={len(python.get('packages', []))}"
+    )
+    system = manifest.get("system", {})
+    typer.echo(f"  system: {len(system.get('packages', []))} packages")
+    artifacts = data.get("artifacts", [])
+    if artifacts:
+        typer.echo("  lockfiles: " + ", ".join(str(item["name"]) for item in artifacts))
+    builds = data.get("builds", [])
+    if builds:
+        latest = builds[0]
+        typer.echo(f"  latest build: {latest['status']}  image={latest.get('image_id') or '-'}")
+    for note in manifest.get("notes", []):
+        typer.echo(f"  - {note}")
+
+
+@env_app.command("diff")
+def env_diff_command(
+    ctx: typer.Context,
+    left: str = typer.Argument(..., help="旧版本，例如 reconstruction@v1。"),
+    right: str = typer.Argument(..., help="新版本，例如 reconstruction@v2。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """比较两个环境版本的依赖差异。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "env_diff", json_output, left=left, right=right)
+    if json_output:
+        return
+    diff = data["diff"]
+    if not diff["changed"]:
+        typer.echo("两个环境版本内容相同")
+        return
+    base = diff.get("base", {})
+    for key, change in base.items():
+        typer.echo(f"base.{key}: {change['from']} -> {change['to']}")
+    python = diff.get("python", {})
+    version_change = python.get("version")
+    if version_change:
+        typer.echo(f"python.version: {version_change['from']} -> {version_change['to']}")
+    for item in python.get("packages", {}).get("added", []):
+        typer.echo(f"+ python {item['name']}=={item['version'] or '?'}")
+    for item in python.get("packages", {}).get("removed", []):
+        typer.echo(f"- python {item['name']}=={item['version'] or '?'}")
+    for item in python.get("packages", {}).get("changed", []):
+        before, after = item["from"], item["to"]
+        typer.echo(
+            f"~ python {before['name']} {before['version'] or '?'} -> {after['version'] or '?'}"
+        )
+    for item in diff.get("system", {}).get("packages", {}).get("added", []):
+        typer.echo(f"+ system {item['name']} {item['version']}")
+    for item in diff.get("system", {}).get("packages", {}).get("removed", []):
+        typer.echo(f"- system {item['name']} {item['version']}")
+    for item in diff.get("system", {}).get("packages", {}).get("changed", []):
+        typer.echo(
+            f"~ system {item['from']['name']} {item['from']['version']} -> {item['to']['version']}"
+        )
 
 
 @app.command("release")

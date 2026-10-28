@@ -121,6 +121,16 @@ class DockerBackend(Protocol):
 
     def remove_container(self, container_id: str) -> None: ...
 
+    def image_details(self, image: str) -> dict[str, Any]: ...
+
+    def exec_capture(
+        self,
+        container_id: str,
+        argv: list[str],
+        *,
+        user: str | None = None,
+    ) -> tuple[int, str, str]: ...
+
     def storage_preflight(
         self,
         *,
@@ -533,6 +543,37 @@ class DockerDriver:
             return None
         except DockerException as exc:
             raise DockerError(f"cannot inspect container {container_id}: {exc}") from exc
+
+    def image_details(self, image: str) -> dict[str, Any]:
+        """Return the local image ID and any recorded repository digests."""
+
+        try:
+            entry = self.client.images.get(image)
+        except NotFound as exc:
+            raise DockerError(f"image not found locally: {image}") from exc
+        except DockerException as exc:
+            raise DockerError(f"cannot inspect image {image}: {exc}") from exc
+        attrs = getattr(entry, "attrs", {}) or {}
+        digests: list[str] = []
+        for item in attrs.get("RepoDigests") or []:
+            if not isinstance(item, str):
+                continue
+            digest = item.split("@", 1)[1] if "@" in item else item
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                digests.append(digest)
+        return {
+            "id": str(attrs.get("Id") or getattr(entry, "id", "")),
+            "digests": digests,
+        }
+
+    def exec_capture(
+        self,
+        container_id: str,
+        argv: list[str],
+        *,
+        user: str | None = None,
+    ) -> tuple[int, str, str]:
+        return self._exec_capture(container_id, argv, user=user)
 
     def _container_user(self, allocation: Allocation) -> str:
         if self.config.policy.container_user == "root":
