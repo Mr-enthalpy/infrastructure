@@ -120,14 +120,25 @@ def image_tag_for(version_id: str, build_id: str) -> str:
     return f"citespec-env:{short}-{attempt}"
 
 
+TORCH_INDEX_PACKAGES = frozenset({"torch", "torchvision", "torchaudio"})
+
+
 def requirements_from_manifest(manifest: dict[str, Any]) -> str:
-    """Generate a pip requirements file from the recorded package list."""
+    """Generate a pip requirements file from the recorded package list.
+
+    Conda metadata is intentionally ignored: names such as ``_libgcc_mutex``
+    are not pip distributions.  A PEP 440 local version on a PyTorch package
+    (``2.7.1+cu128``) only exists on the matching PyTorch index, so that index
+    is added explicitly; other local suffixes are dropped because PyPI does
+    not carry those builds.
+    """
 
     python = manifest.get("python", {})
     packages = python.get("packages", [])
     lines: list[str] = []
     if not isinstance(packages, list):
         return ""
+    indexes: set[str] = set()
     for item in packages[:MAX_PACKAGE_LINES]:
         if not isinstance(item, dict):
             continue
@@ -136,10 +147,22 @@ def requirements_from_manifest(manifest: dict[str, Any]) -> str:
             continue
         version = item.get("version")
         if isinstance(version, str) and version:
-            lines.append(f"{name}=={version}")
+            base_version, _, local = version.partition("+")
+            if (
+                local
+                and name.lower() in TORCH_INDEX_PACKAGES
+                and re.fullmatch(r"cu\d{3}|cpu", local)
+            ):
+                indexes.add(local)
+                lines.append(f"{name}=={version}")
+            else:
+                lines.append(f"{name}=={base_version}")
         else:
             lines.append(name)
-    return "\n".join(lines) + ("\n" if lines else "")
+    prefix = [
+        f"--extra-index-url https://download.pytorch.org/whl/{item}" for item in sorted(indexes)
+    ]
+    return "\n".join(prefix + lines) + ("\n" if lines else "")
 
 
 class EnvironmentBuilder:
@@ -153,11 +176,9 @@ class EnvironmentBuilder:
         if not policy.environment_builds_enabled:
             raise Conflict("环境镜像构建尚未启用（policy.environment_builds_enabled）")
         manifest = _load_manifest(request.manifest_text)
-        system_packages = manifest.get("system", {}).get("packages", [])
-        if isinstance(system_packages, list) and system_packages:
-            raise BuildError(
-                "V1 不支持自动安装系统包（apt）；请让管理员准备包含这些包的基础镜像后再采集。"
-            )
+        # V1 never runs apt.  System packages are recorded for fidelity and
+        # expected to be present in the pinned base image; the build reports
+        # how many were recorded instead of silently claiming to install them.
 
         base_image = str(manifest.get("base", {}).get("image", "")) or request.base_image
         if not self.config.image.image_allowed(base_image):
@@ -276,6 +297,12 @@ class EnvironmentBuilder:
             warnings.append("pip check 报告依赖冲突，环境已构建但请人工确认")
         if not requirements.strip():
             warnings.append("该版本没有记录 Python 包，只生成了空的虚拟环境")
+        system_packages = manifest.get("system", {}).get("packages", [])
+        recorded_system = len(system_packages) if isinstance(system_packages, list) else 0
+        if recorded_system:
+            warnings.append(
+                f"记录了 {recorded_system} 个系统包，V1 不会自动安装；请确认基础镜像已包含"
+            )
         detail = "；".join(warnings) or "重建成功"
         return BuildOutcome(
             image_tag=tag,

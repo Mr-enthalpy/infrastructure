@@ -12,6 +12,7 @@ from citespec_resource import store
 from citespec_resource.db import init_db
 from citespec_resource.environment import authorization as env_authz
 from citespec_resource.environment import builder as env_builder
+from citespec_resource.environment import capture as env_capture
 from citespec_resource.environment import models
 from citespec_resource.environment import store as env_store
 from citespec_resource.environment.normalize import digest_text, normalize_manifest
@@ -461,6 +462,72 @@ def test_build_inputs_are_deterministic():
     assert tag.startswith("citespec-env:")
     assert env_builder.image_tag_for("ver_abc123", "bld_0123456789abcdef") == tag
     assert env_builder.image_tag_for("ver_abc123", "bld_fedcba9876543210") != tag
+
+
+def test_pytorch_local_versions_use_the_matching_index():
+    """``2.7.1+cu128`` only exists on the PyTorch wheel index, not on PyPI."""
+
+    requirements = env_builder.requirements_from_manifest(
+        {
+            "python": {
+                "packages": [
+                    {"name": "torch", "version": "2.7.1+cu128"},
+                    {"name": "torchvision", "version": "0.22.1+cu128"},
+                    {"name": "numpy", "version": "2.3.2+local"},
+                ]
+            }
+        }
+    )
+
+    assert requirements.splitlines() == [
+        "--extra-index-url https://download.pytorch.org/whl/cu128",
+        "torch==2.7.1+cu128",
+        "torchvision==0.22.1+cu128",
+        "numpy==2.3.2",
+    ]
+
+
+def test_conda_metadata_is_not_turned_into_pip_requirements():
+    """Conda-only packages such as ``_libgcc_mutex`` cannot be pip-installed.
+
+    They are recorded for fidelity, but the build input must only contain the
+    distributions that were actually present in the interpreter's
+    site-packages.
+    """
+
+    result = env_capture.build_manifest(
+        project_name="conda-proj",
+        probe={
+            "interpreters": [
+                {
+                    "path": "/opt/conda/bin/python",
+                    "version": "3.11.13",
+                    "packages": [{"name": "torch", "version": "2.7.1"}],
+                }
+            ],
+            "conda": [
+                {"name": "_libgcc_mutex", "version": "0.1"},
+                {"name": "torch", "version": "2.7.1"},
+            ],
+            "dpkg": [],
+            "errors": [],
+        },
+        base_image="citespec-base:2026.10",
+        base_digest="sha256:" + "a" * 64,
+        lockfiles=[],
+    )
+
+    python = result.manifest["python"]
+    assert python["packages"] == [{"name": "torch", "version": "2.7.1"}]
+    assert python["conda_packages"] == [
+        {"name": "_libgcc_mutex", "version": "0.1"},
+        {"name": "torch", "version": "2.7.1"},
+    ]
+    normalized = normalize_manifest(result.manifest)
+    assert normalized.data["python"]["conda_packages"][0]["name"] == "_libgcc_mutex"
+    requirements = env_builder.requirements_from_manifest(normalized.data)
+    assert requirements == "torch==2.7.1\n"
+    assert "_libgcc_mutex" not in requirements
 
 
 @pytest.mark.skipif(os.name != "posix", reason="chown is POSIX-only")

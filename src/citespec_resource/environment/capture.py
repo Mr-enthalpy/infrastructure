@@ -18,7 +18,7 @@ from . import models
 from .normalize import DEFAULT_MAX_PACKAGES
 
 PROBE_SCRIPT = r"""
-import glob, json, os, subprocess
+import glob, json, os, shutil, subprocess
 
 def read(path, limit=200000):
     try:
@@ -69,16 +69,24 @@ def interpreter(path):
     try:
         result = subprocess.run(
             [path, "-I", "-S", "-c",
-             "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
+             "import json, site, sys; print(json.dumps({\n"
+             "  'version': '%d.%d.%d' % sys.version_info[:3],\n"
+             "  'paths': site.getsitepackages(),\n"
+             "}))"],
             capture_output=True, text=True, timeout=10,
         )
     except Exception:
         return None
     if result.returncode != 0:
         return None
-    version = result.stdout.strip()
+    try:
+        info = json.loads(result.stdout)
+        version = info["version"]
+        paths = [item for item in info.get("paths", []) if isinstance(item, str)]
+    except (ValueError, KeyError, TypeError):
+        return None
     short = version.rsplit(".", 1)[0]
-    directories = [
+    directories = paths + [
         "/usr/lib/python3/dist-packages",
         "/usr/local/lib/python" + short + "/site-packages",
         "/usr/lib/python" + short + "/site-packages",
@@ -94,12 +102,17 @@ def interpreter(path):
             collected.append(item)
     return {"path": path, "version": version, "packages": collected}
 
-candidates = [
+candidates = []
+for name in ("python3", "python"):
+    found = shutil.which(name)
+    if found:
+        candidates.append(found)
+candidates.extend([
     "/usr/local/bin/python3",
     "/usr/bin/python3",
     "/opt/conda/bin/python",
     "/opt/conda/bin/python3",
-]
+])
 for path in sorted(glob.glob("/usr/bin/python3.*")):
     if not path.endswith("-config"):
         candidates.append(path)
@@ -233,8 +246,13 @@ def build_manifest(
         if isinstance(item, dict) and item.get("packages")
     ]
     primary = interpreters[0] if interpreters else {}
-    python_packages = _merge_packages(primary.get("packages", []), probe.get("conda", []))
-    python_packages = python_packages[:max_packages]
+    python_packages = _packages(primary.get("packages", []), max_packages)
+    # Conda metadata is recorded for fidelity, but it is not a pip
+    # requirements list: names such as ``_libgcc_mutex`` or ``bzip2`` are
+    # conda-only and would make every build fail.  V1 installs the
+    # distributions that are actually present in the interpreter's
+    # site-packages; conda-only packages must come from the base image.
+    conda_packages = _packages(probe.get("conda", []), max_packages)
     system_packages = probe.get("dpkg", [])[:max_packages]
 
     notes: list[str] = []
@@ -269,6 +287,7 @@ def build_manifest(
             "version": primary.get("version", ""),
             "manager": "conda" if probe.get("conda") else ("pip" if python_packages else "none"),
             "packages": python_packages,
+            "conda_packages": conda_packages,
             "lockfiles": [
                 {
                     "name": item.name,
@@ -283,7 +302,7 @@ def build_manifest(
         "notes": notes[:32],
     }
 
-    total = len(python_packages) + len(system_packages)
+    total = len(python_packages) + len(conda_packages) + len(system_packages)
     if total == 0:
         fidelity = models.CAPTURE_MISSING
     elif python_packages and base_digest and probe.get("errors") == []:
@@ -317,19 +336,6 @@ def _packages(value: Any, max_items: int) -> list[dict[str, str]]:
         if len(packages) >= max_items:
             break
     return packages
-
-
-def _merge_packages(*groups: Any) -> list[dict[str, str]]:
-    merged: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for group in groups:
-        for item in _packages(group, DEFAULT_MAX_PACKAGES):
-            key = item["name"].lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(item)
-    return merged
 
 
 def _digest(text: str) -> str:

@@ -18,7 +18,7 @@
 科研项目 (research_projects)
   └── 环境档案 (environment_profiles，V1 每个项目一个默认档案)
         └── 环境版本 (environment_versions，不可变)
-              ├── manifest（基础镜像、Python/conda/dpkg 包、锁文件清单）
+              ├── manifest（基础镜像、Python 发行包、conda 记录、dpkg 包、锁文件清单）
               ├── 锁文件副本（受大小上限约束）
               └── 构建记录（镜像 tag/id、证据、状态）
 ```
@@ -102,6 +102,10 @@ citespec-resource admin legacy-capture clm_xxx
 - 基础镜像必须仍能解析出与采集时一致的 digest，否则停止构建。
 - **V1 不支持自动 apt 安装系统包**。缺失的系统依赖会记录为未满足需求；管理员需要
   提供一个已包含这些包的基础镜像。
+- **conda 包只记录，不自动重建 conda 环境**。`python.packages` 是解释器
+  site-packages 中实际存在的发行包，构建时用 pip 安装；`python.conda_packages`
+  保留 conda-meta 的原始清单，供人工核对。`_libgcc_mutex`、`bzip2` 这类 conda-only
+  包不能 pip 安装，必须由基础镜像提供。
 - 构建缓存按版本保留（默认每版本 2 个），超过 `env_build_cache_gb` 时清理旧镜像。
 
 ## 管理员开关
@@ -134,6 +138,8 @@ env_max_versions_per_project = 50
 ## 已知限制
 
 - 采集是只读快照，不保证逐字节还原；`partial` 版本需要人工补全。
+- conda 环境的构建走 pip，不会复现 conda 的二进制包；conda-only 包需要基础镜像
+  已包含，`python.conda_packages` 只用于核对。
 - 锁文件采集有单文件/总量上限，超限会被跳过并在 manifest 中反映。
 - 旧容器停止后其镜像层可能仍可读，但无法证明曾经如何启动；因此 legacy 版本默认
   不是“已构建”，仍需走正常构建与功能验证。

@@ -720,7 +720,8 @@
         <p>fidelity <b>${esc(version.capture_fidelity)}</b> · verification <b>${esc(version.verification)}</b> · origin ${esc(version.origin)}</p>
         <p>base: ${esc(base.image || "")}${base.digest ? `<br>digest ${esc(base.digest)}` : ""}</p>
         <p>python: ${esc(python.version || "unknown")} (${esc(python.manager || "-")}) ·
-          ${(python.packages || []).length} packages · system ${(system.packages || []).length} packages</p>
+          ${(python.packages || []).length} packages · ${(python.conda_packages || []).length} conda packages ·
+          system ${(system.packages || []).length} packages</p>
         ${packages ? `<h3>Python packages</h3><ul>${packages}</ul>` : ""}
         ${builds ? `<h3>构建记录</h3><ul>${builds}</ul>` : ""}
       `);
