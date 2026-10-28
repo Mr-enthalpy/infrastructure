@@ -37,6 +37,12 @@
   已释放租约的 `remaining_seconds` 为 `null`。C4-11（容器内 passwd 项）已在成员指南
   说明，不阻塞推广。下一步是决定向更多成员推广的范围与节奏；Portal 与 development
   profile 仍关闭。
+- 客户端分发：`v0.1.1` tag 从 `main` `5232fa5` 创建，release run `40682337169`
+  成功，发布 Windows/Linux 的 full/精简资产与签名 manifest；`v0.1.0` tag 和资产
+  未改动。本地用 `packaging/verify_release.py` 校验 Windows full 包通过
+  （`sha256 3bc6ee26…`），已装客户端 `update --check` 返回 `already up to date`。
+- 推广范围：首批 1–2 名试点成员；C-4 测试账号与两个 workspace/checkpoint 暂保留，
+  观察后再决定是否扩大。
 
 ## 0.4 2026-10-27 部署阻断项与测试服务器准备（PR #1）
 
@@ -588,10 +594,10 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
 | P0 | 容器 root/宿主 GPU 5.6 | 未验证 | 容器 root 不能修改宿主 `/dev/nvidia*` 并影响他人 |
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |
 | P1 | CI 覆盖 | 测试矩阵和 Windows/Linux 打包 smoke 通过；Playwright 浏览器 job 仍待接入 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
-| P1 | 客户端打包/自动更新 | `v0.1.0` 已发布；Windows/Linux 构建和发布资产校验通过 | 成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
+| P1 | 客户端打包/自动更新 | `v0.1.1` 已发布（release run `40682337169`，Windows/Linux full/精简资产 + 签名 manifest，`v0.1.0` 未动）；本地资产校验与 `update --check` 通过 | 试点成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
-| P1 | 真实科研 Agent 端到端（C-4） | 0.1.1 签名客户端复测通过（2026-10-28，外部协助 0 次，2 卡同租约并行训练 + 断线恢复 + 释放后取件）；新增 C4-9/C4-10 待修 | 修完 C4-9/C4-10 后讨论向更多成员推广 |
+| P1 | 真实科研 Agent 端到端（C-4） | 0.1.1 签名客户端复测通过（2026-10-28，外部协助 0 次，2 卡同租约并行训练 + 断线恢复 + 释放后取件）；C4-9/C4-10/C4-4 提示/C4-7 JSON 已修复并随 `b689797` 上线 | 1–2 名试点成员观察后再决定是否扩大范围 |
 | P0 | 主机指纹/`setup` 闭环（C4-1/C4-2） | 已关闭（#4）；复测：错误指纹打印实际算法/指纹与原因，正确指纹退出 0、无崩溃 | 无（仅剩控制台编码见 C4-8） |
 | P1 | 容器内 `nvidia-smi`（C4-3） | 已关闭（#5）；复测：容器内 `nvidia-smi --query-gpu` 返回两张已分配 3090 | 无 |
 | P1 | 客户端/服务端版本一致性（C4-4） | `start` 回退已关闭（#5）；复测 `start --gpu-count 1` 打印回退说明并成功分配；`gpu_busy` 的排队提示已补（#15）并随 `b689797` 上线 | 无 |
