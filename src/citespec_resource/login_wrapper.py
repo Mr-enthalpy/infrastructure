@@ -30,6 +30,8 @@ ALLOWED = {
     "menu",
     "version",
     "me",
+    "project",
+    "env",
 }
 DENIED_TOKENS = {";", "&&", "||", "|", ">", ">>", "<", "&"}
 

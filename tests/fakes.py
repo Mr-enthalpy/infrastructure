@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from typing import Any
+
 from citespec_resource.broker.docker_driver import (
     ContainerInfo,
     ContainerRef,
     GPUProcess,
 )
+from citespec_resource.errors import DockerError
 from citespec_resource.identity import Identity
 from citespec_resource.models import GPU, Allocation
 
@@ -71,6 +74,9 @@ class FakeDocker:
         self.initialized_identity: list[dict[str, object]] = []
         self.fail_identity_init = fail_identity_init
         self.tunnels: list[str] = []
+        self.images: dict[str, dict[str, object]] = {}
+        self.exec_calls: list[tuple[str, list[str], str | None]] = []
+        self.exec_output: tuple[int, str, str] = (0, "", "")
         self._next_id = 1
 
     def list_gpus(self) -> list[GPU]:
@@ -84,6 +90,22 @@ class FakeDocker:
 
     def get_container(self, container_id: str) -> ContainerInfo | None:
         return self.containers.get(container_id)
+
+    def image_details(self, image: str) -> dict[str, Any]:
+        details = self.images.get(image)
+        if details is None:
+            raise DockerError(f"image not found locally: {image}")
+        return dict(details)
+
+    def exec_capture(
+        self,
+        container_id: str,
+        argv: list[str],
+        *,
+        user: str | None = None,
+    ) -> tuple[int, str, str]:
+        self.exec_calls.append((container_id, list(argv), user))
+        return self.exec_output
 
     def add_container(self, container: ContainerInfo) -> None:
         self.containers[container.id] = container

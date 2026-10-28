@@ -23,6 +23,18 @@ from .. import store, version_info
 from ..config import LabConfig, validate_active_mode_policy
 from ..db import connect, init_db
 from ..enrollment import store as intake_store
+from ..environment import authorization as env_authz
+from ..environment import capture as env_capture
+from ..environment import normalize as env_normalize
+from ..environment import service as env_service
+from ..environment import store as env_store
+from ..environment.models import (
+    EnvironmentConflict,
+    EnvironmentError,
+    EnvironmentForbidden,
+    EnvironmentNotFound,
+    ManifestError,
+)
 from ..errors import (
     BadRequest,
     CitespecError,
@@ -90,6 +102,20 @@ MAX_MESSAGE_BYTES = 64 * 1024
 CONNECTION_TIMEOUT = 30.0
 ACTIVE_GPU_HOLDER_STATUSES = {"running", "restarting", "paused"}
 JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+# Environment memory commands. Kept in one place so the dispatcher, the
+# membership command list, and the login wrapper can be checked against it.
+ENVIRONMENT_COMMANDS = frozenset(
+    {
+        "project_create",
+        "project_list",
+        "project_show",
+        "project_archive",
+        "env_capture",
+        "env_list",
+        "env_show",
+        "env_diff",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -2883,6 +2909,8 @@ class Broker:
                 "me_keys_revoke",
             }:
                 return _ok(await self._handle_membership_command(command, identity, args))
+            if command in ENVIRONMENT_COMMANDS:
+                return _ok(await self._handle_environment_command(command, identity, args))
             raise BadRequest(f"unknown command: {command}")
         except CitespecError as exc:
             return _error(exc.code, exc.message)
@@ -3156,6 +3184,400 @@ class Broker:
                 now=self._now(),
             )
             return store.get_queue_request(connection, queue_id, now=self._now())
+
+    # ------------------------------------------------------------------
+    # Environment memory (architecture §4/§8)
+    # ------------------------------------------------------------------
+
+    def _require_environment(self) -> None:
+        if not self.config.policy.environment_enabled:
+            raise Forbidden(
+                "环境记忆尚未启用；需要管理员在服务端配置中打开 policy.environment_enabled"
+            )
+
+    def _env_project_arg(self, args: dict[str, Any]) -> str:
+        name = args.get("project")
+        if not isinstance(name, str) or not name:
+            raise BadRequest("project must be a non-empty string")
+        return name
+
+    def _env_context(
+        self,
+        connection: Any,
+        identity: Identity,
+        ref: Any,
+    ) -> dict[str, Any]:
+        owner_member_id = None
+        if not identity.is_admin:
+            owner_member_id = env_authz.member_id_for(connection, identity.uid)
+        context = env_service.resolve_ref(connection, ref=ref, owner_member_id=owner_member_id)
+        return env_authz.require_version(
+            connection,
+            uid=identity.uid,
+            is_admin=identity.is_admin,
+            version_id=str(context["version_id"]),
+            now=self._now(),
+        )
+
+    def _project_create(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        name = env_store.validate_project_name(args.get("name"))
+        now = self._now()
+        with self._connection() as connection:
+            member_id = env_authz.require_active_member(connection, uid=identity.uid, now=now)
+            try:
+                project = env_store.create_project(
+                    connection, owner_member_id=member_id, name=name, now=now
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict(f"项目 {name} 已存在") from exc
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_project_create",
+                detail={"project_id": project["project_id"], "name": name},
+                now=now,
+            )
+            return {"project": env_service.project_summary(connection, project)}
+
+    def _project_list(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        include_all = bool(args.get("all", False))
+        if include_all and not identity.is_admin:
+            raise Forbidden("only an administrator may list every project")
+        with self._connection() as connection:
+            member_id = env_authz.member_id_for(connection, identity.uid)
+            owner = None if include_all else member_id
+            projects = env_store.list_projects(
+                connection, owner_member_id=owner, include_archived=True
+            )
+            return {
+                "projects": [
+                    env_service.project_summary(connection, project) for project in projects
+                ]
+            }
+
+    def _project_show(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            if args.get("id"):
+                project = env_authz.require_project(
+                    connection,
+                    uid=identity.uid,
+                    is_admin=identity.is_admin,
+                    project_id=str(args["id"]),
+                    now=self._now(),
+                )
+            else:
+                project = env_authz.require_project(
+                    connection,
+                    uid=identity.uid,
+                    is_admin=identity.is_admin,
+                    name=self._env_project_arg(args),
+                    now=self._now(),
+                )
+            profile = env_store.default_profile(connection, str(project["project_id"]))
+            versions = env_store.list_versions(connection, str(profile["profile_id"]))
+            return {
+                "project": env_service.project_summary(connection, project),
+                "versions": [
+                    env_service.summary(
+                        env_store.version_context(connection, str(row["version_id"]))
+                    )
+                    for row in versions
+                ],
+            }
+
+    def _project_archive(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        now = self._now()
+        with self._connection() as connection:
+            project = env_authz.require_project(
+                connection,
+                uid=identity.uid,
+                is_admin=identity.is_admin,
+                name=self._env_project_arg(args),
+                now=now,
+            )
+            if not identity.is_admin:
+                member_id = env_authz.require_active_member(connection, uid=identity.uid, now=now)
+                if project["owner_member_id"] != member_id:
+                    raise Forbidden("only the project owner may archive it")
+            project = env_store.archive_project(connection, str(project["project_id"]), now=now)
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_project_archive",
+                detail={"project_id": project["project_id"]},
+                now=now,
+            )
+            return {"project": env_service.project_summary(connection, project)}
+
+    def _env_list(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        limit = args.get("limit", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise BadRequest("limit must be an integer between 1 and 200")
+        with self._connection() as connection:
+            project = env_authz.require_project(
+                connection,
+                uid=identity.uid,
+                is_admin=identity.is_admin,
+                name=self._env_project_arg(args),
+                now=self._now(),
+            )
+            profile = env_store.default_profile(connection, str(project["project_id"]))
+            versions = env_store.list_versions(connection, str(profile["profile_id"]), limit=limit)
+            return {
+                "project": env_service.project_summary(connection, project),
+                "versions": [
+                    env_service.summary(
+                        env_store.version_context(connection, str(row["version_id"]))
+                    )
+                    for row in versions
+                ],
+            }
+
+    def _env_show(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            context = self._env_context(connection, identity, args.get("ref"))
+            return env_service.detail(connection, context)
+
+    def _env_diff(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as connection:
+            left = self._env_context(connection, identity, args.get("left"))
+            right = self._env_context(connection, identity, args.get("right"))
+            return {
+                "left": env_service.summary(left),
+                "right": env_service.summary(right),
+                "diff": env_service.diff_manifests(left, right),
+            }
+
+    async def _env_capture(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        allocation_id = args.get("allocation")
+        if not isinstance(allocation_id, str) or not allocation_id:
+            raise BadRequest("allocation must be a non-empty string")
+        project_name = self._env_project_arg(args)
+        policy = self.config.policy
+        now = self._now()
+        with self._connection() as connection:
+            allocation = store.get_allocation(connection, allocation_id, now=now)
+            if allocation["owner_uid"] != identity.uid and not identity.is_admin:
+                raise Forbidden("只有本人或管理员可以采集这个工作环境")
+            project = env_authz.require_project(
+                connection,
+                uid=identity.uid,
+                is_admin=identity.is_admin,
+                name=project_name,
+                now=now,
+            )
+            profile = env_store.default_profile(connection, str(project["project_id"]))
+            if (
+                env_store.count_versions(connection, str(profile["profile_id"]))
+                >= policy.env_max_versions_per_project
+            ):
+                raise Conflict(
+                    f"项目 {project_name} 已达到 {policy.env_max_versions_per_project} "
+                    "个版本上限，请先联系管理员清理"
+                )
+        if allocation["status"] != "active":
+            raise Conflict(f"allocation is {allocation['status']}, not active")
+        container_id = str(allocation["container_id"])
+        if not container_id:
+            raise NotFound("allocation has no container")
+
+        details: dict[str, Any] = {}
+        try:
+            details = await asyncio.to_thread(self.docker.image_details, str(allocation["image"]))
+        except (DockerError, EnvironmentError):
+            details = {}
+        digests = details.get("digests") if isinstance(details, dict) else None
+        base_digest = str(digests[0]) if isinstance(digests, list) and digests else ""
+
+        probe: dict[str, Any] = {}
+        probe_error = ""
+        owner_uid, owner_gid = self._allocation_owner_ids(allocation)
+        try:
+            code, output, _stderr = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.docker.exec_capture,
+                    container_id,
+                    list(env_capture.PROBE_ARGV),
+                    user=f"{owner_uid}:{owner_gid}",
+                ),
+                timeout=policy.env_capture_timeout_seconds,
+            )
+            if code == 0:
+                probe = env_capture.parse_probe(output, max_packages=policy.env_max_packages)
+            else:
+                probe_error = f"采集探针退出码 {code}"
+        except TimeoutError:
+            probe_error = "采集探针超时"
+        except (DockerError, EnvironmentError) as exc:
+            probe_error = f"采集探针失败: {exc}"
+        if probe_error:
+            probe = {
+                "os": {},
+                "interpreters": [],
+                "conda": [],
+                "dpkg": [],
+                "errors": [probe_error],
+            }
+
+        lockfiles = await asyncio.to_thread(self._capture_lockfiles, allocation, policy)
+        result = env_capture.build_manifest(
+            project_name=str(project["name"]),
+            probe=probe,
+            base_image=str(allocation["image"]),
+            base_digest=base_digest,
+            lockfiles=lockfiles,
+            max_packages=policy.env_max_packages,
+        )
+        try:
+            normalized = env_normalize.normalize_manifest(
+                result.manifest, max_packages=policy.env_max_packages
+            )
+        except ManifestError as exc:
+            raise BadRequest(str(exc)) from exc
+        if len(normalized.text.encode("utf-8")) > policy.env_max_manifest_bytes:
+            raise BadRequest("环境 manifest 超过大小上限")
+
+        with self._connection() as connection:
+            member_id = env_authz.require_active_member(
+                connection, uid=identity.uid, now=self._now()
+            )
+            version = env_store.create_version(
+                connection,
+                profile_id=str(profile["profile_id"]),
+                manifest_text=normalized.text,
+                sha256=normalized.sha256,
+                origin="capture",
+                capture_fidelity=result.fidelity,
+                created_by_member_id=member_id,
+                now=self._now(),
+            )
+            stored_bytes = 0
+            stored = 0
+            for item in result.artifacts:
+                if item.size_bytes > policy.env_max_artifact_bytes:
+                    continue
+                if stored_bytes + item.size_bytes > policy.env_max_artifacts_bytes:
+                    break
+                env_store.add_artifact(
+                    connection,
+                    version_id=str(version["version_id"]),
+                    kind=item.kind,
+                    name=item.name,
+                    content=item.content,
+                    max_bytes=policy.env_max_artifact_bytes,
+                    now=self._now(),
+                )
+                stored_bytes += item.size_bytes
+                stored += 1
+            context = env_store.version_context(connection, str(version["version_id"]))
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_capture",
+                allocation_id=allocation_id,
+                detail={
+                    "version_id": version["version_id"],
+                    "project_id": project["project_id"],
+                    "fidelity": result.fidelity,
+                    "artifacts": stored,
+                    "probe_error": probe_error,
+                },
+                now=self._now(),
+            )
+            summary = env_service.summary(context)
+            summary["artifacts"] = stored
+            summary["notes"] = result.notes
+            return {"version": summary}
+
+    def _capture_lockfiles(
+        self,
+        allocation: dict[str, Any],
+        policy: Any,
+    ) -> list[env_capture.Lockfile]:
+        """Read the small, known lockfiles from the member workspace.
+
+        Only fixed names are considered; there is no directory walk and no
+        symlink following. A file that is too large or not valid UTF-8 text is
+        skipped and reported through the manifest notes by the caller.
+        """
+
+        candidates = (
+            ("lockfile", "uv.lock"),
+            ("requirements", "requirements.txt"),
+            ("conda", "environment.yml"),
+            ("conda", "environment.yaml"),
+            ("pyproject", "pyproject.toml"),
+        )
+        workspace = str(allocation["workspace"])
+        found: list[env_capture.Lockfile] = []
+        total = 0
+        for kind, name in candidates:
+            try:
+                size = workspace_io.regular_file_size(workspace, (name,))
+                if size is None or size <= 0 or size > policy.env_max_artifact_bytes:
+                    continue
+                descriptor = workspace_io.open_read_file(workspace, (name,))
+            except Exception:
+                # workspace_io raises typed errors on unsupported platforms or
+                # unsafe paths; a capture simply records fewer artifacts.
+                continue
+            try:
+                raw = os.read(descriptor, policy.env_max_artifact_bytes + 1)
+            finally:
+                os.close(descriptor)
+            if len(raw) > policy.env_max_artifact_bytes or b"\x00" in raw:
+                continue
+            total += len(raw)
+            if total > policy.env_max_artifacts_bytes:
+                break
+            found.append(
+                env_capture.Lockfile(
+                    kind=kind, name=name, content=raw.decode("utf-8", errors="replace")
+                )
+            )
+        return found
+
+    async def _handle_environment_command(
+        self,
+        command: str,
+        identity: Identity,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._require_environment()
+        try:
+            if command == "project_create":
+                self._check_args(args, {"name"})
+                return self._project_create(identity, args)
+            if command == "project_list":
+                self._check_args(args, {"all"})
+                return self._project_list(identity, args)
+            if command == "project_show":
+                self._check_args(args, {"name", "id"})
+                return self._project_show(identity, args)
+            if command == "project_archive":
+                self._check_args(args, {"name"})
+                return self._project_archive(identity, args)
+            if command == "env_capture":
+                self._check_args(args, {"allocation", "project"})
+                return await self._env_capture(identity, args)
+            if command == "env_list":
+                self._check_args(args, {"project", "limit"})
+                return self._env_list(identity, args)
+            if command == "env_show":
+                self._check_args(args, {"ref"})
+                return self._env_show(identity, args)
+            if command == "env_diff":
+                self._check_args(args, {"left", "right"})
+                return self._env_diff(identity, args)
+            raise BadRequest(f"unknown environment command: {command}")
+        except EnvironmentNotFound as exc:
+            raise NotFound(str(exc)) from exc
+        except EnvironmentForbidden as exc:
+            raise Forbidden(str(exc)) from exc
+        except EnvironmentConflict as exc:
+            raise Conflict(str(exc)) from exc
+        except EnvironmentError as exc:
+            raise BadRequest(str(exc)) from exc
 
     def _status(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
         allocation_id = args.get("id")
