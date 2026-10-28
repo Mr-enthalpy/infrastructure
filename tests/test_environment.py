@@ -487,6 +487,17 @@ def test_pytorch_local_versions_use_the_matching_index():
     ]
 
 
+def test_probe_records_the_per_user_site_packages():
+    """``pip install --user`` is common in read-only containers.
+
+    The interpreter imports the user site directory before its own
+    site-packages, so a capture that only reads ``site.getsitepackages()``
+    records versions the member does not actually use.
+    """
+
+    assert "site.getusersitepackages()" in env_capture.PROBE_SCRIPT
+
+
 def test_conda_metadata_is_not_turned_into_pip_requirements():
     """Conda-only packages such as ``_libgcc_mutex`` cannot be pip-installed.
 
