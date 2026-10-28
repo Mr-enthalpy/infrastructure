@@ -140,7 +140,7 @@ Per-item recheck of the first round's findings:
 | C4-7 | Fixed in the rendered output; the JSON body of a released allocation still carries `remaining_seconds` |
 | C4-8 | Partially fixed. Redirected and piped output is UTF-8 and JSON parses, but non-JSON output on an interactive console still uses the console encoding and loses unrepresentable punctuation |
 
-New findings from the rerun (non-blocking, not yet fixed):
+New findings from the rerun (non-blocking):
 
 | ID | Severity | Finding | Recommended fix |
 |---|---|---|---|
@@ -151,10 +151,10 @@ New findings from the rerun (non-blocking, not yet fixed):
 
 Verdict: **C-4 passes on 0.1.1**. All blocking items from the first round are
 closed and the member-visible workflow held up without administrator help.
-C4-9 and C4-10 are cheap fixes and should land before the service is offered to
-more members; C4-7 (JSON field), C4-11, and the C4-4 hint can go in the same
-batch. The agent chose to keep the workspace and both checkpoints for review;
-they are not deleted.
+C4-9, C4-10, the C4-4 queueing hint, and the C4-7 JSON field are fixed in #15
+and ship with the next deployment. C4-11 stays open as a low-severity cosmetic
+item. The agent chose to keep the workspace and both checkpoints for review; they
+are not deleted.
 
 ## 6. Project-side findings
 
