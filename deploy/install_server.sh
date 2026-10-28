@@ -372,6 +372,18 @@ effective_members() {
 # unless it still looks like the system account the installer would create:
 # system UID, dedicated primary group, non-interactive shell, locked password,
 # no sudo and no supplementary groups other than citespec-cli.
+portal_account_has_sudo() {
+    # ``sudo -l -U`` exits 0 even when the account has no rules; on sudo 1.8 it
+    # only prints "<user> is not allowed to run sudo".  The listing text is the
+    # only signal, and using the exit status instead rejected every existing
+    # service account on the next install.
+    have sudo || return 1
+    local listing
+    listing=$(sudo -n -l -U "$PORTAL_USER" 2>&1 || true)
+    printf '%s\n' "$listing" \
+        | grep -qE 'may run the following|NOPASSWD|ALL[[:space:]]*='
+}
+
 validate_existing_portal_account() {
     local passwd_entry uid gid home shell primary_group group status shell_ok=0
     passwd_entry=$(getent passwd "$PORTAL_USER" 2>/dev/null || true)
@@ -418,7 +430,7 @@ validate_existing_portal_account() {
                 ;;
         esac
     fi
-    if have sudo && sudo -n -l -U "$PORTAL_USER" >/dev/null 2>&1; then
+    if portal_account_has_sudo; then
         fail "existing $PORTAL_USER has sudo privileges; remove them before installing"
     fi
 }
