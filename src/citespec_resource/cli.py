@@ -50,6 +50,8 @@ app = typer.Typer(no_args_is_help=True, help="Timed lab GPU resource manager.")
 config_app = typer.Typer(no_args_is_help=True, help="Inspect the local configuration.")
 admin_app = typer.Typer(no_args_is_help=True, help="Administrator commands.")
 job_app = typer.Typer(no_args_is_help=True, help="Long-running job commands.")
+
+SERVER_CONFIG = Path("/etc/citespec-resource/config.toml")
 me_app = typer.Typer(
     no_args_is_help=False,
     invoke_without_command=True,
@@ -91,7 +93,7 @@ def _config_path(path: Path | None) -> Path:
     configured = os.environ.get("CITESPEC_RESOURCE_CONFIG")
     if configured:
         return Path(configured)
-    installed = Path("/etc/citespec-resource/config.toml")
+    installed = SERVER_CONFIG
     if installed.exists():
         return installed
     local = Path("lab/resources.local.toml")
@@ -1050,6 +1052,14 @@ def app_callback(
     except OSError:
         return
     if Path(cfg.server.broker_socket).exists():
+        return
+    # On the host that runs the broker, a missing socket means the broker is
+    # stopped or still binding after a restart.  Relaying there would SSH to the
+    # server's own alias and fail with "Could not resolve hostname <alias>",
+    # which reads like a member-workstation problem.  The runtime directory only
+    # exists on that host (a member profile points at the server's path), so it
+    # distinguishes the two without relying on the config location.
+    if Path(cfg.server.broker_socket).parent.is_dir() or Path(ctx.obj) == SERVER_CONFIG:
         return
     _dispatch_remote(cfg.server.ssh_alias, rest)
 
