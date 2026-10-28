@@ -252,6 +252,48 @@ def test_verify_portal_network_rejects_addressless_listen(tmp_path):
     assert "omits a bind address" in result.stdout
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="POSIX sudo stub")
+@pytest.mark.parametrize(
+    ("listing", "expected"),
+    [
+        # sudo 1.8 exits 0 for these lines; the exit status is not a signal.
+        ("User citespec-portal is not allowed to run sudo on host.", 1),
+        ("Sorry, user citespec-portal may not run sudo on host.", 1),
+        (
+            "User citespec-portal may run the following commands on host:\n    (ALL : ALL) ALL",
+            0,
+        ),
+        (
+            "User citespec-portal may run the following commands on host:\n"
+            "    (root) NOPASSWD: /bin/systemctl",
+            0,
+        ),
+    ],
+)
+def test_installer_reads_the_sudo_listing_not_the_exit_status(tmp_path, listing, expected):
+    """Regression: any existing portal account was rejected on reinstall."""
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "if portal_account_has_sudo; then" in source
+    start = source.index("portal_account_has_sudo() {")
+    end = source.index("\n}\n", start) + len("\n}\n")
+    helper = source[start:end]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "sudo"
+    stub.write_text(f"#!/bin/sh\ncat <<'LISTING'\n{listing}\nLISTING\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+    prelude = 'set -u\nPORTAL_USER=citespec-portal\nhave() { command -v "$1" >/dev/null 2>&1; }\n'
+    script = prelude + helper + "\nportal_account_has_sudo\n"
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, check=False, env=env
+    )
+    assert result.returncode == expected, result.stdout + result.stderr
+
+
 def test_installer_has_transactional_backup_and_rollback():
     source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "trap on_exit EXIT" in source
