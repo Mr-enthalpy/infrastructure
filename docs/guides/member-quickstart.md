@@ -83,6 +83,9 @@
   写入 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、
   `NUMEXPR_NUM_THREADS`；在同一个容器里并发跑多个进程时，请按进程数再下调
   （例如两个训练各设一半），否则线程超订会让所有进程一起变慢。
+- 容器镜像里通常没有你 UID 的 passwd 项，`id -un` / `whoami` 可能报
+  "cannot find name for user ID"。这是预期行为，脚本请用 `id -u` 取数字 UID；
+  不影响训练和文件权限。
 - 本地工作台：在你自己的电脑运行 `citespec-resource gui`。
 - VS Code：从工作台的"VS Code"按钮进入，或 `citespec-resource vscode <工作环境>`。
 - 直接执行 `bash` / `docker` / `nvidia-smi` 等宿主机命令会被拒绝，
