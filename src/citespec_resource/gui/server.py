@@ -52,6 +52,10 @@ SOURCE_STATUSES = frozenset({"available", "claimed", "dismissed"})
 # success.
 VSCODE_READY_TIMEOUT_SECONDS = 90
 VSCODE_READY_POLL_SECONDS = 0.25
+# Builds install Python packages and can legitimately take many minutes; the
+# default SSH timeout is sized for synchronous commands only.
+ENV_BUILD_TIMEOUT_SECONDS = 3600.0
+ENV_SLOW_OPERATION_TIMEOUT_SECONDS = 900.0
 
 
 class SSHRunner:
@@ -92,7 +96,9 @@ class SSHRunner:
         argv.extend([alias, remote_command])
         return argv
 
-    async def run(self, alias: str, args: list[str]) -> dict[str, Any]:
+    async def run(
+        self, alias: str, args: list[str], *, timeout: float | None = None
+    ) -> dict[str, Any]:
         argv = self._argv(alias, args)
         if argv is None:
             return _error("ssh_unavailable", "ssh executable or SSH alias is unavailable")
@@ -107,7 +113,7 @@ class SSHRunner:
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=self.config.gui.connect_timeout + 30,
+                timeout=timeout or self.config.gui.connect_timeout + 30,
             )
         except TimeoutError:
             process.kill()
@@ -306,12 +312,18 @@ async def _api_config(request: web.Request) -> web.Response:
     )
 
 
-async def _remote(request: web.Request, args: list[str], *, admin: bool = False) -> web.Response:
+async def _remote(
+    request: web.Request,
+    args: list[str],
+    *,
+    admin: bool = False,
+    timeout: float | None = None,
+) -> web.Response:
     runner = request.app[RUNNER_KEY]
     alias = runner.admin_alias if admin else runner.member_alias
     if not alias:
         return _json(_error("forbidden", "admin SSH alias is not configured"))
-    return _json(await runner.run(alias, args))
+    return _json(await runner.run(alias, args, timeout=timeout))
 
 
 async def _api_overview(request: web.Request) -> web.Response:
@@ -494,7 +506,7 @@ async def _api_env_build(request: web.Request) -> web.Response:
     ref = request.match_info["ref"]
     if not ENV_REF_RE.fullmatch(ref):
         return _bad("invalid environment ref")
-    return await _remote(request, ["env", "build", ref])
+    return await _remote(request, ["env", "build", ref], timeout=ENV_BUILD_TIMEOUT_SECONDS)
 
 
 async def _api_env_verify(request: web.Request) -> web.Response:
@@ -505,7 +517,11 @@ async def _api_env_verify(request: web.Request) -> web.Response:
     allocation_id = body.get("allocation")
     if not isinstance(allocation_id, str) or not ALLOCATION_RE.fullmatch(allocation_id):
         return _bad("allocation is required")
-    return await _remote(request, ["env", "verify", ref, "--allocation", allocation_id])
+    return await _remote(
+        request,
+        ["env", "verify", ref, "--allocation", allocation_id],
+        timeout=ENV_SLOW_OPERATION_TIMEOUT_SECONDS,
+    )
 
 
 async def _api_legacy_sources(request: web.Request) -> web.Response:
@@ -597,7 +613,12 @@ async def _api_admin_legacy_capture(request: web.Request) -> web.Response:
     claim_id = body.get("id")
     if not isinstance(claim_id, str) or not LEGACY_CLAIM_RE.fullmatch(claim_id):
         return _bad("id is required")
-    return await _remote(request, ["admin", "legacy-capture", claim_id], admin=True)
+    return await _remote(
+        request,
+        ["admin", "legacy-capture", claim_id],
+        admin=True,
+        timeout=ENV_SLOW_OPERATION_TIMEOUT_SECONDS,
+    )
 
 
 async def _api_logs(request: web.Request) -> web.Response:

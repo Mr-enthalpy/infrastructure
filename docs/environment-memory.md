@@ -43,6 +43,7 @@ citespec-resource env diff reconstruction@v1 reconstruction@v2
 
 # 4. 从版本构建镜像（需要管理员打开 environment_builds_enabled）
 citespec-resource env build reconstruction@v1
+# 构建是同步请求，CLI 默认最多等 3600 秒；可用 --timeout 调整
 
 # 5. 用环境版本启动，而不是手写镜像名
 citespec-resource apply --gpus 0 --cpus 8 --memory 32 --hours 12 \
