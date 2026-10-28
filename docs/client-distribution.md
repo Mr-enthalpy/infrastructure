@@ -147,6 +147,17 @@ python packaging/check_version.py --tag v<version>
 `CITESPEC_UPDATE_SIGNING_KEY` 未配置或与嵌入公钥不匹配，发布会失败，不会生成
 无法验证的清单。
 
+候选构建（验收用，不发布 Release）走 `.github/workflows/acceptance-build.yml`：
+
+```bash
+gh workflow run acceptance-build.yml --ref main -f notes="<说明>"
+gh run download <run-id> -n acceptance-client -D dist-candidate
+```
+
+它执行与发布相同的构建、签名清单和 full zip 自检，产物只留在该次 run 的
+artifact 中，不会创建 tag 或 Release。私钥仍只在 CI 内使用，本地只拿到已签名
+清单和安装包。
+
 本地检查清单（不用于生产）可用：
 
 ```bash
