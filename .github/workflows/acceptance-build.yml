@@ -1,0 +1,105 @@
+name: acceptance-build
+
+# Produce a signed client package for an acceptance run without publishing a
+# release.  release.yml only runs for a v* tag and publishes the assets, so a
+# candidate build from main (a commit that is not a release) has no way to get a
+# manifest signed by the update key.  This workflow builds the same artifacts as
+# release.yml, signs the manifest with the repository secret, and leaves
+# everything as run artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: Text recorded in the manifest
+        required: false
+        default: acceptance candidate build
+      base_url:
+        description: Base URL recorded in the manifest (not fetched during acceptance)
+        required: false
+        default: https://example.invalid/acceptance
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-latest
+            platform: linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui,portal]" pyinstaller
+      - name: Build client
+        run: python packaging/build_client.py --platform ${{ matrix.platform }} --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ matrix.platform }}
+          path: |
+            dist/citespec-resource-*-${{ matrix.platform }}.zip
+            dist/citespec-resource-*-${{ matrix.platform }}-full.zip
+          if-no-files-found: error
+
+  sign:
+    name: sign manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install manifest dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui,portal]"
+      - uses: actions/download-artifact@v4
+        with:
+          path: candidate-assets
+          merge-multiple: true
+      - name: Create signed manifest
+        env:
+          CITESPEC_UPDATE_SIGNING_KEY: ${{ secrets.CITESPEC_UPDATE_SIGNING_KEY }}
+        run: |
+          version="$(
+            python -c 'from citespec_resource import __version__; print(__version__)'
+          )"
+          python packaging/make_manifest.py \
+            --artifacts-dir candidate-assets \
+            --version "$version" \
+            --output candidate-assets/citespec-resource-manifest.json \
+            --base-url "${{ inputs.base_url }}" \
+            --notes "${{ inputs.notes }}"
+      - name: Add standalone first-install verifier
+        run: |
+          cp packaging/verify_release.py packaging/verify_release.sh \
+            packaging/verify_release.ps1 candidate-assets/
+          chmod +x candidate-assets/verify_release.sh
+      - name: Verify candidate packages against the signed manifest
+        run: |
+          version="$(
+            python -c 'from citespec_resource import __version__; print(__version__)'
+          )"
+          for platform in windows-x64 linux-x64; do
+            python packaging/verify_release.py \
+              --manifest candidate-assets/citespec-resource-manifest.json \
+              --package "candidate-assets/citespec-resource-${version}-${platform}-full.zip" \
+              --platform "$platform"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-client
+          path: candidate-assets/
+          if-no-files-found: error
