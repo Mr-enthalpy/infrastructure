@@ -11,6 +11,13 @@
     jobs: [],
     jobsRefreshedAt: 0,
     adminEnabled: false,
+    projects: [],
+    versions: [],
+    envProject: "",
+    legacySources: [],
+    legacyClaims: [],
+    adminLegacySources: [],
+    adminLegacyClaims: [],
     offline: false,
     selectedGpus: new Set(),
     terminal: null,
@@ -103,7 +110,11 @@
     $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
     $$(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `tab-${name}`));
     if (name === "allocations") refreshMy();
-    if (name === "admin" && state.adminEnabled) refreshAdmin();
+    if (name === "environments") refreshEnvironments();
+    if (name === "admin" && state.adminEnabled) {
+      refreshAdmin();
+      refreshLegacyAdmin();
+    }
   }
 
   async function loadConfig() {
@@ -502,6 +513,549 @@
           <div class="muted">${process.container_name ? `container ${esc(process.container_name)}` : "read-only"}${process.container_owner ? `<br>owner ${esc(process.container_owner_display || process.container_owner)}` : ""}</div>
         </div>
       `).join("");
+    }
+  }
+
+  async function refreshEnvironments() {
+    try {
+      const payload = await api("/api/projects");
+      if (!payload.ok) throw new Error(payload?.error?.message || "project list failed");
+      state.projects = payload.data.projects || [];
+      renderProjects();
+      const active = state.projects.filter((project) => project.status === "active");
+      const select = $("#env-project");
+      const wanted = state.envProject || select.value;
+      select.innerHTML = active.map((project) =>
+        `<option value="${esc(project.name)}">${esc(project.name)}</option>`
+      ).join("");
+      if (active.some((project) => project.name === wanted)) select.value = wanted;
+      state.envProject = select.value || "";
+      renderProjectChoices();
+      await refreshVersions();
+    } catch (error) {
+      $("#project-list").className = "allocation-list empty";
+      $("#project-list").textContent = `无法加载项目：${error.message || error}`;
+    }
+    await refreshLegacy();
+  }
+
+  function renderProjects() {
+    const target = $("#project-list");
+    if (!state.projects.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "还没有项目；先在上方创建一个。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = state.projects.map((project) => `
+      <div class="allocation-item">
+        <div>
+          <div class="id">${esc(project.name)}</div>
+          <div class="muted">${statusBadge(project.status)} · ${esc(project.versions)} 个版本</div>
+        </div>
+        <div class="muted">latest: ${esc(project.latest || "—")}<br>created ${esc(project.created_at)}</div>
+        <div class="row-actions">
+          <button data-action="project-open" data-name="${esc(project.name)}">查看版本</button>
+          ${project.status === "active"
+            ? `<button data-action="project-archive" data-name="${esc(project.name)}">归档</button>`
+            : ""}
+        </div>
+      </div>
+    `).join("");
+    target.querySelectorAll("button[data-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (button.dataset.action === "project-open") openProject(button.dataset.name);
+        if (button.dataset.action === "project-archive") archiveProject(button.dataset.name);
+      });
+    });
+  }
+
+  function renderProjectChoices() {
+    const active = state.projects.filter((project) => project.status === "active");
+    const options = active.map((project) =>
+      `<option value="${esc(project.name)}">${esc(project.name)}</option>`
+    ).join("");
+    const target = $("#legacy-project");
+    if (!target) return;
+    const wanted = target.value;
+    target.innerHTML = options;
+    if (active.some((project) => project.name === wanted)) target.value = wanted;
+  }
+
+  function openProject(name) {
+    if (!name) return;
+    state.envProject = name;
+    const select = $("#env-project");
+    if (select) select.value = name;
+    refreshVersions();
+  }
+
+  async function archiveProject(name) {
+    if (!window.confirm(`归档项目 ${name}？归档后不能再采集或构建，但历史版本仍可查看。`)) return;
+    try {
+      const payload = await api(`/api/projects/${encodeURIComponent(name)}/archive`, {
+        method: "POST",
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(`已归档 ${name}`, "ok");
+      await refreshEnvironments();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function refreshVersions() {
+    const project = $("#env-project")?.value || "";
+    state.envProject = project;
+    const target = $("#version-list");
+    renderEnvCaptureChoices();
+    if (!project) {
+      state.versions = [];
+      target.className = "allocation-list empty";
+      target.textContent = "先创建或选择一个项目。";
+      return;
+    }
+    try {
+      const payload = await api(`/api/environments?project=${encodeURIComponent(project)}`);
+      if (!payload.ok) throw new Error(payload?.error?.message || "env list failed");
+      state.versions = payload.data.versions || [];
+      renderVersions();
+    } catch (error) {
+      state.versions = [];
+      target.className = "allocation-list empty";
+      target.textContent = `无法加载环境版本：${error.message || error}`;
+    }
+  }
+
+  function renderEnvCaptureChoices() {
+    const select = $("#env-capture-allocation");
+    if (!select) return;
+    const allocations = (state.my?.allocations || []).filter(
+      (allocation) => allocation.status === "active",
+    );
+    const current = select.value;
+    select.innerHTML = allocations.map((allocation) => `
+      <option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))} · GPU ${esc((allocation.gpus || []).join(",") || "cpu")}</option>
+    `).join("");
+    if (!allocations.length) {
+      select.innerHTML = '<option value="">没有 active allocation</option>';
+    } else if (allocations.some((allocation) => allocation.id === current)) {
+      select.value = current;
+    }
+  }
+
+  function renderVersions() {
+    const target = $("#version-list");
+    const versions = state.versions || [];
+    if (!versions.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "这个项目还没有环境版本。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = versions.map((version, index) => {
+      const previous = versions[index + 1];
+      const candidates = (state.my?.allocations || []).filter(
+        (allocation) =>
+          allocation.status === "active" && allocation.env_version_id === version.version_id,
+      );
+      const verify = version.verification === "built" && candidates.length
+        ? `<select data-role="verify-allocation" data-ref="${esc(version.ref)}">${candidates.map((allocation) =>
+            `<option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))}</option>`
+          ).join("")}</select>
+          <button data-action="env-verify" data-ref="${esc(version.ref)}">验证通过</button>`
+        : "";
+      return `
+        <div class="allocation-item">
+          <div>
+            <div class="id">${esc(version.ref)}</div>
+            <div class="muted">${statusBadge(version.capture_fidelity)} ${statusBadge(version.verification)} · ${esc(version.origin)}</div>
+          </div>
+          <div class="muted">created ${esc(version.created_at)}<br>sha256 ${esc(String(version.sha256 || "").slice(0, 12))}</div>
+          <div class="muted">visibility ${esc(version.visibility)}</div>
+          <div class="row-actions">
+            <button data-action="env-show" data-ref="${esc(version.ref)}">manifest</button>
+            ${previous
+              ? `<button data-action="env-diff" data-ref="${esc(version.ref)}" data-other="${esc(previous.ref)}">对比 ${esc(previous.ref)}</button>`
+              : ""}
+            <button data-action="env-build" data-ref="${esc(version.ref)}">构建镜像</button>
+            ${verify}
+          </div>
+        </div>
+      `;
+    }).join("");
+    target.querySelectorAll("button[data-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const ref = button.dataset.ref;
+        if (button.dataset.action === "env-show") showEnvVersion(ref);
+        if (button.dataset.action === "env-diff") diffEnvVersion(ref, button.dataset.other);
+        if (button.dataset.action === "env-build") buildEnvVersion(ref);
+        if (button.dataset.action === "env-verify") {
+          const select = Array.from(
+            target.querySelectorAll('select[data-role="verify-allocation"]'),
+          ).find((item) => item.dataset.ref === ref);
+          verifyEnvVersion(ref, select ? select.value : "");
+        }
+      });
+    });
+  }
+
+  async function showEnvVersion(ref) {
+    if (!ref) return;
+    try {
+      const payload = await api(`/api/environments/${encodeURIComponent(ref)}`);
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const version = payload.data.version || {};
+      const manifest = payload.data.manifest || {};
+      const base = manifest.base || {};
+      const python = manifest.python || {};
+      const system = manifest.system || {};
+      const packages = (python.packages || []).map((item) =>
+        `<li>${esc(item.name)}${item.version ? `==${esc(item.version)}` : ""}</li>`
+      ).join("");
+      const builds = (payload.data.builds || []).map((build) =>
+        `<li>${esc(build.status)} · ${esc(build.image_tag || "")} ${esc(String(build.image_id || "").slice(0, 19))}</li>`
+      ).join("");
+      showDetail(`环境 ${version.ref || ref}`, `
+        <p>fidelity <b>${esc(version.capture_fidelity)}</b> · verification <b>${esc(version.verification)}</b> · origin ${esc(version.origin)}</p>
+        <p>base: ${esc(base.image || "")}${base.digest ? `<br>digest ${esc(base.digest)}` : ""}</p>
+        <p>python: ${esc(python.version || "unknown")} (${esc(python.manager || "-")}) ·
+          ${(python.packages || []).length} packages · system ${(system.packages || []).length} packages</p>
+        ${packages ? `<h3>Python packages</h3><ul>${packages}</ul>` : ""}
+        ${builds ? `<h3>构建记录</h3><ul>${builds}</ul>` : ""}
+      `);
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function diffEnvVersion(ref, other) {
+    if (!ref || !other) return;
+    try {
+      const payload = await api(
+        `/api/environments/${encodeURIComponent(ref)}/diff?other=${encodeURIComponent(other)}`,
+      );
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const diff = payload.data.diff || {};
+      if (!diff.changed) {
+        showDetail(`${other} → ${ref}`, "<p>两个环境版本内容相同。</p>");
+        return;
+      }
+      const base = Object.entries(diff.base || {}).map(([key, change]) =>
+        `<li>base.${esc(key)}: ${esc(change.from)} → ${esc(change.to)}</li>`
+      ).join("");
+      const python = diff.python || {};
+      const packageLines = [
+        ...(python.packages?.added || []).map((item) => `<li>+ ${esc(item.name)}==${esc(item.version || "?")}</li>`),
+        ...(python.packages?.removed || []).map((item) => `<li>- ${esc(item.name)}==${esc(item.version || "?")}</li>`),
+        ...(python.packages?.changed || []).map((item) =>
+          `<li>~ ${esc(item.name)}: ${esc(item.from)} → ${esc(item.to)}</li>`
+        ),
+      ].join("");
+      showDetail(`${other} → ${ref}`, `
+        ${base ? `<h3>Base</h3><ul>${base}</ul>` : ""}
+        ${python.version ? `<p>python: ${esc(python.version.from)} → ${esc(python.version.to)}</p>` : ""}
+        ${packageLines ? `<h3>Python packages</h3><ul>${packageLines}</ul>` : ""}
+      `);
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function buildEnvVersion(ref) {
+    if (!ref) return;
+    if (!window.confirm(`构建 ${ref} 的镜像？构建会占用 CPU 和磁盘，可能耗时数分钟。`)) return;
+    try {
+      const payload = await api(`/api/environments/${encodeURIComponent(ref)}/build`, {
+        method: "POST",
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const build = payload.data.build || {};
+      flash(`构建 ${build.status || "完成"}：${build.detail || build.image_tag || ""}`, "ok");
+      await refreshVersions();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function verifyEnvVersion(ref, allocationId) {
+    if (!ref || !allocationId) {
+      flash("先选择一个用该环境启动的 active allocation", "error");
+      return;
+    }
+    if (!window.confirm(`确认 ${allocationId} 已用 ${ref} 完成训练，并标记功能验证通过？`)) return;
+    try {
+      const payload = await api(`/api/environments/${encodeURIComponent(ref)}/verify`, {
+        method: "POST",
+        body: { allocation: allocationId },
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(`验证通过：${payload.data.version?.ref || ref}`, "ok");
+      await refreshVersions();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function refreshLegacy() {
+    const sourceTarget = $("#legacy-sources");
+    const claimTarget = $("#legacy-claims");
+    try {
+      const [sources, claims] = await Promise.all([
+        api("/api/legacy/sources"),
+        api("/api/legacy/claims"),
+      ]);
+      if (!sources.ok) throw new Error(sources?.error?.message || "legacy list failed");
+      state.legacySources = sources.data.sources || [];
+      state.legacyClaims = claims.ok ? claims.data.claims || [] : [];
+      renderLegacySources(sources.ok ? "" : claims?.error?.message || "");
+      renderLegacyClaims(claims.ok ? "" : claims?.error?.message || "");
+    } catch (error) {
+      const message = String(error.message || error);
+      state.legacySources = [];
+      state.legacyClaims = [];
+      sourceTarget.className = "allocation-list empty";
+      sourceTarget.textContent = `旧容器认领不可用：${message}`;
+      claimTarget.className = "allocation-list empty";
+      claimTarget.textContent = "—";
+    }
+    renderLegacyChoices();
+  }
+
+  function renderLegacySources(notice) {
+    const target = $("#legacy-sources");
+    if (notice) {
+      target.className = "allocation-list empty";
+      target.textContent = notice;
+      return;
+    }
+    const sources = state.legacySources || [];
+    if (!sources.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "没有可认领的旧容器；等管理员扫描后再刷新。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = sources.map((source) => {
+      const metadata = source.metadata || {};
+      return `
+        <div class="allocation-item">
+          <div><div class="id">${esc(source.source_id)}</div><div class="muted">${esc(source.container)} · ${statusBadge(source.status)}</div></div>
+          <div class="muted">state ${esc(source.state)} · image ${esc(metadata.image || source.image || "")}</div>
+          <div class="muted">created ${esc(source.created_at || "—")}<br>scanned ${esc(source.scanned_at || "—")}</div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function renderLegacyChoices() {
+    const select = $("#legacy-source");
+    if (!select) return;
+    const sources = (state.legacySources || []).filter((source) => source.status === "available");
+    const current = select.value;
+    select.innerHTML = sources.map((source) =>
+      `<option value="${esc(source.source_id)}">${esc(source.source_id)} · ${esc(source.container)}</option>`
+    ).join("");
+    if (!sources.length) {
+      select.innerHTML = '<option value="">没有可认领的旧容器</option>';
+    } else if (sources.some((source) => source.source_id === current)) {
+      select.value = current;
+    }
+  }
+
+  function renderLegacyClaims(notice) {
+    const target = $("#legacy-claims");
+    if (notice) {
+      target.className = "allocation-list empty";
+      target.textContent = notice;
+      return;
+    }
+    const claims = state.legacyClaims || [];
+    if (!claims.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "还没有认领申请。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = claims.map((claim) => {
+      const version = claim.version || {};
+      return `
+        <div class="allocation-item">
+          <div><div class="id">${esc(claim.claim_id)}</div><div class="muted">${statusBadge(claim.status)} · source ${esc(claim.source?.source_id || "")}</div></div>
+          <div class="muted">${esc(claim.reason || "—")}<br>version: ${esc(version.ref || "—")}</div>
+          <div class="muted">${esc(claim.review_note || "")}</div>
+          <div class="row-actions">
+            <button data-action="legacy-show" data-id="${esc(claim.claim_id)}">详情</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+    target.querySelectorAll("button[data-action]").forEach((button) => {
+      button.addEventListener("click", () => showLegacyClaim(button.dataset.id));
+    });
+  }
+
+  async function showLegacyClaim(claimId) {
+    if (!claimId) return;
+    try {
+      const payload = await api(`/api/legacy/claims/${encodeURIComponent(claimId)}`);
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const claim = payload.data.claim || {};
+      const source = claim.source || {};
+      const version = claim.version || {};
+      showDetail(`认领 ${claim.claim_id}`, `
+        <p>status <b>${esc(claim.status)}</b></p>
+        <p>source: ${esc(source.source_id)} · ${esc(source.container)} · state ${esc(source.state)}</p>
+        <p>image: ${esc(source.image || "")}</p>
+        <p>reason: ${esc(claim.reason || "—")}</p>
+        <p>review: ${esc(claim.review_note || "—")}</p>
+        ${version.ref ? `<p>version: ${esc(version.ref)} · fidelity ${esc(version.capture_fidelity)}</p>` : ""}
+      `);
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function refreshLegacyAdmin() {
+    if (!state.adminEnabled) return;
+    try {
+      const [sources, claims] = await Promise.all([
+        api("/api/admin/legacy/sources"),
+        api("/api/admin/legacy/claims"),
+      ]);
+      if (!sources.ok) throw new Error(sources?.error?.message || "legacy sources failed");
+      state.adminLegacySources = sources.data.sources || [];
+      state.adminLegacyClaims = claims.ok ? claims.data.claims || [] : [];
+      renderAdminLegacySources(sources.ok ? "" : claims?.error?.message || "");
+      renderAdminLegacyClaims(claims.ok ? "" : claims?.error?.message || "");
+    } catch (error) {
+      const message = String(error.message || error);
+      state.adminLegacySources = [];
+      state.adminLegacyClaims = [];
+      $("#legacy-admin-sources").className = "allocation-list empty";
+      $("#legacy-admin-sources").textContent = `旧容器审核不可用：${message}`;
+      $("#legacy-admin-claims").className = "allocation-list empty";
+      $("#legacy-admin-claims").textContent = "—";
+    }
+  }
+
+  async function scanLegacySources() {
+    if (!window.confirm("扫描主机上的非托管容器并登记为可认领来源？只读取元数据。")) return;
+    try {
+      const payload = await api("/api/admin/legacy/scan", { method: "POST" });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(
+        `扫描完成：${payload.data.scanned ?? 0} 个容器，${payload.data.dismissed ?? 0} 个下架`,
+        "ok",
+      );
+      await refreshLegacyAdmin();
+      await refreshLegacy();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  function renderAdminLegacySources(notice) {
+    const target = $("#legacy-admin-sources");
+    if (notice) {
+      target.className = "allocation-list empty";
+      target.textContent = notice;
+      return;
+    }
+    const sources = state.adminLegacySources || [];
+    if (!sources.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "没有登记旧容器来源。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = sources.map((source) => `
+      <div class="allocation-item">
+        <div><div class="id">${esc(source.container_name || source.container_id)}</div><div class="muted">${esc(String(source.container_id || "").slice(0, 19))} · ${statusBadge(source.status)}</div></div>
+        <div class="muted">state ${esc(source.state)} · image ${esc(source.image || "")}<br>${esc(source.image_id || "")}</div>
+        <div class="muted">created ${esc(source.created_at || "—")}<br>scanned ${esc(source.scanned_at || "—")}</div>
+        <div class="muted">${esc(source.server_id || "")}</div>
+      </div>
+    `).join("");
+  }
+
+  function renderAdminLegacyClaims(notice) {
+    const target = $("#legacy-admin-claims");
+    if (notice) {
+      target.className = "allocation-list empty";
+      target.textContent = notice;
+      return;
+    }
+    const claims = state.adminLegacyClaims || [];
+    if (!claims.length) {
+      target.className = "allocation-list empty";
+      target.textContent = "没有认领申请。";
+      return;
+    }
+    target.className = "allocation-list";
+    target.innerHTML = claims.map((claim) => {
+      const version = claim.version || {};
+      const actions = claim.status === "pending"
+        ? `<button data-action="legacy-approve" data-id="${esc(claim.claim_id)}">批准</button>
+           <button data-action="legacy-reject" data-id="${esc(claim.claim_id)}">驳回</button>`
+        : (claim.status === "approved" && !claim.version_id
+            ? `<button data-action="legacy-capture" data-id="${esc(claim.claim_id)}">只读采集</button>`
+            : "");
+      return `
+        <div class="allocation-item">
+          <div><div class="id">${esc(claim.claim_id)}</div><div class="muted">${statusBadge(claim.status)} · member ${esc(claim.member_id)}</div></div>
+          <div class="muted">source ${esc(claim.source?.source_id || "")} · ${esc(claim.source?.container_name || claim.source?.container || "")}</div>
+          <div class="muted">${esc(claim.reason || "—")}<br>version ${esc(version.ref || "—")}</div>
+          <div class="row-actions">${actions}</div>
+        </div>
+      `;
+    }).join("");
+    target.querySelectorAll("button[data-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (button.dataset.action === "legacy-approve") decideLegacyClaim(button.dataset.id, true);
+        if (button.dataset.action === "legacy-reject") decideLegacyClaim(button.dataset.id, false);
+        if (button.dataset.action === "legacy-capture") captureLegacyClaim(button.dataset.id);
+      });
+    });
+  }
+
+  async function decideLegacyClaim(claimId, approve) {
+    if (!claimId) return;
+    const note = window.prompt(
+      approve ? "批准说明（可选，会显示给申请人）" : "驳回原因（会显示给申请人）",
+      "",
+    );
+    if (note === null) return;
+    try {
+      const payload = await api("/api/admin/legacy/decision", {
+        method: "POST",
+        body: { id: claimId, approve, note },
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      flash(`认领 ${claimId}：${payload.data.claim?.status || (approve ? "approved" : "rejected")}`, "ok");
+      await refreshLegacyAdmin();
+      await refreshLegacy();
+    } catch (error) {
+      flash(String(error.message || error), "error");
+    }
+  }
+
+  async function captureLegacyClaim(claimId) {
+    if (!claimId) return;
+    if (!window.confirm("对该已批准认领做只读采集并生成环境版本？不会执行 docker commit。")) return;
+    try {
+      const payload = await api("/api/admin/legacy/capture", {
+        method: "POST",
+        body: { id: claimId },
+      });
+      if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+      const version = payload.data.version || {};
+      flash(`已生成 ${version.ref} · fidelity ${version.capture_fidelity}`, "ok");
+      await refreshLegacyAdmin();
+      await refreshLegacy();
+      await refreshEnvironments();
+    } catch (error) {
+      flash(String(error.message || error), "error");
     }
   }
 
@@ -1221,8 +1775,14 @@
         idempotency_key: idempotencyKey,
       };
       const image = String(data.get("image") || "").trim();
+      const env = String(data.get("env") || "").trim();
       const note = String(data.get("note") || "").trim();
+      if (image && env) {
+        errorTarget.textContent = "镜像与环境版本互斥：二选一";
+        return;
+      }
       if (image) body.image = image;
+      if (env) body.env = env;
       if (note) body.note = note;
       try {
         const payload = await api("/api/apply", { method: "POST", body });
@@ -1243,6 +1803,78 @@
     });
 
     $("#job-start-form").addEventListener("submit", startJob);
+
+    $("#project-create-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const target = $("#project-error");
+      target.textContent = "";
+      const name = String(new FormData(form).get("name") || "").trim();
+      if (!name) return;
+      try {
+        const payload = await api("/api/projects", { method: "POST", body: { name } });
+        if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+        flash(`已创建项目 ${payload.data.project?.name || name}`, "ok");
+        form.reset();
+        state.envProject = payload.data.project?.name || name;
+        await refreshEnvironments();
+      } catch (error) {
+        target.textContent = String(error.message || error);
+      }
+    });
+
+    $("#env-capture-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const target = $("#env-capture-error");
+      target.textContent = "";
+      const project = $("#env-project")?.value || "";
+      const allocation = String(new FormData(form).get("allocation") || "");
+      if (!project || !allocation) {
+        target.textContent = "先选择项目和 active allocation";
+        return;
+      }
+      try {
+        const payload = await api("/api/environments", {
+          method: "POST",
+          body: { project, allocation },
+        });
+        if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+        const version = payload.data.version || {};
+        flash(`已保存 ${version.ref} · fidelity ${version.capture_fidelity}`, "ok");
+        await refreshVersions();
+      } catch (error) {
+        target.textContent = String(error.message || error);
+      }
+    });
+
+    $("#legacy-claim-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const target = $("#legacy-claim-error");
+      target.textContent = "";
+      const data = new FormData(form);
+      const source = String(data.get("source") || "");
+      const project = String(data.get("project") || "");
+      const reason = String(data.get("reason") || "").trim();
+      if (!source || !project) {
+        target.textContent = "先选择旧容器和项目";
+        return;
+      }
+      try {
+        const payload = await api("/api/legacy/claims", {
+          method: "POST",
+          body: { source, project, reason },
+        });
+        if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
+        const claim = payload.data.claim || {};
+        flash(`已提交 ${claim.claim_id || ""}，等待管理员审核`, "ok");
+        form.reset();
+        await refreshLegacy();
+      } catch (error) {
+        target.textContent = String(error.message || error);
+      }
+    });
 
     $("#admin-release-form").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1269,6 +1901,11 @@
     $$(".tab").forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tab)));
     $("#refresh-my").addEventListener("click", refreshMy);
     $("#refresh-jobs").addEventListener("click", refreshJobs);
+    $("#env-refresh").addEventListener("click", refreshVersions);
+    $("#env-project").addEventListener("change", refreshVersions);
+    $("#legacy-refresh").addEventListener("click", refreshLegacy);
+    $("#legacy-admin-refresh").addEventListener("click", refreshLegacyAdmin);
+    $("#legacy-scan").addEventListener("click", scanLegacySources);
     $("#mode-monitor").addEventListener("click", () => changeBrokerMode("monitor"));
     $("#mode-maintenance").addEventListener("click", () => changeBrokerMode("maintenance"));
     $("#mode-active").addEventListener("click", () => changeBrokerMode("active"));
