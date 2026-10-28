@@ -184,6 +184,18 @@ async def test_maintenance_blocks_new_jobs_but_allows_release(tmp_path, member_c
     assert released["data"]["status"] == "released"
 
 
+async def test_monitor_mode_rejection_tells_member_what_to_ask_for(tmp_path, member_config):
+    broker, _ = _broker(tmp_path, member_config)
+    with broker._connection() as connection:
+        _provision_alice(connection, status="active")
+    switched = await _call(broker, "admin_mode", {"mode": "monitor"}, ADMIN)
+    assert switched["ok"] is True
+    blocked = await _call(broker, "apply", {"gpus": [1], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "monitor_only"
+    assert "admin mode active" in blocked["error"]["message"]
+
+
 async def test_maintenance_mode_applies_when_membership_gate_is_disabled(tmp_path, member_config):
     config = replace(
         member_config,

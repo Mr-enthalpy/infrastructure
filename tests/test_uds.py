@@ -268,6 +268,56 @@ async def test_uds_file_transfer_stays_in_workspace(tmp_path, active_config):
 
         writer.close()
         await writer.wait_closed()
+
+        # C4-6: a released allocation still exposes its workspace for reading,
+        # so artifacts can be retrieved after the GPU is gone, but not for
+        # uploads.
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(json.dumps({"cmd": "release", "args": {"id": allocation_id}}).encode() + b"\n")
+        await writer.drain()
+        released = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert released["ok"] is True, released
+        writer.close()
+        await writer.wait_closed()
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(
+            json.dumps(
+                {
+                    "cmd": "file_get",
+                    "args": {"id": allocation_id, "path": "checkpoints/model.bin"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        handshake = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert handshake["ok"] is True, handshake
+        kind, payload = await asyncio.wait_for(read_frame(reader), timeout=5)
+        assert kind == FRAME_DATA
+        assert payload == b"hello world"
+        kind, payload = await asyncio.wait_for(read_frame(reader), timeout=5)
+        assert kind == FRAME_EXIT
+        assert json.loads(payload)["ok"] is True
+        writer.close()
+        await writer.wait_closed()
+
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.write(
+            json.dumps(
+                {
+                    "cmd": "file_put",
+                    "args": {"id": allocation_id, "path": "later.bin"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        handshake = json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        assert handshake["ok"] is False
+        assert handshake["error"]["code"] == "conflict"
+        writer.close()
+        await writer.wait_closed()
     finally:
         await broker.stop()
 
