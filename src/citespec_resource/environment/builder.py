@@ -39,8 +39,12 @@ def fail(code, detail):
     sys.exit(1)
 
 try:
+    # The venv layers pip-installed distributions over the pinned base image's
+    # Python environment.  Conda-managed packages are not on PyPI, so they are
+    # inherited from the base image instead of being reinstalled.
     subprocess.run(
-        [sys.executable, "-m", "venv", "--clear", "--copies", OUT],
+        [sys.executable, "-m", "venv", "--clear", "--copies",
+         "--system-site-packages", OUT],
         check=True, timeout=600,
     )
 except Exception as exc:

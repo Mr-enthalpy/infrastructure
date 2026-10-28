@@ -487,6 +487,22 @@ def test_pytorch_local_versions_use_the_matching_index():
     ]
 
 
+def test_probe_records_installers_and_skips_conda_distributions():
+    """Conda-installed dists must not become pip requirements.
+
+    ``conda``, ``menuinst`` and similar packages only exist on conda channels,
+    so a pip install of the recorded name fails.  The probe records INSTALLER
+    and leaves those to the pinned base image.
+    """
+
+    assert '"installer": installer(path)' in env_capture.PROBE_SCRIPT
+    assert 'item.get("installer") == "conda"' in env_capture.PROBE_SCRIPT
+
+
+def test_builder_venv_inherits_the_base_image_python_environment():
+    assert "--system-site-packages" in env_builder.BUILDER_SCRIPT
+
+
 def test_probe_records_the_per_user_site_packages():
     """``pip install --user`` is common in read-only containers.
 
