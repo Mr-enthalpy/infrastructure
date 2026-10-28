@@ -100,11 +100,12 @@ existing regular file atomically and use a unique temporary file with mode
 Directories, symlinks, FIFOs, devices, and recursive transfers are not supported;
 use a tar archive for directory trees.
 
-`push` and `pull` require an active allocation. After `release`, workspace files
-remain on disk and the persistent job logs are still available through
-`job files`/`job logs`, but `pull` returns `conflict: allocation is released, not
-active`. Retrieve checkpoints, metrics, and any other non-log artifact before
-releasing the allocation.
+`push` requires an active allocation. `pull` requires an active allocation too,
+except for an allocation that has been released: its workspace stays on disk, so
+the owner (or an administrator) can still fetch checkpoints, metrics, and other
+artifacts after the GPU lease ends. A released allocation never accepts uploads
+(`file put` returns `conflict: allocation is released, not active`). Persistent
+job logs remain available through `job files`/`job logs` in every state.
 
 The remote-side primitives are available for diagnostics:
 
