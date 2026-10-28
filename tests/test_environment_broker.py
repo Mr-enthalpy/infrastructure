@@ -96,6 +96,20 @@ def env_config(active_config):
     )
 
 
+@pytest.fixture
+def build_config(active_config, tmp_path):
+    return replace(
+        active_config,
+        policy=replace(
+            active_config.policy,
+            environment_enabled=True,
+            environment_builds_enabled=True,
+            env_state_dir=str(tmp_path / "envs"),
+            env_build_keep_per_version=1,
+        ),
+    )
+
+
 async def _running_allocation(broker):
     applied = await _call(broker, "apply", {"gpus": [0], "cpus": 8, "memory_gb": 32}, ALICE)
     assert applied["ok"] is True, applied
@@ -223,3 +237,164 @@ async def test_project_visibility_is_scoped_to_the_owner(tmp_path, env_config):
 
     admin_view = await _call(broker, "env_show", {"ref": "alice-proj@v1"}, ADMIN)
     assert admin_view["ok"] is True, admin_view
+
+
+# -- image builds ----------------------------------------------------------
+
+
+PROBE_NO_APT = {**PROBE, "dpkg": []}
+BASE_IMAGE_ID = "sha256:" + "b" * 64
+
+
+async def _captured_version(broker, docker, config, *, probe):
+    allocation_id = await _running_allocation(broker)
+    docker.images[config.image.base] = {"id": BASE_IMAGE_ID, "digests": [], "size": 2048}
+    docker.exec_output = (0, json.dumps(probe), "")
+    await _call(broker, "project_create", {"name": "reconstruction"}, ALICE)
+    captured = await _call(
+        broker,
+        "env_capture",
+        {"project": "reconstruction", "allocation": allocation_id},
+        ALICE,
+    )
+    assert captured["ok"] is True, captured
+    return captured["data"]["version"], allocation_id
+
+
+async def test_build_then_start_and_verify(tmp_path, build_config):
+    broker, docker = _broker(tmp_path, build_config)
+    _provision(tmp_path)
+    version, _allocation = await _captured_version(broker, docker, build_config, probe=PROBE_NO_APT)
+
+    built = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    assert built["ok"] is True, built
+    build = built["data"]["build"]
+    assert build["status"] == "built"
+    assert build["image_tag"].startswith("citespec-env:")
+    assert built["data"]["version"]["verification"] == "built"
+
+    call = docker.builder_calls[-1]
+    assert call["image"] == BASE_IMAGE_ID
+    assert call["user"] == f"{ALICE.uid}:{ALICE.gid}"
+    assert call["cpus"] == build_config.policy.env_build_cpus
+    binds = {spec["bind"] for spec in call["volumes"].values()}
+    assert binds == {"/opt/citespec-env", "/citespec/requirements.txt"}
+    assert docker.build_image_calls[-1]["tag"] == build["image_tag"]
+
+    shown = await _call(broker, "env_show", {"ref": "reconstruction@v1"}, ALICE)
+    assert shown["data"]["builds"][0]["status"] == "built"
+
+    started = await _call(
+        broker,
+        "apply",
+        {
+            "gpus": [1],
+            "cpus": 8,
+            "memory_gb": 32,
+            "env": "reconstruction@v1",
+        },
+        ALICE,
+    )
+    assert started["ok"] is True, started
+    allocation = started["data"]
+    assert allocation["image"] == build["image_tag"]
+    assert allocation["env_version_id"] == version["version_id"]
+    assert allocation["image_id"] == build["image_id"]
+
+    verified = await _call(
+        broker,
+        "env_verify",
+        {"ref": "reconstruction@v1", "allocation": allocation["id"]},
+        ALICE,
+    )
+    assert verified["ok"] is True, verified
+    assert verified["data"]["version"]["verification"] == "functional_passed"
+
+
+async def test_build_refuses_system_packages(tmp_path, build_config):
+    broker, docker = _broker(tmp_path, build_config)
+    _provision(tmp_path)
+    await _captured_version(broker, docker, build_config, probe=PROBE)
+
+    failed = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    assert failed["ok"] is False
+    assert failed["error"]["code"] == "conflict"
+    assert "apt" in failed["error"]["message"]
+
+    shown = await _call(broker, "env_show", {"ref": "reconstruction@v1"}, ALICE)
+    assert shown["data"]["builds"][0]["status"] == "failed"
+    assert shown["data"]["version"]["verification"] == "unverified"
+
+
+async def test_apply_with_env_requires_a_successful_build(tmp_path, build_config):
+    broker, docker = _broker(tmp_path, build_config)
+    _provision(tmp_path)
+    await _captured_version(broker, docker, build_config, probe=PROBE_NO_APT)
+
+    denied = await _call(
+        broker,
+        "apply",
+        {"gpus": [1], "cpus": 8, "memory_gb": 32, "env": "reconstruction@v1"},
+        ALICE,
+    )
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "conflict"
+    assert "env build" in denied["error"]["message"]
+
+    both = await _call(
+        broker,
+        "apply",
+        {
+            "gpus": [1],
+            "cpus": 8,
+            "memory_gb": 32,
+            "env": "reconstruction@v1",
+            "image": build_config.image.base,
+        },
+        ALICE,
+    )
+    assert both["ok"] is False
+    assert both["error"]["code"] == "bad_request"
+
+
+async def test_apply_fails_closed_when_built_image_disappears(tmp_path, build_config):
+    broker, docker = _broker(tmp_path, build_config)
+    _provision(tmp_path)
+    await _captured_version(broker, docker, build_config, probe=PROBE_NO_APT)
+    built = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    tag = built["data"]["build"]["image_tag"]
+    docker.images.pop(tag)
+
+    denied = await _call(
+        broker,
+        "apply",
+        {"gpus": [1], "cpus": 8, "memory_gb": 32, "env": "reconstruction@v1"},
+        ALICE,
+    )
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "conflict"
+    assert "env build" in denied["error"]["message"]
+
+
+async def test_build_keeps_only_the_configured_number_of_images(tmp_path, build_config):
+    broker, docker = _broker(tmp_path, build_config)
+    _provision(tmp_path)
+    await _captured_version(broker, docker, build_config, probe=PROBE_NO_APT)
+
+    first = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    assert first["ok"] is True, first
+    second = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    assert second["ok"] is True, second
+    assert first["data"]["build"]["image_tag"] in docker.removed_images
+    assert second["data"]["build"]["image_tag"] in docker.images
+
+
+async def test_build_requires_the_builds_gate(tmp_path, env_config):
+    broker, docker = _broker(tmp_path, env_config)
+    _provision(tmp_path)
+    await _captured_version(broker, docker, env_config, probe=PROBE_NO_APT)
+
+    denied = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "forbidden"
+    assert "environment_builds_enabled" in denied["error"]["message"]

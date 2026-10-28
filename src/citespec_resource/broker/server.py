@@ -18,12 +18,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
+from uuid import uuid4
 
 from .. import store, version_info
 from ..config import LabConfig, validate_active_mode_policy
 from ..db import connect, init_db
 from ..enrollment import store as intake_store
 from ..environment import authorization as env_authz
+from ..environment import builder as env_builder
 from ..environment import capture as env_capture
 from ..environment import normalize as env_normalize
 from ..environment import service as env_service
@@ -114,6 +116,8 @@ ENVIRONMENT_COMMANDS = frozenset(
         "env_list",
         "env_show",
         "env_diff",
+        "env_build",
+        "env_verify",
     }
 )
 
@@ -2799,6 +2803,7 @@ class Broker:
                         "memory_gb",
                         "hours",
                         "image",
+                        "env",
                         "note",
                         "queue",
                         "idempotency_key",
@@ -3537,6 +3542,279 @@ class Broker:
             )
         return found
 
+    # -- image builds -----------------------------------------------------
+
+    def _require_environment_builds(self) -> None:
+        if not self.config.policy.environment_enabled:
+            raise Forbidden("环境记忆尚未启用；需要管理员打开 policy.environment_enabled")
+        if not self.config.policy.environment_builds_enabled:
+            raise Forbidden(
+                "环境镜像构建尚未启用；需要管理员打开 policy.environment_builds_enabled"
+            )
+
+    def _owned_version(
+        self,
+        connection: Any,
+        identity: Identity,
+        ref: Any,
+    ) -> dict[str, Any]:
+        context = self._env_context(connection, identity, ref)
+        if context["project_status"] != "active":
+            raise Conflict("项目已归档，不能再构建新镜像")
+        if not identity.is_admin:
+            member_id = env_authz.require_active_member(
+                connection, uid=identity.uid, now=self._now()
+            )
+            if context["owner_member_id"] != member_id:
+                raise Forbidden("只有项目所有者或管理员可以构建该环境")
+        return context
+
+    @staticmethod
+    def _requirements_for(connection: Any, version_id: str) -> str:
+        artifacts = env_store.list_artifacts(connection, version_id, include_content=True)
+        for artifact in artifacts:
+            if artifact["kind"] == "requirements" and artifact["name"] == "requirements.txt":
+                return str(artifact["content"])
+        return ""
+
+    async def _env_build(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_environment_builds()
+        policy = self.config.policy
+        now = self._now()
+        with self._connection() as connection:
+            context = self._owned_version(connection, identity, args.get("ref"))
+            try:
+                manifest = json.loads(str(context["manifest"]))
+            except ValueError as exc:
+                raise InternalError("存储的环境 manifest 已损坏") from exc
+            base_image = str(manifest.get("base", {}).get("image", ""))
+            if not base_image:
+                raise Conflict("该环境版本没有记录基础镜像，无法重建")
+            if not self.config.image.image_allowed(base_image):
+                raise Forbidden(f"基础镜像 {base_image} 不在允许列表内")
+            active = [
+                build
+                for build in env_store.list_builds(connection, str(context["version_id"]), limit=5)
+                if build["status"] in {"pending", "running"}
+            ]
+            if active:
+                raise Conflict("该环境版本已有构建正在进行，请稍后再试")
+            build_id = uuid4().hex
+            build = env_store.create_build(
+                connection,
+                build_id=build_id,
+                version_id=str(context["version_id"]),
+                server_id=self.config.server.name,
+                base_image=base_image,
+                image_tag=env_builder.image_tag_for(str(context["version_id"]), build_id),
+                now=now,
+            )
+            requirements = self._requirements_for(connection, str(context["version_id"]))
+        requested_gid = self._owner_gid(identity.uid)
+        builder = env_builder.EnvironmentBuilder(self.config, self.docker)
+        try:
+            with self._connection() as connection:
+                env_store.mark_build_running(connection, str(build["build_id"]), now=self._now())
+            outcome = await asyncio.to_thread(
+                builder.build,
+                env_builder.BuildRequest(
+                    build_id=str(build["build_id"]),
+                    image_tag=str(build["image_tag"]),
+                    version_id=str(context["version_id"]),
+                    server_id=self.config.server.name,
+                    base_image=base_image,
+                    base_digest=str(manifest.get("base", {}).get("digest", "")),
+                    manifest_text=str(context["manifest"]),
+                    requirements_text=requirements,
+                    owner_uid=identity.uid,
+                    owner_gid=requested_gid,
+                ),
+            )
+        except env_builder.BuildError as exc:
+            with self._connection() as connection:
+                env_store.finish_build(
+                    connection,
+                    str(build["build_id"]),
+                    status="failed",
+                    detail=str(exc),
+                    evidence=exc.evidence,
+                    now=self._now(),
+                )
+                store.record_event(
+                    connection,
+                    actor_uid=identity.uid,
+                    action="env_build_failed",
+                    detail={
+                        "build_id": build["build_id"],
+                        "version_id": context["version_id"],
+                        "detail": str(exc)[:500],
+                    },
+                    now=self._now(),
+                )
+            raise Conflict(f"环境构建失败：{exc}") from exc
+        except Exception as exc:
+            with self._connection() as connection:
+                env_store.finish_build(
+                    connection,
+                    str(build["build_id"]),
+                    status="failed",
+                    detail=f"internal build error: {exc}",
+                    now=self._now(),
+                )
+            raise InternalError(f"环境构建异常终止：{exc}") from exc
+
+        with self._connection() as connection:
+            finished = env_store.finish_build(
+                connection,
+                str(build["build_id"]),
+                status="built",
+                image_id=outcome.image_id,
+                detail=outcome.detail,
+                evidence=outcome.evidence,
+                now=self._now(),
+            )
+            try:
+                env_store.set_verification(
+                    connection, str(context["version_id"]), "built", now=self._now()
+                )
+            except EnvironmentConflict:
+                # Already built or verified: the verification column is
+                # forward-only, so an existing stronger state is kept.
+                pass
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_build",
+                detail={
+                    "build_id": finished["build_id"],
+                    "version_id": context["version_id"],
+                    "image_id": outcome.image_id,
+                },
+                now=self._now(),
+            )
+            successful = env_store.successful_builds(connection)
+            kept_tags: set[str] = set()
+            per_version: dict[str, int] = {}
+            for row in successful:
+                version_key = str(row["version_id"])
+                if per_version.get(version_key, 0) >= policy.env_build_keep_per_version:
+                    continue
+                per_version[version_key] = per_version.get(version_key, 0) + 1
+                kept_tags.add(str(row["image_tag"]))
+            stale = {
+                str(row["image_tag"])
+                for row in successful
+                if str(row["image_tag"]) not in kept_tags
+            }
+            summary = env_service.summary(
+                env_store.version_context(connection, str(context["version_id"]))
+            )
+        if stale:
+            removed = await asyncio.to_thread(self._remove_images, stale)
+            if removed:
+                logger.info("pruned superseded environment images: %s", ", ".join(removed))
+        pruned = await asyncio.to_thread(builder.prune, keep_images=kept_tags)
+        if pruned:
+            logger.info("pruned environment images over budget: %s", ", ".join(pruned))
+        return {
+            "build": {
+                "build_id": finished["build_id"],
+                "status": finished["status"],
+                "image_tag": finished["image_tag"],
+                "image_id": finished["image_id"],
+                "detail": finished["detail"],
+                "finished_at": finished["finished_at"],
+            },
+            "version": summary,
+        }
+
+    async def _env_verify(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
+        self._require_environment_builds()
+        allocation_id = args.get("allocation")
+        if not isinstance(allocation_id, str) or not allocation_id:
+            raise BadRequest("allocation must be a non-empty string")
+        now = self._now()
+        with self._connection() as connection:
+            context = self._env_context(connection, identity, args.get("ref"))
+            allocation = store.get_allocation(connection, allocation_id, now=now)
+            if allocation["owner_uid"] != identity.uid and not identity.is_admin:
+                raise Forbidden("只有本人或管理员可以验证这个工作环境")
+            if allocation["status"] != "active":
+                raise Conflict(f"allocation is {allocation['status']}, not active")
+            if not allocation["env_version_id"]:
+                raise Conflict("该租约不是用环境版本启动的，不能作为功能验证依据")
+            if str(allocation["env_version_id"]) != str(context["version_id"]):
+                raise Conflict("该租约启动时使用的外部环境版本与要验证的版本不一致")
+            build_id = str(allocation["env_build_id"] or "")
+            if not build_id:
+                raise Conflict("该租约没有记录构建来源")
+            build = env_store.get_build(connection, build_id)
+            if build["status"] not in {"built", "verified"}:
+                raise Conflict("该租约使用的镜像构建未成功，不能标记为功能验证通过")
+            if context["verification"] != "functional_passed":
+                env_store.set_verification(
+                    connection, str(context["version_id"]), "functional_passed", now=now
+                )
+            env_store.mark_build_verified(connection, build_id, now=now)
+            store.record_event(
+                connection,
+                actor_uid=identity.uid,
+                action="env_verify",
+                allocation_id=allocation_id,
+                detail={
+                    "version_id": context["version_id"],
+                    "build_id": build_id,
+                },
+                now=now,
+            )
+            updated = env_service.summary(
+                env_store.version_context(connection, str(context["version_id"]))
+            )
+        return {"version": updated}
+
+    def _remove_images(self, tags: set[str]) -> list[str]:
+        removed: list[str] = []
+        for tag in sorted(tags):
+            try:
+                self.docker.remove_image(tag)
+            except DockerError:
+                continue
+            removed.append(tag)
+        return removed
+
+    def _owner_gid(self, uid: int) -> int:
+        if os.name == "posix":
+            try:
+                import pwd
+
+                return int(pwd.getpwuid(uid).pw_gid)
+            except (ImportError, KeyError):
+                pass
+        return uid
+
+    def _environment_for_apply(
+        self,
+        connection: Any,
+        identity: Identity,
+        ref: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._require_environment_builds()
+        context = self._env_context(connection, identity, ref)
+        if context["project_status"] != "active":
+            raise Conflict("项目已归档，不能用它启动新的工作环境")
+        build = env_store.latest_build(
+            connection,
+            str(context["version_id"]),
+            server_id=self.config.server.name,
+            successful_only=True,
+        )
+        if build is None:
+            raise Conflict(
+                f"{context['project_name']}@v{context['version']} 还没有成功构建的镜像；"
+                "请先运行 citespec-resource env build"
+            )
+        return context, build
+
     async def _handle_environment_command(
         self,
         command: str,
@@ -3569,6 +3847,12 @@ class Broker:
             if command == "env_diff":
                 self._check_args(args, {"left", "right"})
                 return self._env_diff(identity, args)
+            if command == "env_build":
+                self._check_args(args, {"ref"})
+                return await self._env_build(identity, args)
+            if command == "env_verify":
+                self._check_args(args, {"ref", "allocation"})
+                return await self._env_verify(identity, args)
             raise BadRequest(f"unknown environment command: {command}")
         except EnvironmentNotFound as exc:
             raise NotFound(str(exc)) from exc
@@ -3652,11 +3936,40 @@ class Broker:
         queue_requested = args.get("queue", self.config.policy.queue_enabled)
         if not isinstance(queue_requested, bool):
             raise BadRequest("queue must be a boolean")
-        image = args.get("image", self.config.image.base)
-        if not isinstance(image, str) or not image:
-            raise BadRequest("image must be a non-empty string")
-        if not identity.is_admin and not self.config.image.image_allowed(image):
-            raise Forbidden("members may only use images on the configured allowlist")
+        image_arg = args.get("image")
+        env_ref = args.get("env")
+        if env_ref is not None and image_arg is not None:
+            raise BadRequest("--env 与 --image 只能二选一")
+        if env_ref is not None:
+            if not isinstance(env_ref, str) or not env_ref:
+                raise BadRequest("env must be a non-empty string")
+            with self._connection() as connection:
+                context, build = self._environment_for_apply(connection, identity, env_ref)
+            try:
+                details = await asyncio.to_thread(
+                    self.docker.image_details, str(build["image_tag"])
+                )
+            except DockerError as exc:
+                raise Conflict(
+                    "环境镜像已不在本机或已被替换；请重新运行 citespec-resource env build"
+                ) from exc
+            if str(details.get("id", "")) != str(build["image_id"]):
+                raise Conflict(
+                    "环境镜像已不在本机或已被替换；请重新运行 citespec-resource env build"
+                )
+            image = str(build["image_tag"])
+            env_version_id = str(context["version_id"])
+            env_build_id = str(build["build_id"])
+            image_id = str(build["image_id"])
+        else:
+            image = args.get("image", self.config.image.base)
+            if not isinstance(image, str) or not image:
+                raise BadRequest("image must be a non-empty string")
+            if not identity.is_admin and not self.config.image.image_allowed(image):
+                raise Forbidden("members may only use images on the configured allowlist")
+            env_version_id = None
+            env_build_id = None
+            image_id = None
         note = args.get("note", "")
         if not isinstance(note, str):
             raise BadRequest("note must be a string")
@@ -3756,6 +4069,9 @@ class Broker:
                     image=image,
                     workspace=workspace,
                     note=note,
+                    env_version_id=env_version_id,
+                    env_build_id=env_build_id,
+                    image_id=image_id,
                     reason=reason,
                 )
         if busy_reason is not None:
@@ -3777,6 +4093,9 @@ class Broker:
                 image=image,
                 workspace=workspace,
                 note=note,
+                env_version_id=env_version_id,
+                env_build_id=env_build_id,
+                image_id=image_id,
                 reason=busy_reason,
             )
         try:
@@ -3793,6 +4112,9 @@ class Broker:
                     note=note,
                     starts_at=starts_at,
                     expires_at=expires_at,
+                    env_version_id=env_version_id,
+                    env_build_id=env_build_id,
+                    image_id=image_id,
                     max_cpus=self.config.policy.global_max_cpus,
                     max_memory_gb=self.config.policy.global_max_memory_gb,
                     max_cpus_per_user=self.config.policy.max_cpus_per_user,
@@ -3821,6 +4143,9 @@ class Broker:
                 image=image,
                 workspace=workspace,
                 note=note,
+                env_version_id=env_version_id,
+                env_build_id=env_build_id,
+                image_id=image_id,
                 reason=str(exc),
             )
         # Idempotent replay (§3.3): a retried apply returns the original
@@ -3848,6 +4173,9 @@ class Broker:
         reason: str,
         requested_gpu_count: int = 0,
         idempotency_key: str = "",
+        env_version_id: str | None = None,
+        env_build_id: str | None = None,
+        image_id: str | None = None,
     ) -> dict[str, Any]:
         with self._connection() as connection:
             queue_id = store.create_queue_request(
@@ -3863,6 +4191,9 @@ class Broker:
                 image=image,
                 workspace=workspace,
                 note=note,
+                env_version_id=env_version_id,
+                env_build_id=env_build_id,
+                image_id=image_id,
                 max_queue_length=self.config.policy.max_queue_length,
                 max_queued_allocations_per_user=(
                     self.config.policy.max_queued_allocations_per_user
@@ -3913,6 +4244,37 @@ class Broker:
         if not provisioned.passed:
             raise Conflict(f"workspace quota could not be enforced: {provisioned.detail}")
 
+    async def _environment_materialization_failure(self, allocation: dict[str, Any]) -> str:
+        """Re-validate an environment-backed allocation right before Docker.
+
+        The image may have been deleted or replaced between admission and
+        materialization. In that case the allocation fails instead of silently
+        starting from a different image.
+        """
+
+        build_id = str(allocation.get("env_build_id") or "")
+        if not build_id:
+            return ""
+        try:
+            with self._connection() as connection:
+                build = env_store.get_build(connection, build_id)
+                if allocation.get("env_version_id"):
+                    env_store.get_version(connection, str(allocation["env_version_id"]))
+        except EnvironmentNotFound:
+            return "环境构建记录已不存在，拒绝启动"
+        if build["status"] not in {"built", "verified"}:
+            return f"环境构建状态为 {build['status']}，拒绝启动"
+        expected = str(allocation.get("image_id") or "")
+        if expected and str(build["image_id"]) != expected:
+            return "环境构建记录与租约记录的镜像不一致，拒绝启动"
+        try:
+            details = await asyncio.to_thread(self.docker.image_details, str(build["image_tag"]))
+        except DockerError as exc:
+            return f"环境镜像不可用：{exc}"
+        if expected and str(details.get("id", "")) != expected:
+            return "环境镜像已被替换或删除，请重新构建后再启动"
+        return ""
+
     async def _materialize_allocation(self, allocation_id: str) -> dict[str, Any]:
         with self._connection() as connection:
             allocation_data = store.get_allocation(
@@ -3924,6 +4286,16 @@ class Broker:
             expires_at = datetime.fromisoformat(str(allocation_data["expires_at"]))
             owner_uid = int(allocation_data["owner_uid"])
             owner_gid = owner_uid
+        environment_failure = await self._environment_materialization_failure(allocation_data)
+        if environment_failure:
+            with self._connection() as connection:
+                store.fail_allocation(
+                    connection,
+                    allocation_id,
+                    reason=environment_failure,
+                    now=self._now(),
+                )
+            raise Conflict(environment_failure)
         if os.name == "posix":
             try:
                 import pwd

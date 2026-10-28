@@ -1625,6 +1625,11 @@ def apply_command(
     memory: int = typer.Option(..., "--memory", help="Memory in GiB."),
     hours: int | None = typer.Option(None, "--hours", help="Lease hours (1-36)."),
     image: str | None = typer.Option(None, "--image", help="Container image."),
+    env: str | None = typer.Option(
+        None,
+        "--env",
+        help="用已构建的环境版本启动，例如 reconstruction@v3（与 --image 二选一）。",
+    ),
     note: str = typer.Option("", "--note", help="Free-form note."),
     queue: bool = typer.Option(
         True,
@@ -1653,6 +1658,8 @@ def apply_command(
     indices = _parse_gpu_indices(gpus)
     if gpu_count is not None and indices:
         _fail("bad_request", "--gpus 与 --gpu-count 只能二选一", json_output)
+    if env is not None and image is not None:
+        _fail("bad_request", "--env 与 --image 只能二选一", json_output)
     key = idempotency_key or uuid.uuid4().hex
     args: dict[str, Any] = {
         "gpus": indices,
@@ -1668,6 +1675,8 @@ def apply_command(
         args["hours"] = hours
     if image is not None:
         args["image"] = image
+    if env is not None:
+        args["env"] = env
     config = _load(ctx)
     client = _make_client(config)
     if wait and json_output:
@@ -2537,6 +2546,47 @@ def env_diff_command(
         typer.echo(
             f"~ system {item['from']['name']} {item['from']['version']} -> {item['to']['version']}"
         )
+
+
+@env_app.command("build")
+def env_build_command(
+    ctx: typer.Context,
+    ref: str = typer.Argument(..., help="环境引用，例如 reconstruction@v1。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """按环境版本重建一个可复用的镜像（不占 GPU）。"""
+    config = _load(ctx)
+    data = _request(_make_client(config), "env_build", json_output, ref=ref)
+    if json_output:
+        return
+    build = data["build"]
+    typer.echo(f"build {build['status']}: {build.get('image_id') or '-'}")
+    typer.echo(f"  image: {build.get('image_tag')}")
+    typer.echo(f"  {build.get('detail')}")
+    typer.echo(f"  {data['version']['ref']}  verification={data['version']['verification']}")
+
+
+@env_app.command("verify")
+def env_verify_command(
+    ctx: typer.Context,
+    ref: str = typer.Argument(..., help="环境引用，例如 reconstruction@v1。"),
+    allocation: str = typer.Option(..., "--allocation", help="用该环境启动的工作环境 id。"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """把当前租约标记为该环境版本的功能验证通过。"""
+    config = _load(ctx)
+    data = _request(
+        _make_client(config),
+        "env_verify",
+        json_output,
+        ref=ref,
+        allocation=allocation,
+    )
+    if json_output:
+        return
+    typer.echo(
+        f"verified: {data['version']['ref']}  verification={data['version']['verification']}"
+    )
 
 
 @app.command("release")

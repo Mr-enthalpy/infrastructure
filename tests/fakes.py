@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
 from citespec_resource.broker.docker_driver import (
@@ -77,6 +80,23 @@ class FakeDocker:
         self.images: dict[str, dict[str, object]] = {}
         self.exec_calls: list[tuple[str, list[str], str | None]] = []
         self.exec_output: tuple[int, str, str] = (0, "", "")
+        self.builder_calls: list[dict[str, object]] = []
+        self.build_image_calls: list[dict[str, object]] = []
+        self.removed_images: list[str] = []
+        self.builder_failure = False
+        self.builder_output = (
+            0,
+            "CITESPEC_BUILD_EVIDENCE "
+            + json.dumps(
+                {
+                    "python": "3.11.9",
+                    "pip_check": True,
+                    "pip_check_output": "",
+                    "installed": ["torch==2.7.1"],
+                }
+            )
+            + "\n",
+        )
         self._next_id = 1
 
     def list_gpus(self) -> list[GPU]:
@@ -106,6 +126,79 @@ class FakeDocker:
     ) -> tuple[int, str, str]:
         self.exec_calls.append((container_id, list(argv), user))
         return self.exec_output
+
+    def remove_image(self, image: str) -> None:
+        self.removed_images.append(image)
+        self.images.pop(image, None)
+
+    def list_environment_images(self, prefix: str) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for tag, details in self.images.items():
+            if not tag.startswith(prefix):
+                continue
+            found.append(
+                {
+                    "id": str(details.get("id", "")),
+                    "tags": [tag],
+                    "size": int(details.get("size", 0) or 0),
+                    "created": str(details.get("created", "")),
+                }
+            )
+        return found
+
+    def run_builder(
+        self,
+        image: str,
+        argv: list[str],
+        *,
+        user: str,
+        cpus: float,
+        memory_gb: int,
+        pids_limit: int,
+        timeout_seconds: int,
+        volumes: dict[str, dict[str, str]],
+        labels: dict[str, str],
+    ) -> tuple[int, str]:
+        self.builder_calls.append(
+            {
+                "image": image,
+                "argv": list(argv),
+                "user": user,
+                "cpus": cpus,
+                "memory_gb": memory_gb,
+                "pids_limit": pids_limit,
+                "timeout_seconds": timeout_seconds,
+                "volumes": volumes,
+                "labels": labels,
+            }
+        )
+        for host, spec in volumes.items():
+            if spec.get("bind") == "/opt/citespec-env":
+                target = Path(host)
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "pyvenv.cfg").write_text("home = /usr/local/bin\n", encoding="utf-8")
+                (target / "bin").mkdir(exist_ok=True)
+                (target / "bin" / "python").write_text("", encoding="utf-8")
+        if self.builder_failure:
+            return 1, self.builder_output
+        return self.builder_output
+
+    def build_image(
+        self,
+        *,
+        path: str,
+        tag: str,
+        labels: dict[str, str],
+    ) -> str:
+        self.build_image_calls.append({"path": path, "tag": tag, "labels": labels})
+        image_id = "sha256:" + hashlib.sha256(tag.encode("utf-8")).hexdigest()
+        self.images[tag] = {
+            "id": image_id,
+            "digests": [],
+            "size": 1024,
+            "created": f"2026-10-22T12:00:{len(self.build_image_calls):02d}+00:00",
+        }
+        return image_id
 
     def add_container(self, container: ContainerInfo) -> None:
         self.containers[container.id] = container

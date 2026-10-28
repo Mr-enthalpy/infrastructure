@@ -174,6 +174,9 @@ def allocation_to_dict(
         "container_name": str(row["container_name"]),
         "gpus": [gpu["index"] for gpu in gpus],
         "gpu_uuids": [gpu["uuid"] for gpu in gpus],
+        "env_version_id": row["env_version_id"],
+        "env_build_id": row["env_build_id"],
+        "image_id": row["image_id"],
     }
 
 
@@ -353,6 +356,9 @@ def _insert_allocation(
     now: datetime | None,
     action: str = "allocation_pending",
     idempotency_key: str = "",
+    env_version_id: str | None = None,
+    env_build_id: str | None = None,
+    image_id: str | None = None,
 ) -> None:
     timestamp = (now or utcnow()).isoformat()
     connection.execute(
@@ -360,8 +366,8 @@ def _insert_allocation(
         INSERT INTO allocations(
             id, owner_uid, owner_name, status, image, cpus, memory_gb,
             workspace, note, gpus, created_at, starts_at, expires_at,
-            idempotency_key
-        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?)
+            idempotency_key, env_version_id, env_build_id, image_id
+        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             allocation_id,
@@ -376,6 +382,9 @@ def _insert_allocation(
             starts_at.isoformat(),
             expires_at.isoformat(),
             idempotency_key,
+            env_version_id,
+            env_build_id,
+            image_id,
         ),
     )
     connection.executemany(
@@ -419,6 +428,9 @@ def create_allocation(
     docker_storage_budget_gb: int = 0,
     idempotency_key: str = "",
     membership_valid_until: str = "",
+    env_version_id: str | None = None,
+    env_build_id: str | None = None,
+    image_id: str | None = None,
     now: datetime | None = None,
 ) -> str:
     # Membership validity bounds the allocation (§6.3): a new environment can
@@ -478,6 +490,9 @@ def create_allocation(
             starts_at=starts_at,
             expires_at=expires_at,
             idempotency_key=idempotency_key,
+            env_version_id=env_version_id,
+            env_build_id=env_build_id,
+            image_id=image_id,
             now=now,
         )
         connection.commit()
@@ -573,6 +588,9 @@ def queue_to_dict(
         "allocation_id": row["allocation_id"],
         "admitted_at": str(row["admitted_at"]),
         "reason": str(row["reason"]),
+        "env_version_id": row["env_version_id"],
+        "env_build_id": row["env_build_id"],
+        "image_id": row["image_id"],
     }
 
 
@@ -594,6 +612,9 @@ def create_queue_request(
     priority: int = 0,
     requested_gpu_count: int = 0,
     idempotency_key: str = "",
+    env_version_id: str | None = None,
+    env_build_id: str | None = None,
+    image_id: str | None = None,
     now: datetime | None = None,
 ) -> str:
     if len(set(requested_gpus)) != len(requested_gpus):
@@ -635,8 +656,9 @@ def create_queue_request(
             INSERT INTO queue_requests(
                 id, owner_uid, owner_name, cpus, memory_gb, hours, image,
                 workspace, note, requested_gpus, priority, state, created_at,
-                expires_at, requested_gpu_count, idempotency_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                expires_at, requested_gpu_count, idempotency_key,
+                env_version_id, env_build_id, image_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 queue_id,
@@ -654,6 +676,9 @@ def create_queue_request(
                 (current + timedelta(hours=max_queue_hours)).isoformat(),
                 requested_gpu_count,
                 idempotency_key,
+                env_version_id,
+                env_build_id,
+                image_id,
             ),
         )
         record_event(
@@ -988,6 +1013,9 @@ def admit_next_queued(
                 note=str(row["note"]),
                 starts_at=starts_at,
                 expires_at=expires_at,
+                env_version_id=row["env_version_id"],
+                env_build_id=row["env_build_id"],
+                image_id=row["image_id"],
                 now=current,
             )
             connection.execute(

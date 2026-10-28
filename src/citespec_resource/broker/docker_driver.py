@@ -123,6 +123,32 @@ class DockerBackend(Protocol):
 
     def image_details(self, image: str) -> dict[str, Any]: ...
 
+    def remove_image(self, image: str) -> None: ...
+
+    def list_environment_images(self, prefix: str) -> list[dict[str, Any]]: ...
+
+    def run_builder(
+        self,
+        image: str,
+        argv: list[str],
+        *,
+        user: str,
+        cpus: float,
+        memory_gb: int,
+        pids_limit: int,
+        timeout_seconds: int,
+        volumes: dict[str, dict[str, str]],
+        labels: dict[str, str],
+    ) -> tuple[int, str]: ...
+
+    def build_image(
+        self,
+        *,
+        path: str,
+        tag: str,
+        labels: dict[str, str],
+    ) -> str: ...
+
     def exec_capture(
         self,
         container_id: str,
@@ -564,7 +590,136 @@ class DockerDriver:
         return {
             "id": str(attrs.get("Id") or getattr(entry, "id", "")),
             "digests": digests,
+            "size": int(attrs.get("Size") or 0),
         }
+
+    def remove_image(self, image: str) -> None:
+        try:
+            self.client.images.remove(image, force=True, noprune=False)
+        except NotFound:
+            return
+        except DockerException as exc:
+            raise DockerError(f"cannot remove image {image}: {exc}") from exc
+
+    def list_environment_images(self, prefix: str) -> list[dict[str, Any]]:
+        """Return locally built environment images whose tag starts with prefix."""
+
+        try:
+            entries = self.client.images.list()
+        except DockerException as exc:
+            raise DockerError(f"cannot list images: {exc}") from exc
+        found: list[dict[str, Any]] = []
+        for entry in entries:
+            attrs = getattr(entry, "attrs", {}) or {}
+            tags = [tag for tag in attrs.get("RepoTags") or [] if isinstance(tag, str)]
+            matching = sorted(tag for tag in tags if tag.startswith(prefix))
+            if not matching:
+                continue
+            found.append(
+                {
+                    "id": str(attrs.get("Id") or getattr(entry, "id", "")),
+                    "tags": matching,
+                    "size": int(attrs.get("Size") or 0),
+                    "created": str(attrs.get("Created") or ""),
+                }
+            )
+        return found
+
+    def run_builder(
+        self,
+        image: str,
+        argv: list[str],
+        *,
+        user: str,
+        cpus: float,
+        memory_gb: int,
+        pids_limit: int,
+        timeout_seconds: int,
+        volumes: dict[str, dict[str, str]],
+        labels: dict[str, str],
+    ) -> tuple[int, str]:
+        """Run the fixed build script in a bounded, CPU-only container.
+
+        The container gets no GPU, a read-only root filesystem, and only the
+        broker-owned build directory mounted. Its output is truncated before
+        being returned to the caller so a noisy failed install cannot flood the
+        broker log or the database.
+        """
+
+        container = None
+        try:
+            container = self.client.containers.run(
+                image,
+                command=argv,
+                detach=True,
+                remove=False,
+                name=None,
+                user=user,
+                nano_cpus=int(cpus * 1_000_000_000),
+                mem_limit=f"{memory_gb}g",
+                memswap_limit=f"{memory_gb}g",
+                pids_limit=pids_limit,
+                network_mode="bridge",
+                read_only=True,
+                tmpfs={"/tmp": "rw,nosuid,nodev,size=1g"},
+                volumes=volumes,
+                working_dir="/tmp",
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges"],
+                environment={
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PIP_NO_CACHE_DIR": "1",
+                    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                    "HOME": "/tmp",
+                },
+                labels=labels,
+            )
+            try:
+                status = container.wait(timeout=timeout_seconds)
+            except Exception as exc:  # docker.errors.APIError and read timeouts
+                raise DockerError(f"environment builder timed out or failed: {exc}") from exc
+            code = int((status or {}).get("StatusCode", -1))
+            raw = container.logs(stdout=True, stderr=True) or b""
+        except DockerException as exc:
+            raise DockerError(f"cannot start environment builder: {exc}") from exc
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except DockerException:
+                    logger.warning("could not remove environment builder container")
+        text = raw.decode("utf-8", errors="replace")
+        return code, text[-20000:]
+
+    def build_image(
+        self,
+        *,
+        path: str,
+        tag: str,
+        labels: dict[str, str],
+    ) -> str:
+        """Build the derived image from an already prepared context."""
+
+        try:
+            _image, logs = self.client.images.build(
+                path=path,
+                tag=tag,
+                labels=labels,
+                network_mode="none",
+                rm=True,
+                forcerm=True,
+                pull=False,
+            )
+        except DockerException as exc:
+            raise DockerError(f"environment image build failed: {exc}") from exc
+        except (OSError, ValueError) as exc:
+            raise DockerError(f"environment build context is invalid: {exc}") from exc
+        for entry in logs:
+            stream = entry.get("stream") if isinstance(entry, dict) else None
+            if stream:
+                logger.debug("environment build: %s", str(stream).rstrip())
+        details = self.image_details(tag)
+        return str(details["id"])
 
     def exec_capture(
         self,

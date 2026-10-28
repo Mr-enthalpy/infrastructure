@@ -432,9 +432,10 @@ def create_build(
     server_id: str,
     base_image: str,
     image_tag: str,
+    build_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    build_id = _new_id("bld")
+    resolved = build_id or _new_id("bld")
     timestamp = _timestamp(now)
     with _write(connection):
         connection.execute(
@@ -444,9 +445,9 @@ def create_build(
                 status, created_at
             ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
             """,
-            (build_id, version_id, server_id, base_image, image_tag, timestamp),
+            (resolved, version_id, server_id, base_image, image_tag, timestamp),
         )
-    return get_build(connection, build_id)
+    return get_build(connection, resolved)
 
 
 def get_build(connection: sqlite3.Connection, build_id: str) -> dict[str, Any]:
@@ -474,7 +475,7 @@ def latest_build(
         clauses.append("status IN ('built', 'verified')")
     row = connection.execute(
         "SELECT * FROM environment_builds "
-        f"WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
+        f"WHERE {' AND '.join(clauses)} ORDER BY created_at DESC, rowid DESC LIMIT 1",
         params,
     ).fetchone()
     return None if row is None else dict(row)
@@ -487,7 +488,8 @@ def list_builds(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     rows = connection.execute(
-        "SELECT * FROM environment_builds WHERE version_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT * FROM environment_builds WHERE version_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
         (version_id, limit),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -539,6 +541,35 @@ def finish_build(
         if cursor.rowcount == 0:
             raise models.EnvironmentConflict("构建记录已结束，不能重复写入结果")
     return get_build(connection, build_id)
+
+
+def mark_build_verified(
+    connection: sqlite3.Connection,
+    build_id: str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Record that the built image was used for a successful functional run."""
+
+    with _write(connection):
+        cursor = connection.execute(
+            "UPDATE environment_builds SET status = 'verified', finished_at = ? "
+            "WHERE build_id = ? AND status IN ('built', 'verified')",
+            (_timestamp(now), build_id),
+        )
+        if cursor.rowcount == 0:
+            raise models.EnvironmentConflict("只有构建成功的镜像才能标记为已验证")
+    return get_build(connection, build_id)
+
+
+def successful_builds(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    """All built or verified images, newest first, across every version."""
+
+    rows = connection.execute(
+        "SELECT * FROM environment_builds WHERE status IN ('built', 'verified') "
+        "ORDER BY created_at DESC, rowid DESC"
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def record_legacy_source(
