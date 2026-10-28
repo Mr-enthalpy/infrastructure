@@ -1104,6 +1104,12 @@ AUTO_RELAY_COMMANDS = {
     "admin",
     "job",
     "me",
+    # Environment memory and legacy claims are broker commands. Without these
+    # entries a workstation would try the local socket, which does not exist
+    # off the server, and fail with "Unix domain sockets are not supported".
+    "project",
+    "env",
+    "legacy",
     # ``start`` only needs server configuration and the broker. It used to run
     # locally, which made a stale workstation package silently use old presets
     # and fail when no local broker socket existed.

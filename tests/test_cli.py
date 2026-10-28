@@ -1169,6 +1169,35 @@ def test_client_profile_still_relays_start(tmp_path, monkeypatch):
     assert recorded["argv"][-1] == "citespec-resource start --gpu-count 1 --json"
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["project", "list"],
+        ["env", "list", "--project", "reconstruction"],
+        ["legacy", "list"],
+    ],
+)
+def test_environment_commands_relay_from_a_workstation(tmp_path, monkeypatch, argv):
+    import subprocess as subprocess_module
+    import sys as sys_module
+
+    recorded = {}
+
+    def fake_run(command, **kwargs):
+        recorded["argv"] = list(command)
+        return subprocess_module.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", lambda path: _no_socket_config(tmp_path))
+    monkeypatch.setattr(sys_module, "argv", ["citespec-resource", *argv])
+
+    result = runner.invoke(cli.app, argv)
+
+    assert result.exit_code == 0
+    assert recorded["argv"][-2] == _no_socket_config(tmp_path).server.ssh_alias
+    assert recorded["argv"][-1] == "citespec-resource " + " ".join(argv)
+
+
 def test_workstation_defaults_to_relay_without_socket(tmp_path, monkeypatch):
     import subprocess as subprocess_module
     import sys as sys_module
