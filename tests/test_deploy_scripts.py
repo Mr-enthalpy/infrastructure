@@ -520,6 +520,12 @@ def test_installer_provisions_root_only_broker_admin_key():
     assert 'chmod 0600 "$ADMIN_AUTH_KEY_FILE"' in source
 
 
+def test_installer_creates_a_broker_only_environment_state_directory():
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert 'install -d -o root -g root -m 0700 "$STATE_DIR/envs"' in source
+    assert "environment build state ready" in source
+
+
 def test_installer_overrides_every_unit_that_embeds_the_workspace_root():
     source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "SYSTEMD_WORKSPACE_ROOT=/home/data1/citespec-users" in source

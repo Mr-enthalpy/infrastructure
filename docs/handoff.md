@@ -11,6 +11,25 @@
 > docs/reports/member-onboarding-and-ux.md（含差距表、实际测试结果与
 > **D1=完成 / D2=核心实机验收完成 / D3=未开放** 结论）。
 
+## 0.6 2026-10-28 科研环境记忆（0.2.0）
+
+- 已实现“项目 → 环境档案 → 不可变版本”：采集、查看/对比、两阶段镜像构建、
+  `apply --env`、功能验证。数据模型与权限见 #18，采集与 CLI 见 #20，构建与
+  `--env` 见 #21。
+- 三个维度分开记录：采集保真度、构建/功能验证、可见性。采集完整不代表能构建，
+  构建成功也不代表项目还能训练；验证状态只能向前推进。
+- 构建不依赖 `docker commit`/`export`：CPU-only 构建容器以成员 UID 安装 venv，
+  再生成无 `RUN` 的最小 Dockerfile，`docker build --network none`。基础镜像 digest
+  与采集记录不一致时停止；V1 拒绝自动 apt，缺失系统包记录为未满足需求。
+- 旧容器认领（#22）：管理员扫描非托管容器，成员提交申请，管理员批准后才做只读
+  采集。运行中容器以 nobody 执行固定探针；已停止容器只读固定归档路径，不启动、
+  不 exec。同一来源存在待处理申请时批准返回冲突，不自动替管理员选择。
+- 门控全部默认关闭（`environment_enabled`、`environment_builds_enabled`、
+  `legacy_claims_enabled`），部署本身不改变现有行为；`env_state_dir` 由安装器
+  创建为 root-only。
+- 文档：`docs/environment-memory.md`。部署与验收顺序见 `docs/handoff.local.md`。
+- 发布：客户端 `0.2.0`；`v0.1.0`/`v0.1.1` tag 与资产保持不变。
+
 ## 0.5 2026-10-28 C-4 复测（0.1.1 签名客户端）
 
 - 同一名测试成员用 CI 构建并本地校验过的签名 0.1.1 客户端重跑 C-4；服务端同为
@@ -595,6 +614,7 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |
 | P1 | CI 覆盖 | 测试矩阵和 Windows/Linux 打包 smoke 通过；Playwright 浏览器 job 仍待接入 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
 | P1 | 客户端打包/自动更新 | `v0.1.1` 已发布（release run `40682337169`，Windows/Linux full/精简资产 + 签名 manifest，`v0.1.0` 未动）；本地资产校验与 `update --check` 通过 | 试点成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
+| P1 | 科研环境记忆（0.2.0） | 代码与测试完成（#18/#20/#21，旧容器 #22）；门控默认关闭，待部署与实机验收 | 部署后行为不变；维护窗口打开门控完成 capture→build→start --env→train→verify→release→pull；发布 0.2.0 签名客户端 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
 | P1 | 真实科研 Agent 端到端（C-4） | 0.1.1 签名客户端复测通过（2026-10-28，外部协助 0 次，2 卡同租约并行训练 + 断线恢复 + 释放后取件）；C4-9/C4-10/C4-4 提示/C4-7 JSON 已修复并随 `b689797` 上线 | 1–2 名试点成员观察后再决定是否扩大范围 |
