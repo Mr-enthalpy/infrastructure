@@ -105,6 +105,26 @@ class PolicyConfig:
     # operations require an active member record. Admin identities keep the
     # trusted admin-group path and are exempt.
     membership_required: bool = True
+    # Environment memory (architecture §10). Every gate defaults to false so
+    # deploying this version changes nothing until an administrator opts in.
+    environment_enabled: bool = False
+    environment_builds_enabled: bool = False
+    legacy_claims_enabled: bool = False
+    env_state_dir: str = "/var/lib/citespec-resource/envs"
+    env_max_manifest_bytes: int = 262144
+    env_max_artifact_bytes: int = 1048576
+    env_max_artifacts_bytes: int = 4194304
+    env_max_packages: int = 2000
+    env_build_cpus: float = 4.0
+    env_build_memory_gb: int = 8
+    env_build_timeout_seconds: int = 1800
+    env_capture_timeout_seconds: int = 120
+    env_build_cache_gb: int = 50
+    env_build_keep_per_version: int = 2
+    env_max_versions_per_project: int = 50
+    legacy_probe_timeout_seconds: int = 20
+    legacy_probe_output_bytes: int = 262144
+    legacy_capture_max_bytes: int = 16777216
 
 
 @dataclass(frozen=True)
@@ -421,6 +441,24 @@ def load_config(path: str | Path) -> LabConfig:
         max_shells_global=int(policy_raw.get("max_shells_global", 16)),
         max_tunnels_per_user=int(policy_raw.get("max_tunnels_per_user", 8)),
         max_tunnels_global=int(policy_raw.get("max_tunnels_global", 16)),
+        environment_enabled=bool(policy_raw.get("environment_enabled", False)),
+        environment_builds_enabled=bool(policy_raw.get("environment_builds_enabled", False)),
+        legacy_claims_enabled=bool(policy_raw.get("legacy_claims_enabled", False)),
+        env_state_dir=str(policy_raw.get("env_state_dir", "/var/lib/citespec-resource/envs")),
+        env_max_manifest_bytes=int(policy_raw.get("env_max_manifest_bytes", 262144)),
+        env_max_artifact_bytes=int(policy_raw.get("env_max_artifact_bytes", 1048576)),
+        env_max_artifacts_bytes=int(policy_raw.get("env_max_artifacts_bytes", 4194304)),
+        env_max_packages=int(policy_raw.get("env_max_packages", 2000)),
+        env_build_cpus=float(policy_raw.get("env_build_cpus", 4.0)),
+        env_build_memory_gb=int(policy_raw.get("env_build_memory_gb", 8)),
+        env_build_timeout_seconds=int(policy_raw.get("env_build_timeout_seconds", 1800)),
+        env_capture_timeout_seconds=int(policy_raw.get("env_capture_timeout_seconds", 120)),
+        env_build_cache_gb=int(policy_raw.get("env_build_cache_gb", 50)),
+        env_build_keep_per_version=int(policy_raw.get("env_build_keep_per_version", 2)),
+        env_max_versions_per_project=int(policy_raw.get("env_max_versions_per_project", 50)),
+        legacy_probe_timeout_seconds=int(policy_raw.get("legacy_probe_timeout_seconds", 20)),
+        legacy_probe_output_bytes=int(policy_raw.get("legacy_probe_output_bytes", 262144)),
+        legacy_capture_max_bytes=int(policy_raw.get("legacy_capture_max_bytes", 16777216)),
     )
     if not 1 <= policy.default_hours <= policy.max_hours:
         raise ValueError("default_hours must be between 1 and max_hours")
@@ -460,6 +498,43 @@ def load_config(path: str | Path) -> LabConfig:
         raise ValueError("policy disk limits must not be negative")
     if policy.pids_limit <= 0:
         raise ValueError("policy.pids_limit must be positive")
+    if policy.environment_builds_enabled and not policy.environment_enabled:
+        raise ValueError("environment_builds_enabled requires environment_enabled=true")
+    if policy.legacy_claims_enabled and not policy.environment_enabled:
+        raise ValueError("legacy_claims_enabled requires environment_enabled=true")
+    if not policy.env_state_dir.startswith("/"):
+        raise ValueError("policy.env_state_dir must be an absolute path")
+    if ".." in PurePosixPath(policy.env_state_dir).parts:
+        raise ValueError("policy.env_state_dir must not contain '..'")
+    if policy.env_state_dir in {"/", "/var", "/var/lib", "/home"}:
+        raise ValueError("policy.env_state_dir must be a dedicated directory")
+    if (
+        min(
+            policy.env_max_manifest_bytes,
+            policy.env_max_artifact_bytes,
+            policy.env_max_artifacts_bytes,
+            policy.env_max_packages,
+            policy.env_build_memory_gb,
+            policy.env_build_timeout_seconds,
+            policy.env_capture_timeout_seconds,
+            policy.env_build_cache_gb,
+            policy.env_build_keep_per_version,
+            policy.env_max_versions_per_project,
+            policy.legacy_probe_timeout_seconds,
+            policy.legacy_probe_output_bytes,
+            policy.legacy_capture_max_bytes,
+        )
+        <= 0
+    ):
+        raise ValueError("environment memory limits must be positive")
+    if policy.env_build_cpus <= 0:
+        raise ValueError("policy.env_build_cpus must be positive")
+    if policy.env_build_cpus > policy.global_max_cpus:
+        raise ValueError("env_build_cpus exceeds global_max_cpus")
+    if policy.env_build_memory_gb > policy.global_max_memory_gb:
+        raise ValueError("env_build_memory_gb exceeds global_max_memory_gb")
+    if policy.env_max_artifacts_bytes < policy.env_max_artifact_bytes:
+        raise ValueError("env_max_artifacts_bytes must be at least env_max_artifact_bytes")
     if policy.container_user not in {"root", "member"}:
         raise ValueError("policy.container_user must be root or member")
     if policy.container_profile not in {"restricted", "development"}:

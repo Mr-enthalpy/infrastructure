@@ -219,3 +219,84 @@ def test_refuses_newer_schema(tmp_path):
     connection.close()
     with pytest.raises(RuntimeError, match="newer"):
         init_db(path)
+
+
+def test_migration_7_adds_environment_memory_without_touching_old_rows(tmp_path):
+    from citespec_resource.db import BASE_SCHEMA_VERSION, MIGRATIONS, SCHEMA
+
+    path = tmp_path / "v6.db"
+    connection = connect(path)
+    connection.executescript(SCHEMA)
+    connection.execute(f"PRAGMA user_version={BASE_SCHEMA_VERSION}")
+    for version in sorted(MIGRATIONS):
+        if version < 7:
+            MIGRATIONS[version](connection)
+    connection.execute("PRAGMA user_version=6")
+    _add_gpu(connection, 0, "GPU-0")
+    _add_allocation(connection, "legacy-alloc")
+    connection.execute(
+        """
+        INSERT INTO queue_requests(
+            id, owner_uid, owner_name, cpus, memory_gb, hours, image, workspace,
+            requested_gpus, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "legacy-queue",
+            1000,
+            "citespec-test",
+            4,
+            8,
+            2,
+            "citespec-base:2026.10",
+            "/data1/citespec-users/citespec-test",
+            "[0]",
+            "2026-10-22T00:00:00+00:00",
+            "2026-10-22T02:00:00+00:00",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    upgraded = init_db(path)
+    assert upgraded.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    tables = {
+        row[0] for row in upgraded.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {
+        "research_projects",
+        "environment_profiles",
+        "environment_versions",
+        "environment_artifacts",
+        "environment_builds",
+        "legacy_sources",
+        "legacy_claims",
+    } <= tables
+    triggers = {
+        row[0] for row in upgraded.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    }
+    assert {
+        "trg_environment_versions_immutable",
+        "trg_environment_versions_no_delete",
+        "trg_environment_artifacts_immutable",
+    } <= triggers
+
+    allocation_columns = {row[1] for row in upgraded.execute("PRAGMA table_info(allocations)")}
+    assert {"env_version_id", "env_build_id", "image_id"} <= allocation_columns
+    row = upgraded.execute(
+        "SELECT env_version_id, env_build_id, image_id FROM allocations WHERE id = ?",
+        ("legacy-alloc",),
+    ).fetchone()
+    assert tuple(row) == (None, None, None)
+    queue_row = upgraded.execute(
+        "SELECT env_version_id, env_build_id, image_id FROM queue_requests WHERE id = ?",
+        ("legacy-queue",),
+    ).fetchone()
+    assert tuple(queue_row) == (None, None, None)
+    upgraded.close()
+
+    # The upgrade is retryable: a second init must be a no-op.
+    again = init_db(path)
+    assert again.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert again.execute("SELECT COUNT(*) FROM research_projects").fetchone()[0] == 0
+    again.close()

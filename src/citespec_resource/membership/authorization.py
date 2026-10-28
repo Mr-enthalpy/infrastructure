@@ -27,6 +27,22 @@ MEMBER_COMMANDS = frozenset(
         "job_list",
         "job_logs",
         "job_stop",
+        # Environment memory (architecture §8). Capture, build, verify, and
+        # claim all create durable or host-side work and require an active
+        # member at the moment of the request.
+        "project_create",
+        "project_list",
+        "project_show",
+        "project_archive",
+        "env_capture",
+        "env_list",
+        "env_show",
+        "env_diff",
+        "env_build",
+        "env_verify",
+        "legacy_claim",
+        "legacy_claim_list",
+        "legacy_claim_show",
     }
 )
 
@@ -47,6 +63,15 @@ NON_ACTIVE_MEMBER_ALLOWED = frozenset(
         "job_stop",
         "queue_cancel",
         "release",
+        # Read-only environment inspection stays available so members can see
+        # what they saved while the host is in maintenance or monitor mode.
+        "project_list",
+        "project_show",
+        "env_list",
+        "env_show",
+        "env_diff",
+        "legacy_claim_list",
+        "legacy_claim_show",
     }
 )
 
