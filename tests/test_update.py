@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -243,6 +244,38 @@ def test_install_update_downloads_verifies_and_keeps_previous(tmp_path):
     assert installed2.previous_version == "0.2.0"
     assert update.resolve_payload(root) is not None
     assert (root / "versions" / "0.2.0").is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable bit")
+def test_install_update_marks_payload_executable_and_repairs_existing(tmp_path):
+    private, public = _keypair()
+    root = tmp_path / "app"
+    archive = tmp_path / "payload.zip"
+    _payload_zip(archive, content=b"#!/bin/sh\nprintf ok\n")
+    manifest = _signed_manifest(
+        private,
+        version="0.2.0",
+        artifacts={"test": _artifact(archive)},
+    )
+    info = update.check_for_update(
+        current_version="0.1.0",
+        platform="test",
+        manifest_payload=manifest,
+        public_key_b64=public,
+    )
+    update.install_update(info, app_root=root, allow_insecure=True)
+    payload = update.resolve_payload(root)
+    assert payload is not None
+    assert payload.stat().st_mode & 0o777 == 0o755
+    completed = subprocess.run(
+        [str(payload)], check=False, capture_output=True, text=True, timeout=30
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == "ok"
+
+    payload.chmod(0o644)
+    update.install_update(info, app_root=root, allow_insecure=True)
+    assert payload.stat().st_mode & 0o777 == 0o755
 
 
 def test_install_update_replaces_incomplete_version_directory(tmp_path):

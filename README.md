@@ -19,15 +19,15 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 | 范围 | 状态 | 证据 |
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
-| 自动化验证 | 完成 | 本地 `475 passed, 21 skipped`；Ruff、mypy、JS、Bash 通过 |
+| 自动化验证 | 完成 | 本地 `563 passed, 27 skipped`；Ruff、mypy、JS、Bash 通过 |
 | CI | 完成 | GitHub Actions `40465970858`（测试矩阵）和 `40465970936`（Windows/Linux 打包）通过 |
-| 客户端分发 | 完成 | [v0.1.0](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0) 已发布 Windows/Linux x64；签名清单、自动更新、篡改拒绝和回退已验证 |
+| 客户端分发 | 完成 | [v0.1.0](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0) 已发布 Windows/Linux x64；签名清单、自动更新、篡改拒绝和回退已验证。`0.1.1` 是 PR #1 的部署候选版本，尚未发布 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
 | 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
-| VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；等待内网 DNS/VPN/证书答复 |
-| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现，CI `40465970858` 通过；实机部署与恢复演练待维护窗口 |
-| 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭 |
+| VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；安装器不会启用 Portal，需 `enable_portal.sh` 在网络/证书验收后写标记并启动；等待内网 DNS/VPN/证书答复 |
+| 备份/告警 | 代码完成 | 日备份、校验、恢复、保留和安全告警单元已实现；安装器在维护窗口内先停写入者，再用 `backup.py` 取一致快照并支持回滚；实机部署与恢复演练待维护窗口 |
+| 可选能力 | 未开放 | VS Code、文件传输、development profile/5.6 仍按门禁关闭；development + container sudo 需要真机 GPU 隔离标记 |
 | example-gpu | 未改动 | 不部署、不重启 Docker/NVIDIA、不操作现有容器 |
 
 - 生产基线为 Python 3.12；本地开发可使用 Python 3.13。
@@ -190,6 +190,10 @@ uv.lock              # 锁定依赖版本
 
 - [docs/client-distribution.md](docs/client-distribution.md)：Windows/Linux 客户端安装、
   签名自动更新、构建发布和回滚。
+- [docs/reports/p1-remediation.md](docs/reports/p1-remediation.md)：部署前 P1 安全修复、
+  验证证据与残余风险。
+- [docs/guides/maintenance-window-b2.md](docs/guides/maintenance-window-b2.md)：monitor
+  模式维护窗口、手动备份/checkpoint、回滚演练与回滚操作单。
 ## 8. 实现里程碑
 
 > 以下 M0–M5 是初始实现阶段；历史文档中的 P0–P5 指同一组里程碑。后续变更优先级
@@ -333,14 +337,15 @@ citespec-apply.<lab-domain>  → 127.0.0.1:8765   # 旧 intake/申请页，保�
 ### 11.4 安装与本地验证
 
 安装器会创建低权限账号、`citespec-portal` 组、状态目录、root-owned 密钥文件和
-`portal.db`，安装 systemd unit；只有 `[portal].enabled = true` 时才 enable，且
-**从不自动 start**。安装示例：
+`portal.db`，安装 systemd unit，但**从不 enable、也从不 start**。unit 还带有
+`ConditionPathExists=/etc/citespec-resource/portal-network-accepted`，没有验收标记
+时即使被手工 enable 也不会启动。安装示例：
 
 ```bash
 bash deploy/install_server.sh --dry-run --skip-preflight
 bash deploy/install_server.sh --yes
-# 网络/证书验收后再执行：
-sudo systemctl start citespec-resource-portal.service
+# 网络/证书验收后，唯一启用入口（fail-closed 审计通过才写标记并 enable）：
+sudo deploy/enable_portal.sh --yes --approved-cidr <vpn-source-cidr>
 ```
 
 `deploy/nginx/` 中只有 vhost 示例，不包含证书、DNS 或防火墙改动。本地验证命令：
@@ -393,6 +398,12 @@ systemctl start citespec-resource-broker citespec-resource-intake.service citesp
 bash deploy/verify_monitor_only.sh --member <member>
 ```
 
+维护窗口内的安装应加 `--no-timers`，先不启用磁盘告警、日志轮转和每日备份 timer；
+验收通过后再单独 enable。Portal/apply vhost 部署后运行只读的
+`bash deploy/verify_portal_network.sh --nginx-root /etc/nginx`，确认 vhost 没有
+wildcard `listen`、有 `allow <vpn-source-cidr>; ... deny all;`、且只反代到
+`127.0.0.1`。
+
 `install_server.sh` 是幂等安装器。真实修改必须显式提供 `--yes`；默认只安装、不
 启动，启动后强制使用 `monitor` 模式。安装器默认启用磁盘告警、日志轮转和每日
 状态备份 timer，可用 `--no-timers` 关闭。安装器会将严格审计脚本、GPU 权限验收脚本、root-owned
@@ -442,6 +453,16 @@ NVIDIA udev 规则按 `KERNEL=="nvidia*"` 匹配，覆盖 `nvidiactl`、`nvidia-
 `nvidia-uvm-tools`、`nvidia-modeset` 等可能位于 `misc` 子系统的节点。验收脚本会
 检查所有 `/dev/nvidia*` 节点、有效组成员关系、ACL，以及成员 UID 的实际读写和
 `nvidia-smi` 拒绝结果。
+
+`nvidia-smi` 以 root 运行时会把 `/dev/nvidia*` 重置为 `0666 root:root`。安装器因此
+保留真实 helper 为 `/usr/bin/nvidia-smi.real`（去掉 setuid/setgid），安装
+`/usr/bin/nvidia-smi` wrapper、`/usr/bin/nvidia-modprobe` wrapper 和窄 LD_PRELOAD
+shim，使 wrapper 调用真实 helper 时不再修改节点权限。`preflight.sh` **默认不调用**
+`nvidia-smi`，只做静态 wrapper/设备审计；需要探测时显式使用 `--probe-nvidia`，
+脚本会在调用前后比较每个节点的 mode/owner，wrapper 未安装或 `.real` 缺失时拒绝
+探测。安装器只在 wrapper 和权限修复完成后执行一次
+`preflight.sh --probe-nvidia --nvidia-only`。`--skip-nvidia` 保留为显式跳过（与默认
+行为一致），也会跳过 compute process 查询。
 
 预算拆分为 `global_max_cpus` / `global_max_memory_gb`、每分配上限
 `max_cpus_per_allocation` / `max_memory_gb_per_allocation`、每用户上限

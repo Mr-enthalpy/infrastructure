@@ -202,7 +202,15 @@ def _is_managed_account(username: str) -> bool:
     groups = _account_groups(username)
     if "citespec-members" not in groups:
         return False
-    if groups & {"sudo", "docker", "citespec-gpu", "video", "render", "citespec-admins"}:
+    if groups & {
+        "sudo",
+        "docker",
+        "citespec-gpu",
+        "video",
+        "render",
+        "citespec-admins",
+        "citespec-portal",
+    }:
         return False
     return True
 

@@ -12,14 +12,30 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 PREFIX=/opt/citespec-resource
+VENVS_DIR=$PREFIX/venvs
 VENV=$PREFIX/.venv
+VENV_STAGING=""
+VENV_TARGET=""
+VENV_PREVIOUS=""
+VENV_PREVIOUS_LINK=""
+VENV_PREVIOUS_KIND="none"
+VENV_SWITCHED=0
 CONFIG_DIR=/etc/citespec-resource
 CONFIG_FILE=$CONFIG_DIR/config.toml
 STATE_DIR=/var/lib/citespec-resource
-# The static unit templates below grant access to this exact workspace.  P1-06:
-# reject a different workspace instead of warning and installing units that
-# would create a split directory or a systemd write-permission mismatch.
+# The static unit templates below default to the amax workspace.  A host with a
+# different server.workspace_root gets generated drop-ins for every unit that
+# names the path; the installer no longer rejects a different root.
 SYSTEMD_WORKSPACE_ROOT=/home/data1/citespec-users
+# Every unit that names the workspace is overridden when server.workspace_root
+# differs from the static amax path.  The broker alone is not enough: the
+# log-rotation, disk-check, and provisioning units also embed the path in
+# ExecStart/Environment and in their sandbox path lists.
+WORKSPACE_DROPIN_ROOT=/etc/systemd/system
+BROKER_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-broker.service.d/10-workspace.conf
+LOG_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-logrotate.service.d/10-workspace.conf
+DISK_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-disk-check.service.d/10-workspace.conf
+PROVISION_WORKSPACE_DROPIN=$WORKSPACE_DROPIN_ROOT/citespec-resource-provision.service.d/10-workspace.conf
 SYSTEMD_UNIT=/etc/systemd/system/citespec-resource-broker.service
 UDEV_RULE=/etc/udev/rules.d/99-citespec-gpu.rules
 SSHD_DROPIN=/etc/ssh/sshd_config.d/60-citespec-resource.conf
@@ -56,6 +72,10 @@ MEMBER_SHELL_INSTALL=$LIBEXEC_DIR/member-shell
 CREATE_USER_INSTALL=$LIBEXEC_DIR/create_user.sh
 PROVISION_EXECUTOR_INSTALL=$LIBEXEC_DIR/provision_executor.py
 GPU_FIX_INSTALL=$LIBEXEC_DIR/fix_gpu_permissions.sh
+PORTAL_AUDIT_INSTALL=$LIBEXEC_DIR/verify_portal_network.sh
+PORTAL_AUDIT_PY_INSTALL=$LIBEXEC_DIR/portal_network_audit.py
+ENABLE_PORTAL_INSTALL=$LIBEXEC_DIR/enable_portal.sh
+GPU_ISOLATION_INSTALL=$LIBEXEC_DIR/verify_gpu_isolation.sh
 GPU_SHIM_DIR=/usr/local/lib/citespec-resource
 GPU_SHIM="$GPU_SHIM_DIR/libcitespec-nvidia-chmod.so"
 GPU_SHIM_SRC="$GPU_SHIM_DIR/citespec_nvidia_chmod_shim.c"
@@ -71,6 +91,8 @@ ASSUME_YES=0
 SKIP_PREFLIGHT=0
 START=0
 ALLOW_ACTIVE=0
+MAINTENANCE_WINDOW=0
+SERVICES_STOPPED=0
 FORCE_CONFIG=0
 ENABLE_TIMERS=1
 AUDIT_FAILED=0
@@ -80,13 +102,48 @@ BACKUP_ROOT=/var/backups/citespec-resource
 BACKUP_DIR=""
 ROLLBACK_ARMED=0
 INSTALL_COMPLETE=0
-BROKER_WAS_ACTIVE=0
-BROKER_WAS_ENABLED=0
-BROKER_START_ATTEMPTED=0
 BACKED_UP=()
 STATE_DB=""
 STATE_DB_BACKUP=""
 STATE_DB_EXISTED=0
+SNAPSHOT_DIR=""
+# Unit/timer state recorded before the installer touches anything.  Rollback
+# restores both enablement and active state, not just the broker.
+UNIT_NAMES=(
+    citespec-resource-provision.path
+    citespec-resource-provision.service
+    citespec-resource-intake.service
+    citespec-resource-broker.service
+    citespec-gpu-permissions.service
+    citespec-resource-portal.service
+)
+# Stop public entry points before the executor spool; timers are stopped first
+# so nothing is triggered while the rollback is restoring unit files.
+UNIT_STOP_ORDER=(
+    citespec-resource-broker.service
+    citespec-resource-portal.service
+    citespec-resource-intake.service
+    citespec-resource-provision.path
+    citespec-resource-provision.service
+    citespec-gpu-permissions.service
+)
+TIMER_NAMES=(
+    citespec-resource-logrotate.timer
+    citespec-resource-disk-check.timer
+    citespec-resource-backup.timer
+)
+UNIT_WAS_ACTIVE=()
+UNIT_WAS_ENABLED=()
+TIMER_WAS_ACTIVE=()
+TIMER_WAS_ENABLED=()
+NVIDIA_PATHS=(
+    /usr/bin/nvidia-smi
+    /usr/bin/nvidia-smi.real
+    /usr/bin/nvidia-modprobe
+    /usr/bin/nvidia-modprobe.real
+)
+NVIDIA_STATE_FILE=""
+ROLLBACK_MISMATCH=0
 
 usage() {
     cat <<'EOF'
@@ -101,6 +158,10 @@ Options:
   --allow-active        Allow an active-mode config after training and approval.
                         A fresh database still starts in monitor; existing active
                         leases are preserved only when deployment_allowed=true.
+  --maintenance-window  Required when an existing Citespec unit is active. Stops
+                        the managed writers before replacing the Python venv and
+                        taking the database snapshot; they remain stopped unless
+                        --start is also given.
   --force-config        Overwrite an existing /etc/citespec-resource/config.toml.
   --no-timers           Do not enable the disk-alert, backup, and log-rotation timers.
   --config-source PATH  TOML config to install (default: lab/resources.local.toml
@@ -119,6 +180,178 @@ note() { printf '[info] %s\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+contains() {
+    local needle=$1
+    shift
+    local item
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+unit_is_active() {
+    systemctl is-active --quiet "$1" >/dev/null 2>&1
+}
+
+unit_is_enabled() {
+    systemctl is-enabled --quiet "$1" >/dev/null 2>&1
+}
+
+# Record the state rollback must return to before the first host change.  An
+# installer that only restores files leaves newly enabled or newly started
+# units behind; capture both axes for every unit and timer it manages.
+capture_unit_state() {
+    local unit
+    UNIT_WAS_ACTIVE=()
+    UNIT_WAS_ENABLED=()
+    TIMER_WAS_ACTIVE=()
+    TIMER_WAS_ENABLED=()
+    for unit in "${UNIT_NAMES[@]}"; do
+        if unit_is_active "$unit"; then
+            UNIT_WAS_ACTIVE+=("$unit")
+        fi
+        if unit_is_enabled "$unit"; then
+            UNIT_WAS_ENABLED+=("$unit")
+        fi
+    done
+    for unit in "${TIMER_NAMES[@]}"; do
+        if unit_is_active "$unit"; then
+            TIMER_WAS_ACTIVE+=("$unit")
+        fi
+        if unit_is_enabled "$unit"; then
+            TIMER_WAS_ENABLED+=("$unit")
+        fi
+    done
+}
+
+stop_managed_units() {
+    local unit
+    for unit in "${TIMER_NAMES[@]}"; do
+        if unit_is_active "$unit"; then
+            systemctl stop "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not stop $unit"
+        fi
+    done
+    for unit in "${UNIT_STOP_ORDER[@]}"; do
+        if unit_is_active "$unit"; then
+            systemctl stop "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not stop $unit"
+        fi
+    done
+}
+
+# Remove enablement that the installer added while the new unit files still
+# exist; otherwise daemon-reload leaves dangling .wants symlinks behind.
+disable_new_units() {
+    local unit
+    for unit in "${UNIT_NAMES[@]}"; do
+        if ! contains "$unit" "${UNIT_WAS_ENABLED[@]}" && unit_is_enabled "$unit"; then
+            systemctl disable "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not remove enablement for $unit"
+        fi
+    done
+    for unit in "${TIMER_NAMES[@]}"; do
+        if ! contains "$unit" "${TIMER_WAS_ENABLED[@]}" && unit_is_enabled "$unit"; then
+            systemctl disable "$unit" >/dev/null 2>&1 \
+                || warn "rollback could not remove enablement for $unit"
+        fi
+    done
+}
+
+# Start/enable exactly the units that were active/enabled before the installer
+# ran.  Called after daemon-reload restores the old unit files, so a
+# pre-existing unit gets its old ExecStart back.
+restore_unit_state() {
+    local unit
+    for unit in "${UNIT_NAMES[@]}"; do
+        if contains "$unit" "${UNIT_WAS_ENABLED[@]}"; then
+            if ! unit_is_enabled "$unit"; then
+                systemctl enable "$unit" >/dev/null 2>&1 \
+                    || warn "rollback could not re-enable $unit"
+            fi
+        fi
+    done
+    for unit in "${TIMER_NAMES[@]}"; do
+        if contains "$unit" "${TIMER_WAS_ENABLED[@]}"; then
+            if ! unit_is_enabled "$unit"; then
+                systemctl enable "$unit" >/dev/null 2>&1 \
+                    || warn "rollback could not re-enable $unit"
+            fi
+        fi
+    done
+    for unit in "${UNIT_WAS_ACTIVE[@]}"; do
+        systemctl start "$unit" >/dev/null 2>&1 \
+            || warn "rollback could not restart $unit"
+    done
+    for unit in "${TIMER_WAS_ACTIVE[@]}"; do
+        systemctl start "$unit" >/dev/null 2>&1 \
+            || warn "rollback could not restart $unit"
+    done
+}
+
+sha256_file() {
+    if have sha256sum; then
+        sha256sum -- "$1" 2>/dev/null | awk '{print $1}'
+    elif have shasum; then
+        shasum -a 256 -- "$1" 2>/dev/null | awk '{print $1}'
+    else
+        printf 'unavailable\n'
+    fi
+}
+
+# Capture every NVIDIA helper path, including the ".real" targets the installer
+# may create.  Mode %a keeps setuid/setgid bits, and the digest catches a
+# restore that silently replaced the original binary.
+record_nvidia_state() {
+    local path
+    [ -n "${NVIDIA_STATE_FILE:-}" ] || return 0
+    : > "$NVIDIA_STATE_FILE" || fail "could not create NVIDIA state record"
+    for path in "${NVIDIA_PATHS[@]}"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            printf '%s\texists\t%s\t%s\t%s\n' \
+                "$path" \
+                "$(stat -c '%a' "$path" 2>/dev/null || printf '?')" \
+                "$(stat -c '%u:%g' "$path" 2>/dev/null || printf '?')" \
+                "$(sha256_file "$path")" >> "$NVIDIA_STATE_FILE"
+        else
+            printf '%s\tabsent\t-\t-\t-\n' "$path" >> "$NVIDIA_STATE_FILE"
+        fi
+    done
+}
+
+verify_nvidia_state() {
+    local path expected mode owner digest current_mode current_owner current_digest
+    [ -n "${NVIDIA_STATE_FILE:-}" ] || return 0
+    [ -f "$NVIDIA_STATE_FILE" ] || return 0
+    while IFS=$'\t' read -r path expected mode owner digest; do
+        [ -n "$path" ] || continue
+        if [ "$expected" = "absent" ]; then
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                warn "rollback mismatch: $path should not exist"
+                ROLLBACK_MISMATCH=1
+            fi
+            continue
+        fi
+        if [ ! -e "$path" ]; then
+            warn "rollback mismatch: $path is missing"
+            ROLLBACK_MISMATCH=1
+            continue
+        fi
+        current_mode=$(stat -c '%a' "$path" 2>/dev/null || printf '?')
+        current_owner=$(stat -c '%u:%g' "$path" 2>/dev/null || printf '?')
+        current_digest=$(sha256_file "$path")
+        if [ "$current_mode" != "$mode" ] || [ "$current_owner" != "$owner" ]; then
+            warn "rollback mismatch: $path is $current_owner $current_mode, expected $owner $mode"
+            ROLLBACK_MISMATCH=1
+        fi
+        if [ "$digest" != "unavailable" ] && [ "$current_digest" != "$digest" ]; then
+            warn "rollback mismatch: $path content differs from the pre-install binary"
+            ROLLBACK_MISMATCH=1
+        fi
+    done < "$NVIDIA_STATE_FILE"
+}
+
 # List human members whose effective group set includes GROUP.  Supplementary
 # group lists omit users whose primary group is the target group, so always ask
 # the account database with id -G instead of parsing /etc/group field 4.
@@ -132,6 +365,62 @@ effective_members() {
             printf '%s\n' "$user"
         fi
     done
+}
+
+# An existing account with the portal service name is reused by the installer,
+# and the broker then treats its UID as the portal machine identity.  Fail closed
+# unless it still looks like the system account the installer would create:
+# system UID, dedicated primary group, non-interactive shell, locked password,
+# no sudo and no supplementary groups other than citespec-cli.
+validate_existing_portal_account() {
+    local passwd_entry uid gid home shell primary_group group status shell_ok=0
+    passwd_entry=$(getent passwd "$PORTAL_USER" 2>/dev/null || true)
+    [ -n "$passwd_entry" ] || fail "could not read the existing $PORTAL_USER account"
+    IFS=: read -r _ _ uid gid _ home shell <<<"$passwd_entry"
+    case "$uid" in
+        ''|*[!0-9]*) fail "existing $PORTAL_USER has a non-numeric UID: $uid" ;;
+    esac
+    if [ "$uid" -eq 0 ]; then
+        fail "existing $PORTAL_USER has UID 0; remove it and let the installer create the service account"
+    fi
+    if [ "$uid" -ge 1000 ]; then
+        fail "existing $PORTAL_USER has UID $uid outside the system range (1-999); remove or rename the interactive account before installing"
+    fi
+    primary_group=$(getent group "$gid" 2>/dev/null | cut -d: -f1 || true)
+    if [ "$primary_group" != "$PORTAL_USER" ]; then
+        fail "existing $PORTAL_USER has primary group '${primary_group:-<missing>}', expected '$PORTAL_USER'"
+    fi
+    case "$shell" in
+        /bin/false|/usr/bin/false|/sbin/false|/usr/sbin/false|/bin/nologin|/usr/bin/nologin|/sbin/nologin|/usr/sbin/nologin)
+            shell_ok=1
+            ;;
+    esac
+    if [ "$shell_ok" -ne 1 ]; then
+        fail "existing $PORTAL_USER has interactive login shell '$shell'; use a non-interactive system account"
+    fi
+    if [ "$home" != "$PORTAL_STATE_DIR" ]; then
+        fail "existing $PORTAL_USER has home '$home', expected '$PORTAL_STATE_DIR'; fix it before installing"
+    fi
+    for group in $(id -nG "$PORTAL_USER" 2>/dev/null); do
+        case "$group" in
+            "$PORTAL_USER"|citespec-cli) ;;
+            *)
+                fail "existing $PORTAL_USER is in group '$group'; only its primary group and citespec-cli are allowed"
+                ;;
+        esac
+    done
+    if have passwd; then
+        status=$(passwd -S "$PORTAL_USER" 2>/dev/null | awk 'NR == 1 {print $2}')
+        case "$status" in
+            L|LK) ;;
+            *)
+                fail "existing $PORTAL_USER has password status '${status:-unknown}'; lock the password before installing"
+                ;;
+        esac
+    fi
+    if have sudo && sudo -n -l -U "$PORTAL_USER" >/dev/null 2>&1; then
+        fail "existing $PORTAL_USER has sudo privileges; remove them before installing"
+    fi
 }
 
 run() {
@@ -193,18 +482,210 @@ reload_sshd() {
     fi
 }
 
+write_workspace_dropin() {
+    local destination=$1
+    shift
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/citespec-workspace.XXXXXX") \
+        || fail "could not create workspace drop-in temp file: $destination"
+    {
+        printf '[Service]\n'
+        printf '%s\n' "$@"
+    } > "$tmp" || fail "could not write workspace drop-in: $destination"
+    install_file 0644 "$tmp" "$destination"
+    rm -f -- "$tmp"
+}
+
+# The static units hard-code the amax workspace.  When this host uses another
+# server.workspace_root, override every place the path appears: the sandbox
+# path lists, the log-rotation and disk-check ExecStart, and the provisioning
+# executor's managed-root variable.
+install_workspace_dropins() {
+    local root=$1
+    local dropin
+    for dropin in "$BROKER_WORKSPACE_DROPIN" "$LOG_WORKSPACE_DROPIN" \
+                  "$DISK_WORKSPACE_DROPIN" "$PROVISION_WORKSPACE_DROPIN"; do
+        run install -d -o root -g root -m 0755 "$(dirname "$dropin")"
+    done
+    write_workspace_dropin "$BROKER_WORKSPACE_DROPIN" \
+        "ReadWritePaths=$root"
+    write_workspace_dropin "$LOG_WORKSPACE_DROPIN" \
+        "ExecStart=" \
+        "ExecStart=/usr/local/sbin/citespec-rotate-job-logs --workspace-root $root --max-bytes 104857600 --keep 3" \
+        "ReadWritePaths=" \
+        "ReadWritePaths=$root"
+    write_workspace_dropin "$DISK_WORKSPACE_DROPIN" \
+        "ExecStart=" \
+        "ExecStart=/usr/local/sbin/citespec-check-disk --path $root --warn-percent 85 --crit-percent 95 --min-free-gb 200" \
+        "ReadOnlyPaths=" \
+        "ReadOnlyPaths=$root"
+    write_workspace_dropin "$PROVISION_WORKSPACE_DROPIN" \
+        "Environment=CITESPEC_RESOURCE_WORKSPACE_ROOT=$root" \
+        "ReadWritePaths=" \
+        "ReadWritePaths=/etc /home $root /var/lib/citespec-resource/provision"
+}
+
+remove_workspace_dropins() {
+    local dropin
+    for dropin in "$BROKER_WORKSPACE_DROPIN" "$LOG_WORKSPACE_DROPIN" \
+                  "$DISK_WORKSPACE_DROPIN" "$PROVISION_WORKSPACE_DROPIN"; do
+        if [ -e "$dropin" ] || [ -L "$dropin" ]; then
+            note "removing obsolete workspace drop-in: $dropin"
+            backup_file "$dropin"
+            run rm -f -- "$dropin"
+        fi
+    done
+}
+
+restore_venv() {
+    [ "$VENV_SWITCHED" -eq 1 ] || return 0
+    printf '[rollback] restoring previous Python environment\n' >&2
+    case "$VENV_PREVIOUS_KIND" in
+        link)
+            ln -sfn -- "$VENV_PREVIOUS_LINK" "$VENV" \
+                || warn "could not restore the previous .venv symlink"
+            ;;
+        dir)
+            rm -f -- "$VENV" || true
+            mv -- "$VENV_PREVIOUS" "$VENV" \
+                || warn "could not restore the previous .venv directory"
+            ;;
+        none)
+            rm -f -- "$VENV" || true
+            ;;
+    esac
+    # The newly built environment is no longer referenced; keep the previous
+    # one (restored above) and discard only the failed release.
+    if [ -n "$VENV_TARGET" ] && [ -d "$VENV_TARGET" ]; then
+        rm -rf -- "$VENV_TARGET" || true
+    fi
+    VENV_SWITCHED=0
+}
+
+cleanup_venv_staging() {
+    if [ -n "$VENV_STAGING" ] && [ -d "$VENV_STAGING" ]; then
+        rm -rf -- "$VENV_STAGING" || true
+    fi
+    # A failure between promoting the staging directory and switching .venv
+    # leaves an unreferenced release directory behind.  It can never be the
+    # active environment in that state, so discard it.
+    if [ "$VENV_SWITCHED" -eq 0 ] && [ -n "$VENV_TARGET" ] && [ -d "$VENV_TARGET" ]; then
+        rm -rf -- "$VENV_TARGET" || true
+    fi
+}
+
+# Replace /opt/citespec-resource/.venv only after the new environment passed its
+# smoke test.  A real directory is moved aside; an existing symlink target is
+# recorded and recreated on rollback.  Services must already be stopped.
+switch_venv() {
+    local tmp_link=$VENV.tmp-$$
+    if [ -L "$VENV" ]; then
+        VENV_PREVIOUS_LINK=$(readlink "$VENV") \
+            || fail "could not read the existing .venv symlink"
+        VENV_PREVIOUS_KIND=link
+    elif [ -d "$VENV" ]; then
+        VENV_PREVIOUS="$VENVS_DIR/legacy-$(date +%Y%m%d%H%M%S)-$$"
+        mv -- "$VENV" "$VENV_PREVIOUS" \
+            || fail "could not move the previous Python environment aside"
+        VENV_PREVIOUS_KIND=dir
+        VENV_SWITCHED=1
+    else
+        VENV_PREVIOUS_KIND=none
+    fi
+    if ! ln -s -- "$VENV_TARGET" "$tmp_link"; then
+        restore_venv
+        fail "could not create the new .venv symlink"
+    fi
+    if ! mv -T -- "$tmp_link" "$VENV"; then
+        rm -f -- "$tmp_link" || true
+        restore_venv
+        fail "could not activate the new Python environment"
+    fi
+    VENV_SWITCHED=1
+}
+
+# Read server.state_db from an already-installed config without importing the
+# package (the old venv may predate this release).
+existing_state_db() {
+    local config=$1
+    [ -f "$config" ] || return 0
+    "$PYTHON_BIN" - "$config" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        data = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(0)
+value = data.get("server", {}).get("state_db", "")
+print(value if isinstance(value, str) else "")
+PY
+}
+
+# One consistent, verified snapshot of every database and the spool, created
+# with the same code path as the scheduled backup.  Writers must already be
+# stopped; --no-quiesce prevents this invocation from restarting them.
+take_preupgrade_snapshot() {
+    local state_db=$1
+    local parent="$BACKUP_DIR/snapshots"
+    local output
+    [ -n "$state_db" ] && [ -f "$state_db" ] || return 0
+    [ -n "${SNAPSHOT_PYTHON:-}" ] && [ -x "$SNAPSHOT_PYTHON" ] \
+        || fail "cannot take a consistent pre-upgrade snapshot: installed Python environment is missing"
+
+    run install -d -o root -g root -m 0700 "$parent"
+    note "taking consistent pre-upgrade snapshot (state, intake, portal, spool)"
+    output=$(PYTHONPATH="$REPO_ROOT/src" "$SNAPSHOT_PYTHON" -m citespec_resource.backup backup \
+        --config "$CONFIG_FILE" \
+        --backup-root "$parent" \
+        --keep 0 \
+        --no-quiesce \
+        --json) || fail "pre-upgrade snapshot failed; refusing to continue"
+    SNAPSHOT_DIR=$(printf '%s' "$output" | "$PYTHON_BIN" -c \
+        'import json, sys; print(json.load(sys.stdin)["backup"])') \
+        || fail "could not parse pre-upgrade snapshot output"
+    [ -f "$SNAPSHOT_DIR/manifest.json" ] \
+        || fail "pre-upgrade snapshot has no manifest: $SNAPSHOT_DIR"
+    ok "pre-upgrade snapshot: $SNAPSHOT_DIR"
+}
+
+restore_preupgrade_snapshot() {
+    [ -n "${SNAPSHOT_DIR:-}" ] || return 0
+    [ -f "$SNAPSHOT_DIR/manifest.json" ] || {
+        warn "pre-upgrade snapshot is missing its manifest: $SNAPSHOT_DIR"
+        return 0
+    }
+    printf '[rollback] restoring databases and spool from %s\n' "$SNAPSHOT_DIR" >&2
+    # Use the restored (old) environment for its dependencies; the source tree
+    # supplies this release's restore implementation.
+    PYTHONPATH="$REPO_ROOT/src" "$VENV/bin/python" -m citespec_resource.backup restore \
+        "$SNAPSHOT_DIR" \
+        --config "$CONFIG_FILE" \
+        --yes \
+        --json >/dev/null \
+        || warn "could not restore the pre-upgrade snapshot automatically; restore manually with: PYTHONPATH=$REPO_ROOT/src $VENV/bin/python -m citespec_resource.backup restore $SNAPSHOT_DIR --config $CONFIG_FILE --yes"
+}
+
 rollback() {
     local code=${1:-$?}
     local path
     local rel
+    local broker_active=0
     if [ "$INSTALL_COMPLETE" -eq 1 ] || [ "$ROLLBACK_ARMED" -eq 0 ]; then
         return "$code"
     fi
-    trap - EXIT
-    printf '\n[rollback] installation failed (exit %s); restoring previous files\n' "$code" >&2
-    if [ "$BROKER_START_ATTEMPTED" -eq 1 ]; then
-        systemctl stop citespec-resource-broker.service 2>/dev/null || true
-    fi
+    trap - EXIT INT TERM HUP
+    printf '\n[rollback] installation failed (exit %s); restoring previous state\n' "$code" >&2
+    # Timers first, then every service this installer may have started.  Without
+    # this a newly enabled timer/service keeps running against restored files.
+    stop_managed_units
+    disable_new_units
+    # Put the old interpreter back before restoring files that its service
+    # units point at.  A failed upgrade must never leave old units running a
+    # partially updated environment.
+    restore_venv
+    cleanup_venv_staging
     for path in "${BACKED_UP[@]}"; do
         rel=${path#/}
         if [ -f "$BACKUP_DIR/$rel.absent" ]; then
@@ -214,11 +695,16 @@ rollback() {
             cp -a -- "$BACKUP_DIR/$rel" "$path" || true
         fi
     done
-    BROKER_ACTIVE_NOW=0
-    if systemctl is-active --quiet citespec-resource-broker.service 2>/dev/null; then
-        BROKER_ACTIVE_NOW=1
+    if unit_is_active citespec-resource-broker.service; then
+        broker_active=1
     fi
-    if [ -n "$STATE_DB" ] && [ "$BROKER_ACTIVE_NOW" -eq 0 ]; then
+    if [ -n "$SNAPSHOT_DIR" ]; then
+        if [ "$broker_active" -eq 0 ]; then
+            restore_preupgrade_snapshot
+        else
+            warn "broker is still running; leaving the consistent snapshot unrestored"
+        fi
+    elif [ -n "$STATE_DB" ] && [ "$broker_active" -eq 0 ]; then
         if [ "$STATE_DB_EXISTED" -eq 1 ] && [ -f "$STATE_DB_BACKUP" ]; then
             rm -f -- "$STATE_DB-wal" "$STATE_DB-shm" || true
             cp -a -- "$STATE_DB_BACKUP" "$STATE_DB" || true
@@ -228,15 +714,14 @@ rollback() {
     elif [ -n "$STATE_DB" ]; then
         warn "broker is still running; leaving SQLite state in place during rollback"
     fi
-    systemctl daemon-reload 2>/dev/null || true
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --action=change --sysname-match='nvidia*' 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    restore_unit_state
+    verify_nvidia_state
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --action=change --sysname-match='nvidia*' >/dev/null 2>&1 || true
     reload_sshd
-    if [ "$BROKER_WAS_ENABLED" -eq 0 ]; then
-        systemctl disable citespec-resource-broker.service 2>/dev/null || true
-    fi
-    if [ "$START" -eq 1 ] && [ "$BROKER_WAS_ACTIVE" -eq 1 ]; then
-        systemctl restart citespec-resource-broker.service 2>/dev/null || true
+    if [ "$ROLLBACK_MISMATCH" -ne 0 ]; then
+        warn "rollback completed with state mismatches; inspect $BACKUP_DIR before retrying"
     fi
     printf '[rollback] restored %s path(s); backup: %s\n' "${#BACKED_UP[@]}" "$BACKUP_DIR" >&2
     exit "$code"
@@ -250,6 +735,22 @@ on_exit() {
     exit "$code"
 }
 
+# An interrupted installer must roll back just like a failed command: TERM/INT/
+# HUP arrive during package sync or unit replacement, not only as a command
+# failure.  128+signal preserves the conventional exit status.
+on_signal() {
+    local code=$1
+    trap - INT TERM HUP
+    rollback "$code"
+    exit "$code"
+}
+
+# Test hook: source this file with CITESPEC_INSTALL_LIB_ONLY=1 to exercise the
+# rollback helpers without touching the host.  Real runs continue below.
+if [ "${CITESPEC_INSTALL_LIB_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
@@ -257,6 +758,7 @@ while [ "$#" -gt 0 ]; do
         --skip-preflight) SKIP_PREFLIGHT=1 ;;
         --start) START=1 ;;
         --allow-active) ALLOW_ACTIVE=1 ;;
+        --maintenance-window) MAINTENANCE_WINDOW=1 ;;
         --force-config) FORCE_CONFIG=1 ;;
         --no-timers) ENABLE_TIMERS=0 ;;
         --config-source)
@@ -372,20 +874,28 @@ if [ "$CONFIG_DEPLOYMENT_ALLOWED" = "true" ] && [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    if systemctl is-active --quiet citespec-resource-broker.service 2>/dev/null; then
-        BROKER_WAS_ACTIVE=1
-    fi
-    if systemctl is-enabled --quiet citespec-resource-broker.service 2>/dev/null; then
-        BROKER_WAS_ENABLED=1
+    # The maintenance-window refusal must leave the host untouched.  Capture
+    # the read-only unit state first and fail before the backup directory,
+    # rollback trap, or any service is stopped.
+    capture_unit_state
+    if { [ "${#UNIT_WAS_ACTIVE[@]}" -gt 0 ] || [ "${#TIMER_WAS_ACTIVE[@]}" -gt 0 ]; } \
+        && [ "$MAINTENANCE_WINDOW" -ne 1 ]; then
+        fail "existing Citespec units are active; re-run with --maintenance-window to stop writers and take a consistent snapshot (no host changes were made)"
     fi
     install -d -o root -g root -m 0700 "$BACKUP_ROOT" \
         || fail "could not secure backup root: $BACKUP_ROOT"
     BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
     mkdir -p "$BACKUP_DIR" || fail "could not create backup directory: $BACKUP_DIR"
     chmod 0700 "$BACKUP_DIR" || fail "could not secure backup directory: $BACKUP_DIR"
+    NVIDIA_STATE_FILE="$BACKUP_DIR/nvidia-state.tsv"
+    record_nvidia_state
     ROLLBACK_ARMED=1
     trap on_exit EXIT
+    trap 'on_signal 129' HUP
+    trap 'on_signal 130' INT
+    trap 'on_signal 143' TERM
     note "transactional backup: $BACKUP_DIR"
+    note "unit rollback state: ${UNIT_WAS_ACTIVE[*]:-none active}; ${UNIT_WAS_ENABLED[*]:-none enabled}"
 else
     note "dry-run: no rollback backup is created"
 fi
@@ -394,6 +904,38 @@ note "repo: $REPO_ROOT"
 note "config source: $CONFIG_SOURCE"
 note "python: $PYTHON_BIN ($PY_VERSION)"
 note "venv: $VENV"
+
+# Read-only checks come before any host mutation.  A refused upgrade must not
+# leave new groups, accounts, or group memberships behind.
+if getent passwd "$PORTAL_USER" >/dev/null 2>&1; then
+    validate_existing_portal_account
+    ok "existing $PORTAL_USER matches the service-account policy"
+fi
+
+PORTAL_GROUP_MEMBERS=$(getent group "$PORTAL_USER" 2>/dev/null | cut -d: -f4 || true)
+if [ -n "$PORTAL_GROUP_MEMBERS" ]; then
+    fail "group $PORTAL_USER has human members: $PORTAL_GROUP_MEMBERS; remove them before installing"
+fi
+
+if [ -n "$(effective_members citespec-gpu)" ]; then
+    fail "citespec-gpu has effective members; remove them before installing"
+fi
+ok "citespec-gpu has no effective members"
+
+while IFS= read -r username; do
+    [ -n "$username" ] || continue
+    for forbidden in sudo docker citespec-gpu video render citespec-admins; do
+        if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "$forbidden"; then
+            fail "member $username is in forbidden group $forbidden"
+        fi
+    done
+done < <(effective_members citespec-members)
+while IFS= read -r username; do
+    [ -n "$username" ] || continue
+    if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-members; then
+        fail "admin $username is also in citespec-members; ForceCommand would apply"
+    fi
+done < <(effective_members citespec-admins)
 
 for group in "${CITESPEC_RESOURCE_GROUPS[@]}"; do
     if getent group "$group" >/dev/null 2>&1; then
@@ -432,55 +974,78 @@ else
     note "adding $PORTAL_USER to citespec-cli for broker socket access"
     run usermod -aG citespec-cli "$PORTAL_USER"
 fi
-if id -nG "$PORTAL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-admins; then
-    fail "$PORTAL_USER must not be a member of citespec-admins"
-fi
-
-if [ -n "$(effective_members citespec-gpu)" ]; then
-    fail "citespec-gpu has effective members; remove them before installing"
-fi
-ok "citespec-gpu has no effective members"
-
-while IFS= read -r username; do
-    [ -n "$username" ] || continue
-    for forbidden in sudo docker citespec-gpu video render citespec-admins; do
-        if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "$forbidden"; then
-            fail "member $username is in forbidden group $forbidden"
-        fi
-    done
-done < <(effective_members citespec-members)
-while IFS= read -r username; do
-    [ -n "$username" ] || continue
-    if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-members; then
-        fail "admin $username is also in citespec-members; ForceCommand would apply"
-    fi
-done < <(effective_members citespec-admins)
 
 if [ "$DRY_RUN" -eq 0 ]; then
+    # An upgrade replaces the interpreter and migrates databases.  Refuse to do
+    # that behind the back of a running broker: the operator must acknowledge a
+    # maintenance window, and every writer is stopped before the snapshot.
+    if [ "${#UNIT_WAS_ACTIVE[@]}" -gt 0 ] || [ "${#TIMER_WAS_ACTIVE[@]}" -gt 0 ]; then
+        note "maintenance window: stopping managed writers before replacing the environment"
+        stop_managed_units
+        SERVICES_STOPPED=1
+    fi
+    if [ -f "$CONFIG_FILE" ]; then
+        EXISTING_STATE_DB=$(existing_state_db "$CONFIG_FILE") \
+            || fail "could not read server.state_db from $CONFIG_FILE"
+        if [ -n "$EXISTING_STATE_DB" ] && [ -f "$EXISTING_STATE_DB" ]; then
+            SNAPSHOT_PYTHON="$VENV/bin/python"
+            take_preupgrade_snapshot "$EXISTING_STATE_DB"
+        fi
+    fi
+
     run install -d -o root -g root -m 0755 "$PREFIX"
+    run install -d -o root -g root -m 0755 "$VENVS_DIR"
+    RELEASE_VERSION=$("$PYTHON_BIN" - "$REPO_ROOT/pyproject.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    print(tomllib.load(handle)["project"]["version"])
+PY
+    ) || fail "could not read the project version"
+    VENV_TARGET="$VENVS_DIR/venv-$RELEASE_VERSION-$(date +%Y%m%d%H%M%S)-$$"
+    VENV_STAGING="$VENVS_DIR/.staging-$RELEASE_VERSION-$(date +%Y%m%d%H%M%S)-$$"
     if have uv; then
-        note "installing package with uv sync --frozen --no-dev --no-editable --extra gui --extra portal"
-        run env UV_PROJECT_ENVIRONMENT="$VENV" uv sync \
+        note "installing package into $VENV_STAGING with uv sync --frozen --no-dev --no-editable --extra gui --extra portal"
+        run env UV_PROJECT_ENVIRONMENT="$VENV_STAGING" uv sync \
             --frozen --no-dev --no-editable --extra gui --extra portal --project "$REPO_ROOT" --python "$PYTHON_BIN"
     else
         warn "uv is not installed; falling back to pip (versions may drift)"
-        if [ ! -x "$VENV/bin/python" ]; then
-            run "$PYTHON_BIN" -m venv "$VENV"
-        fi
-        run "$VENV/bin/python" -m pip install --upgrade pip
-        run "$VENV/bin/python" -m pip install "$REPO_ROOT[gui,portal]"
+        run "$PYTHON_BIN" -m venv "$VENV_STAGING"
+        run "$VENV_STAGING/bin/python" -m pip install --upgrade pip
+        run "$VENV_STAGING/bin/python" -m pip install "$REPO_ROOT[gui,portal]"
     fi
-    [ -x "$VENV/bin/python" ] || fail "venv was not created: $VENV"
+    # Smoke-test the release before it becomes visible through .venv.  A failed
+    # dependency sync must leave the previous environment and services intact.
+    [ -x "$VENV_STAGING/bin/python" ] || fail "venv was not created: $VENV_STAGING"
+    "$VENV_STAGING/bin/python" -c 'import citespec_resource' \
+        || fail "new Python environment cannot import citespec_resource"
+    [ -x "$VENV_STAGING/bin/citespec-resource" ] || fail "citespec-resource entry point is missing"
+    [ -x "$VENV_STAGING/bin/citespec-resource-login" ] || fail "citespec-resource-login entry point is missing"
+    "$VENV_STAGING/bin/citespec-resource" version >/dev/null \
+        || fail "new Python environment failed its version smoke test"
+    if [ -x "$VENV_STAGING/bin/python" ] && "$VENV_STAGING/bin/python" -m pip --version >/dev/null 2>&1; then
+        "$VENV_STAGING/bin/python" -m pip check >/dev/null \
+            || fail "new Python environment has an inconsistent dependency set"
+    fi
+    mv -- "$VENV_STAGING" "$VENV_TARGET" \
+        || fail "could not promote the new Python environment"
+    VENV_STAGING=""
+    switch_venv
+    ok "activated Python environment: $VENV_TARGET"
+    [ -x "$VENV/bin/python" ] || fail "venv was not activated: $VENV"
     [ -x "$VENV/bin/citespec-resource" ] || fail "citespec-resource entry point is missing"
     [ -x "$VENV/bin/citespec-resource-login" ] || fail "citespec-resource-login entry point is missing"
 else
     run_shell "install -d -o root -g root -m 0755 $PREFIX"
+    run_shell "install -d -o root -g root -m 0755 $VENVS_DIR"
     if have uv; then
-        run_shell "UV_PROJECT_ENVIRONMENT=$VENV uv sync --frozen --no-dev --no-editable --extra gui --extra portal --project $REPO_ROOT --python $PYTHON_BIN"
+        run_shell "UV_PROJECT_ENVIRONMENT=$VENVS_DIR/venv-<version> uv sync --frozen --no-dev --no-editable --extra gui --extra portal --project $REPO_ROOT --python $PYTHON_BIN"
+        run_shell "ln -sfn $VENVS_DIR/venv-<version> $VENV"
     else
-        run_shell "$PYTHON_BIN -m venv $VENV"
-        run_shell "$VENV/bin/python -m pip install --upgrade pip"
-        run_shell "$VENV/bin/python -m pip install $REPO_ROOT[gui,portal]"
+        run_shell "$PYTHON_BIN -m venv $VENVS_DIR/venv-<version>"
+        run_shell "$VENVS_DIR/venv-<version>/bin/python -m pip install $REPO_ROOT[gui,portal]"
+        run_shell "ln -sfn $VENVS_DIR/venv-<version> $VENV"
     fi
 fi
 
@@ -497,6 +1062,12 @@ install_file 0755 "$SCRIPT_DIR/membership/provision_executor.py" "$PROVISION_EXE
 ok "root provisioning executor installed: $PROVISION_EXECUTOR_INSTALL"
 install_file 0755 "$SCRIPT_DIR/fix_gpu_permissions.sh" "$GPU_FIX_INSTALL"
 ok "GPU device permission fixer installed: $GPU_FIX_INSTALL"
+install_file 0755 "$SCRIPT_DIR/verify_gpu_isolation.sh" "$GPU_ISOLATION_INSTALL"
+ok "GPU isolation verifier installed: $GPU_ISOLATION_INSTALL"
+install_file 0755 "$SCRIPT_DIR/verify_portal_network.sh" "$PORTAL_AUDIT_INSTALL"
+install_file 0644 "$SCRIPT_DIR/portal_network_audit.py" "$PORTAL_AUDIT_PY_INSTALL"
+install_file 0755 "$SCRIPT_DIR/enable_portal.sh" "$ENABLE_PORTAL_INSTALL"
+ok "Portal network acceptance tooling installed: $ENABLE_PORTAL_INSTALL"
 
 # NVIDIA's nodes on this host are not udev-managed and nvidia-smi chmods them
 # back to 0666 root:root on every invocation.  Install the narrow LD_PRELOAD
@@ -505,6 +1076,12 @@ ok "GPU device permission fixer installed: $GPU_FIX_INSTALL"
 # setuid/setgid bits are removed because members must not create host nodes.
 run install -d -o root -g root -m 0755 "$GPU_SHIM_DIR"
 install_file 0644 "$SCRIPT_DIR/nvidia/citespec_nvidia_chmod_shim.c" "$GPU_SHIM_SRC"
+if [ "$DRY_RUN" -eq 0 ]; then
+    # Record the .real targets before the move so rollback removes one that did
+    # not exist before, or restores the exact binary that did.
+    backup_file "$NVIDIA_SMI_REAL"
+    backup_file "$NVIDIA_MODPROBE_REAL"
+fi
 if [ "$DRY_RUN" -eq 0 ]; then
     CC_BIN=$(command -v gcc 2>/dev/null || command -v cc 2>/dev/null || true)
     [ -n "$CC_BIN" ] || fail "gcc or cc is required to build the NVIDIA chmod shim"
@@ -557,7 +1134,7 @@ else
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    note "would validate $CONFIG_FILE and create its workspace_root"
+    note "would validate $CONFIG_FILE, create its workspace_root, and install workspace unit drop-ins if it differs"
 else
     CITESPEC_RESOURCE_CONFIG="$CONFIG_FILE" "$VENV/bin/python" -c \
         'from citespec_resource.config import load_config; load_config(__import__("os").environ["CITESPEC_RESOURCE_CONFIG"])' \
@@ -591,7 +1168,11 @@ print("true" if same else "false")
 PY
 ) || fail "could not validate workspace_root against the systemd unit path"
     if [ "$WORKSPACE_MATCH" != "true" ]; then
-        fail "server.workspace_root '$WORKSPACE_ROOT' does not match the static systemd workspace '$SYSTEMD_WORKSPACE_ROOT'; update deploy/systemd units for the new path before installing"
+        note "workspace root '$WORKSPACE_ROOT' differs from the static systemd path; installing unit drop-ins"
+        install_workspace_dropins "$WORKSPACE_ROOT"
+        ok "workspace systemd drop-ins installed for broker, logrotate, disk-check, and provision"
+    else
+        remove_workspace_dropins
     fi
     run install -d -o root -g root -m 0755 "$WORKSPACE_ROOT"
     ok "workspace root ready: $WORKSPACE_ROOT"
@@ -682,6 +1263,8 @@ else
         || fail "could not read onboarding.intake_db from config"
     run install -d -o "$INTAKE_USER" -g "$INTAKE_USER" -m 0700 "$(dirname "$INTAKE_DB")"
     backup_file "$INTAKE_DB"
+    backup_file "$INTAKE_DB-wal"
+    backup_file "$INTAKE_DB-shm"
     (umask 077; "$VENV/bin/python" - "$INTAKE_DB" <<'PY'
 import sys
 
@@ -707,6 +1290,8 @@ PY
         || fail "could not read portal.db_path from config"
     run install -d -o "$PORTAL_USER" -g "$PORTAL_USER" -m 0750 "$(dirname "$PORTAL_DB")"
     backup_file "$PORTAL_DB"
+    backup_file "$PORTAL_DB-wal"
+    backup_file "$PORTAL_DB-shm"
     (umask 077; "$VENV/bin/python" - "$PORTAL_DB" <<'PY'
 import sys
 
@@ -826,14 +1411,24 @@ run systemctl enable citespec-resource-intake.service
 run systemctl enable citespec-resource-provision.path
 run systemctl enable citespec-gpu-permissions.service
 if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
-    run systemctl enable citespec-resource-portal.service
-    note "portal unit enabled but not started; start it only after DNS/VPN/TLS acceptance"
+    # Never enable the unit here: enablement alone makes it start on the next
+    # boot, before DNS/TLS/nginx/VPN acceptance.  The unit also has a
+    # ConditionPathExists gate; deploy/enable_portal.sh writes the marker only
+    # after a fail-closed audit.
+    note "portal unit installed but NOT enabled; run $ENABLE_PORTAL_INSTALL --yes --approved-cidr <CIDR> after DNS/VPN/TLS acceptance"
 else
     note "portal unit installed but left disabled because [portal].enabled=false"
 fi
 ok "broker, intake, provisioning, GPU-permission, and portal units installed"
 run "$GPU_FIX_INSTALL"
 ok "current GPU device permissions applied"
+if [ "$DRY_RUN" -eq 0 ]; then
+    # Safe probe point: the wrapper/shim exist and the broker-only policy has
+    # been applied.  The probe fails if nvidia-smi changes device mode/owner.
+    bash "$SCRIPT_DIR/preflight.sh" --probe-nvidia --nvidia-only \
+        || fail "post-install NVIDIA probe failed; do not start the broker"
+    ok "post-install NVIDIA probe passed"
+fi
 
 run install -d -m 0755 /usr/local/bin
 backup_file "$LOGIN_WRAPPER"
@@ -937,7 +1532,6 @@ if [ "$START" -eq 1 ] && [ "$AUDIT_FAILED" -eq 1 ]; then
     fail "legacy audit failed; resolve critical findings before starting the broker"
 fi
 if [ "$START" -eq 1 ]; then
-    BROKER_START_ATTEMPTED=1
     run systemctl restart citespec-resource-broker.service
     run systemctl restart citespec-resource-intake.service
     run systemctl restart citespec-resource-provision.path
@@ -950,12 +1544,15 @@ if [ "$START" -eq 1 ]; then
         ok "broker and intake started (${MODE:-unknown} mode)"
     fi
     if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
-        note "portal is enabled but was not started; start it after DNS/VPN/TLS acceptance"
+        note "portal remains disabled until the network acceptance gate is passed"
     fi
 else
     note "broker installed but not started; use: systemctl start citespec-resource-broker"
+    if [ "$SERVICES_STOPPED" -eq 1 ]; then
+        note "previously active Citespec units remain stopped; start them explicitly after verification"
+    fi
     if [ "$CONFIG_PORTAL_ENABLED" = "true" ]; then
-        note "portal enabled; use: systemctl start citespec-resource-portal"
+        note "portal is not enabled; run $ENABLE_PORTAL_INSTALL after network acceptance"
     else
         note "portal disabled; use: systemctl start citespec-resource-portal after enabling [portal]"
     fi

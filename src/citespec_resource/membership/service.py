@@ -938,6 +938,46 @@ def recover_stale_operations(
     return failed
 
 
+def reconcile_restored_operations(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    """Mark every non-terminal operation from a restored backup retryable.
+
+    A restore is a point-in-time rollback: an operation that was ``pending`` or
+    ``running`` in the snapshot has no live executor waiting for it.  It is
+    failed closed (and a member still in ``provisioning`` moves to
+    ``provision_failed``) so an administrator must explicitly retry it instead
+    of the broker assuming an unobserved result.
+    """
+
+    rows = connection.execute(
+        "SELECT operation_id FROM member_operations "
+        "WHERE status IN ('pending', 'running') ORDER BY created_at, operation_id"
+    ).fetchall()
+    reconciled: list[dict[str, str]] = []
+    for row in rows:
+        operation = member_store.get_operation(connection, str(row["operation_id"]))
+        previous = str(operation["status"])
+        _fail_operation(
+            connection,
+            operation,
+            "stage=restore: operation was not terminal when the backup was restored; "
+            "retry explicitly",
+            now=now,
+        )
+        reconciled.append(
+            {
+                "operation_id": str(operation["operation_id"]),
+                "action": str(operation["action"]),
+                "previous_status": previous,
+                "status": "failed",
+            }
+        )
+    return reconciled
+
+
 def _disable_operation(
     connection: sqlite3.Connection,
     *,
@@ -1512,6 +1552,7 @@ def import_legacy_member(
             "video",
             "render",
             "citespec-admins",
+            "citespec-portal",
             "root",
         }
         for group in sorted(privileged):

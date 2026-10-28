@@ -67,6 +67,19 @@ jobs:
             --version "${GITHUB_REF_NAME#v}" \
             --output release-assets/citespec-resource-manifest.json \
             --base-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+      - name: Add standalone first-install verifier
+        run: |
+          cp packaging/verify_release.py packaging/verify_release.sh \
+            packaging/verify_release.ps1 release-assets/
+          chmod +x release-assets/verify_release.sh
+      - name: Verify released full packages against the signed manifest
+        run: |
+          for platform in windows-x64 linux-x64; do
+            python packaging/verify_release.py \
+              --manifest release-assets/citespec-resource-manifest.json \
+              --package "release-assets/citespec-resource-${GITHUB_REF_NAME#v}-${platform}-full.zip" \
+              --platform "$platform"
+          done
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:

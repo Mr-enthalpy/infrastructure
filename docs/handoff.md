@@ -11,6 +11,36 @@
 > docs/reports/member-onboarding-and-ux.md（含差距表、实际测试结果与
 > **D1=完成 / D2=核心实机验收完成 / D3=未开放** 结论）。
 
+## 0.4 2026-10-27 部署阻断项与测试服务器准备（PR #1）
+
+- 分支 `fix/p1-pre-deploy`；客户端版本提升为 `0.1.1`，`v0.1.0` tag/资产不变。
+- 安装器改为版本化 venv + staging smoke test + 原子 `.venv` 切换；已 active 的 unit
+  需要 `--maintenance-window`，安装器先停写入者，再用 `backup.py --no-quiesce`
+  生成并校验一致快照；回滚恢复旧 venv 和快照。
+- 备份 unit 增加 state/intake/portal 目录的 `ReadWritePaths`，使
+  `wal_checkpoint(TRUNCATE)` 在 `ProtectSystem=strict` 下可完成。
+- 客户端 `install.sh --verify` / `install.ps1 -Verify` 改为强制。
+- 非默认 `workspace_root` 通过 broker、logrotate、disk-check、provision 四份
+  `10-workspace.conf` drop-in 生效（路径列表、ExecStart、环境变量），不再硬失败。
+- Portal 安装后永不 enable；unit 以
+  `/etc/citespec-resource/portal-network-accepted` 为启动条件。新增
+  `portal_network_audit.py`、`verify_portal_network.sh --acceptance` 和
+  `enable_portal.sh`，审计通过后才写标记并 `systemctl enable --now`。
+- 新增 `verify_gpu_isolation.sh` 真机 P0 测试；active + development +
+  container sudo 在 `/etc/citespec-resource/gpu-isolation.ok` 缺失时被 config、
+  preflight 和 broker 拒绝。preflight 默认不调用 `nvidia-smi`，安装器在 wrapper
+  完成后执行一次 `--probe-nvidia --nvidia-only`。
+- 复审追加硬化：复用已有 `citespec-portal` 账号前 fail-closed 校验系统 UID、主组、
+  nologin shell、锁定密码、无 sudo、仅 `citespec-cli` 附加组；Broker 启动时复核
+  同一规则。维护窗口检查移到所有组/账号变更之前。GPU 隔离脚本在首次 chmod 前
+  设置 `MUTATION_STARTED`，中断或异常退出也恢复并复核设备状态。
+- 已知残余边界（P2）：应用仍信任来自 loopback 的 `X-Citespec-Client-IP`，宿主机
+  本地用户可直接连接 127.0.0.1 伪造审计 IP/限流键；开放 Portal 浏览器入口前需改为
+  权限受限 Unix socket 或可验证代理身份。Portal 保持禁用，不阻塞 monitor 升级。
+- 本地验证：`563 passed, 27 skipped`；Ruff、mypy、`bash -n deploy/*.sh` 通过。
+  尚未连接真实主机；一次性 VM 回滚演练、测试服务器 monitor 部署、备份/恢复、
+  Portal 网络验收和 GPU 5.6 真机测试仍需维护窗口。
+
 ## 0.3 2026-10-27 打包客户端、自动更新与 CI
 
 - 新增 `packaging/`：Windows/Linux x64 的 PyInstaller payload、稳定启动器、full zip、
@@ -393,6 +423,7 @@ git log --oneline -5
 bash -n deploy/preflight.sh
 bash -n deploy/install_server.sh
 bash -n deploy/verify_monitor_only.sh
+bash -n deploy/verify_portal_network.sh
 ```
 
 ### 步骤 3：变更前确认
@@ -414,8 +445,13 @@ bash -n deploy/verify_monitor_only.sh
 bash deploy/preflight.sh --config lab/resources.local.toml
 bash deploy/audit_legacy.sh --production
 bash deploy/verify_gpu_permissions.sh --json
+bash deploy/verify_portal_network.sh --nginx-root /etc/nginx
 bash deploy/verify_monitor_only.sh --member <member> --skip-snapshot
 ```
+
+`verify_portal_network.sh` 只读：检查 Portal/apply vhost 是否绑定具体私有地址、是否
+有 `allow <vpn-source-cidr>; ... deny all;`、是否只反代 loopback，以及 Portal
+unit/监听器的当前状态。Portal vhost 尚未部署时它会报告 warning，不会失败。
 
 同时保存：
 
@@ -427,8 +463,13 @@ systemctl show citespec-resource-broker \
 xfs_quota -x -c 'report -p -b -h' /data1
 ```
 
-上述命令均为只读。若 `preflight.sh`、GPU 审计、`nosuid` 或配额检查失败，停止，
-不得继续安装或切换到 active。
+上述命令除显式 NVIDIA 探测外均为只读。`preflight.sh` **默认不调用**
+`nvidia-smi`：以 root 调用会前后比较 `/dev/nvidia*` 的 mode/owner，而未安装 wrapper
+时该探测本身可能把节点重置为 `0666 root:root`。需要探测时先安装 wrapper，再显式
+使用 `--probe-nvidia`；安装器会在 wrapper 和权限修复完成后自动执行一次
+`--probe-nvidia --nvidia-only`。`--skip-nvidia` 是默认行为的显式写法，也会跳过
+compute process 查询，因此应在另一时刻单独确认没有训练进程。若 `preflight.sh`、
+GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切换到 active。
 
 ### 步骤 5：完整验收
 

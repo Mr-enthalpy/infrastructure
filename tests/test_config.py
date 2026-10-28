@@ -150,6 +150,23 @@ def test_enabled_portal_accepts_https_and_secure_cookie(tmp_path):
     assert cfg.portal.cookie_secure is True
 
 
+def test_portal_service_account_defaults_to_portal_group():
+    cfg = load_config(ROOT / "lab/resources.example.toml")
+    assert cfg.portal.service_account == cfg.groups.portal
+
+
+def test_portal_service_account_must_be_an_account_name(tmp_path):
+    path = _variant(
+        tmp_path,
+        (
+            'service_account = "citespec-portal"',
+            'service_account = "../citespec-portal"',
+        ),
+    )
+    with pytest.raises(ValueError, match="portal.service_account"):
+        load_config(path)
+
+
 def test_invalid_duration_is_rejected(tmp_path):
     text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
     text = text.replace("default_hours = 12", "default_hours = 40")
@@ -427,3 +444,22 @@ def test_active_development_profile_requires_storage_protection(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="docker_storage_budget_gb"):
         load_config(path)
+
+
+def test_active_development_sudo_requires_a_passing_gpu_isolation_test(tmp_path, monkeypatch):
+    text = (ROOT / "lab/resources.example.toml").read_text(encoding="utf-8")
+    text = text.replace('mode = "monitor"', 'mode = "active"')
+    text = text.replace("deployment_allowed = false", "deployment_allowed = true")
+    path = tmp_path / "active.toml"
+    path.write_text(text, encoding="utf-8")
+
+    marker = tmp_path / "gpu-isolation.ok"
+    monkeypatch.setenv("CITESPEC_GPU_ISOLATION_MARKER", str(marker))
+    with pytest.raises(ValueError, match="GPU isolation test"):
+        load_config(path)
+
+    marker.write_text("created_at=test\n", encoding="utf-8")
+    config = load_config(path)
+    assert config.policy.mode == "active"
+    assert config.policy.container_profile == "development"
+    assert config.policy.container_sudo is True

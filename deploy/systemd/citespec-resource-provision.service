@@ -20,7 +20,7 @@ ProtectSystem=strict
 # homes, so it needs real access to /home. It is not a general root shell: fixed
 # argv only, no network, no arbitrary paths or names from the broker.
 ProtectHome=false
-ReadWritePaths=/etc /home /home/data1/citespec-users /var/lib/citespec-resource/provision
+ReadWritePaths=/etc /home -/home/data1/citespec-users /var/lib/citespec-resource/provision
 PrivateTmp=true
 # The fixed executor must run setquota(8) against the workspace block device.
 # PrivateDevices would hide /dev/sdb1 and make project-quota provisioning fail.

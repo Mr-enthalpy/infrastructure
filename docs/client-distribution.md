@@ -15,6 +15,11 @@ VPN 内访问；客户端更新不改变 Portal 的启用状态。
 Ed25519 签名，payload 使用 SHA-256 校验。新版本先解压到临时目录，确认包含
 payload 后再原子替换 `current.json`，旧版本保留用于回滚。
 
+首次安装没有已安装的启动器可用，因此签名清单还包含 `first_install` 段：每个平台
+的 full zip、zip 内 `install.sh`/`install.ps1` 的 SHA-256 和大小。用户先运行
+`verify_release.py` 校验清单签名与 full zip，再用清单中的 `installer_sha256`
+通过 `--verify`/`-Verify` 认证安装脚本。
+
 本仓库固定嵌入更新公钥：
 
 ```
@@ -27,15 +32,29 @@ GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY`（base64 的 32 字节原始
 
 首个签名版本为
 [`v0.1.0`](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0)，
-包含 Windows/Linux x64 payload、full zip 和签名清单。
+包含 Windows/Linux x64 payload、full zip 和签名清单。`v0.1.0` 的 tag 和资产保持
+不变；当前分支的下一个客户端版本为 `0.1.1`，发布前不得替换或重发 `v0.1.0`。
+`--verify`/`-Verify` 是强制参数：缺失、格式错误或摘要不匹配都会在写入任何文件前
+退出。
 
 ## 2. Windows x64 首次安装
 
 1. 从 GitHub Release 下载
-   `citespec-resource-<version>-windows-x64-full.zip`。
-2. 解压后运行 `install.ps1`。默认安装到
+   `citespec-resource-<version>-windows-x64-full.zip`、
+   `citespec-resource-manifest.json` 和 `verify_release.py`/`verify_release.ps1`。
+2. 先校验完整包（需要 Python 3.11+ 与 `cryptography`）：
+
+   ```powershell
+   python verify_release.py `
+     --manifest citespec-resource-manifest.json `
+     --package citespec-resource-<version>-windows-x64-full.zip `
+     --platform windows-x64
+   ```
+
+   输出中的 `installer_sha256` 是清单签名的安装脚本摘要。
+3. 解压后运行 `install.ps1 -Verify <installer_sha256>`。默认安装到
    `%LOCALAPPDATA%\CitespecResource`，并把该目录加入当前用户的 `PATH`。
-3. 打开新的 PowerShell，运行：
+4. 打开新的 PowerShell，运行：
 
    ```powershell
    citespec-resource setup --server <服务器地址> --user <Linux 用户名>
@@ -49,14 +68,28 @@ GitHub Actions secret `CITESPEC_UPDATE_SIGNING_KEY`（base64 的 32 字节原始
 
 ## 3. Linux x64 首次安装
 
+从 Release 下载 full zip 和 `citespec-resource-manifest.json`（也可用
+`verify_release.sh` 代替 `python3 verify_release.py`）：
+
 ```bash
 unzip citespec-resource-<version>-linux-x64-full.zip -d citespec-resource
 cd citespec-resource
-bash install.sh
+python3 verify_release.py \
+  --manifest ../citespec-resource-manifest.json \
+  --package ../citespec-resource-<version>-linux-x64-full.zip \
+  --platform linux-x64
+bash install.sh --verify <installer_sha256>
 ```
 
-脚本默认安装到 `~/.local/opt/citespec-resource`，并在 `~/.local/bin` 建立
+`installer_sha256` 取自上一步输出（也就是签名清单的
+`first_install.linux-x64.installer_sha256`）。脚本默认安装到
+`~/.local/opt/citespec-resource`，并在 `~/.local/bin` 建立
 `citespec-resource` 软链接。确认 `~/.local/bin` 在 `PATH` 中后运行 `setup`。
+
+首次安装的残余信任缺口：校验器本身、清单和 zip 都从同一 HTTPS 源下载。若下载
+通道被完全控制，攻击者可以同时替换三者。发布页与应用商店之外应通过独立渠道公布
+`verify_release.py` 的 SHA-256（或公钥指纹），首次安装时人工比对；安装完成后，
+后续更新由启动器内置的签名公钥保护，不再依赖该初始通道。
 
 ## 4. 更新、检查与回滚
 
@@ -96,6 +129,11 @@ python packaging/build_client.py --platform linux-x64 --output dist
 
 - `citespec-resource-<version>-<platform>.zip`：更新 payload。
 - `citespec-resource-<version>-<platform>-full.zip`：首次安装包。
+- 签名清单中的 `first_install.<platform>`：full zip 与安装脚本的 SHA-256。
+
+发布 job 还会把独立的 `verify_release.py`、`verify_release.sh` 和
+`verify_release.ps1` 作为 Release 资产上传，并用签名清单自检两个平台的 full zip；
+缺少 full zip 或 zip 内缺少安装脚本时发布会失败。
 
 版本必须同时与 `pyproject.toml`、`src/citespec_resource/__init__.py` 和
 `uv.lock` 中的项目版本一致。发布前运行：

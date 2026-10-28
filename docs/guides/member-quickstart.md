@@ -7,8 +7,13 @@
 不要从仓库手动复制 Python 脚本。维护者发布带签名的客户端后，从 GitHub Release
 下载对应平台的 `citespec-resource-<version>-<platform>-full.zip`：
 
-- Windows x64：解压并运行 `install.ps1`，然后打开新的 PowerShell。
-- Linux x64：解压后运行 `bash install.sh`。
+- Windows x64：从签名清单读取 `installer_sha256`，解压后运行
+  `powershell -File install.ps1 -Verify <installer_sha256>`，然后打开新的 PowerShell。
+- Linux x64：从签名清单读取 `installer_sha256`，解压后运行
+  `bash install.sh --verify <installer_sha256>`。
+
+`--verify`/`-Verify` 是强制参数；缺失或摘要不匹配会在写入任何文件前退出。先用
+`verify_release.py` 校验完整包和签名，步骤见 `docs/client-distribution.md`。
 
 启动器会自动检查并安装签名更新；也可以手动运行
 `citespec-resource update --check` 或 `citespec-resource update`。

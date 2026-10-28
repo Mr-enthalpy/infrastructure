@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -26,10 +27,21 @@ import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development host
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX production host
+    msvcrt = None  # type: ignore[assignment]
 
 DEFAULT_CONFIG = "/etc/citespec-resource/config.toml"
 DEFAULT_BACKUP_ROOT = "/var/backups/citespec-resource"
@@ -37,6 +49,7 @@ DEFAULT_KEEP = 14
 MANIFEST_NAME = "manifest.json"
 BACKUP_SCHEMA = 2
 SPOOL_BACKUP_NAME = "provision"
+BACKUP_LOCK_NAME = ".backup.lock"
 # Units that can write the state/intake databases or the provisioning spool.
 # Restore stops every one of them and re-checks before touching live files.
 WRITER_UNITS = (
@@ -46,11 +59,39 @@ WRITER_UNITS = (
     "citespec-resource-broker.service",
     "citespec-resource-portal.service",
 )
+# Stop the public entry points before the spool/executor when quiescing, and
+# bring the spool watcher back first so no request is lost on restart.
+QUIESCE_STOP_ORDER = (
+    "citespec-resource-broker.service",
+    "citespec-resource-portal.service",
+    "citespec-resource-intake.service",
+    "citespec-resource-provision.path",
+    "citespec-resource-provision.service",
+)
+QUIESCE_START_ORDER = (
+    "citespec-resource-provision.path",
+    "citespec-resource-intake.service",
+    "citespec-resource-portal.service",
+    "citespec-resource-broker.service",
+)
 _STATE_BACKUP_NAME = re.compile(r"^state-\d{8}-\d{6}-\d+$")
+logger = logging.getLogger(__name__)
 
 
 class BackupError(RuntimeError):
     """Raised when a backup or restore cannot be completed safely."""
+
+
+@dataclass(frozen=True)
+class _Swap:
+    """One restore swap, including every SQLite companion file.
+
+    Each member is ``(live_path, old_path_or_none)``.  Companion files are
+    recorded even when they did not exist so rollback can remove a WAL/SHM file
+    that appeared after the swap.
+    """
+
+    members: tuple[tuple[Path, Path | None], ...]
 
 
 def _chmod(path: Path, mode: int) -> None:
@@ -141,6 +182,43 @@ def _sqlite_integrity(path: Path) -> None:
             connection.close()
 
 
+def _checkpoint_sqlite(path: Path, *, timeout: float = 0) -> None:
+    """Fold a live WAL into the main database before any restore file move.
+
+    ``wal_checkpoint(TRUNCATE)`` returns ``(busy, log, checkpointed)``.  A
+    non-zero ``busy`` means a reader or writer still holds the database; abort
+    before any live file is moved so the caller can retry with the writers
+    actually stopped.  After a successful truncate the ``-wal`` file must be
+    empty (or absent), making main+WAL+SHM safe to move as one group.
+    """
+
+    if not path.is_file():
+        return
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = path.resolve().as_uri() + "?mode=rw"
+        connection = sqlite3.connect(uri, uri=True, timeout=timeout)
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error as exc:
+        raise BackupError(f"cannot checkpoint SQLite database {path}: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        raise BackupError(f"SQLite checkpoint returned no result: {path}")
+    if int(row[0]) != 0:
+        raise BackupError(
+            f"SQLite database is busy; stop all writers/readers before restoring: {path}"
+        )
+    wal = path.with_name(path.name + "-wal")
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    if wal_size:
+        raise BackupError(f"SQLite WAL was not truncated before restore: {wal}")
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -195,47 +273,20 @@ def _prune_backups(backup_root: Path, keep: int) -> list[Path]:
     return removed
 
 
-def create_backup(
-    config_path: str | Path = DEFAULT_CONFIG,
-    backup_root: str | Path = DEFAULT_BACKUP_ROOT,
+def _write_backup(
     *,
-    keep: int = DEFAULT_KEEP,
-    prefix: str = "state",
-    state_db_override: str | Path | None = None,
-    stamp: str | None = None,
+    root: Path,
+    target: Path,
+    temporary: Path,
+    state_db: Path,
+    intake_db: Path | None,
+    portal_db: Path | None,
+    spool_dir: Path | None,
+    config: Path,
+    config_dir: Path,
+    portal_enabled: bool,
+    keep: int,
 ) -> Path:
-    """Create and verify one timestamped backup; return its directory."""
-
-    config = Path(config_path)
-    root = Path(backup_root)
-    state_db, intake_db, spool_dir, portal_db, portal_enabled, config_dir = _read_config_paths(
-        config,
-        Path(state_db_override) if state_db_override is not None else None,
-    )
-    if not config_dir.is_dir():
-        raise BackupError(f"configuration directory does not exist: {config_dir}")
-    if not state_db.is_file():
-        raise BackupError(f"state database does not exist: {state_db}")
-    if intake_db is not None and not intake_db.is_file():
-        raise BackupError(f"intake database does not exist: {intake_db}")
-    if spool_dir is not None and not spool_dir.is_dir():
-        raise BackupError(f"provisioning spool does not exist: {spool_dir}")
-    if portal_enabled and portal_db is None:
-        raise BackupError("Portal is enabled but portal.db_path is not configured")
-    if portal_db is not None and not portal_db.is_file():
-        if portal_enabled:
-            raise BackupError(f"Portal is enabled but its database does not exist: {portal_db}")
-        portal_db = None
-
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _chmod(root, 0o700)
-    stamp = stamp or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-    target = root / f"{prefix}-{stamp}-{os.getpid()}"
-    temporary = root / f".{target.name}.tmp"
-    if target.exists() or temporary.exists():
-        raise BackupError(f"backup path already exists: {target}")
-    temporary.mkdir(mode=0o700)
-
     try:
         _sqlite_backup(state_db, temporary / "state.db")
         if intake_db is not None:
@@ -283,6 +334,79 @@ def create_backup(
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+
+
+def create_backup(
+    config_path: str | Path = DEFAULT_CONFIG,
+    backup_root: str | Path = DEFAULT_BACKUP_ROOT,
+    *,
+    keep: int = DEFAULT_KEEP,
+    prefix: str = "state",
+    state_db_override: str | Path | None = None,
+    stamp: str | None = None,
+    quiesce: bool = True,
+    _lock: bool = True,
+) -> Path:
+    """Create and verify one timestamped backup; return its directory.
+
+    By default every writer unit is stopped, all databases are checkpointed,
+    files are copied, and the writers that were active are started again.  This
+    is what makes the state, intake, portal, and spool snapshots correspond to
+    the same instant.  ``quiesce=False`` exists only for an operator who has
+    already taken the writers down manually.
+    """
+
+    config = Path(config_path)
+    root = Path(backup_root)
+    state_db, intake_db, spool_dir, portal_db, portal_enabled, config_dir = _read_config_paths(
+        config,
+        Path(state_db_override) if state_db_override is not None else None,
+    )
+    if not config_dir.is_dir():
+        raise BackupError(f"configuration directory does not exist: {config_dir}")
+    if not state_db.is_file():
+        raise BackupError(f"state database does not exist: {state_db}")
+    if intake_db is not None and not intake_db.is_file():
+        raise BackupError(f"intake database does not exist: {intake_db}")
+    if spool_dir is not None and not spool_dir.is_dir():
+        raise BackupError(f"provisioning spool does not exist: {spool_dir}")
+    if portal_enabled and portal_db is None:
+        raise BackupError("Portal is enabled but portal.db_path is not configured")
+    if portal_db is not None and not portal_db.is_file():
+        if portal_enabled:
+            raise BackupError(f"Portal is enabled but its database does not exist: {portal_db}")
+        portal_db = None
+
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _chmod(root, 0o700)
+    lock_context = _backup_lock(root) if _lock else nullcontext()
+    with lock_context:
+        quiescing = _should_quiesce(quiesce)
+        quiesce_context = _quiesced_writers() if quiescing else nullcontext()
+        with quiesce_context:
+            if quiescing:
+                for database in (state_db, intake_db, portal_db):
+                    if database is not None:
+                        _checkpoint_sqlite(database, timeout=5)
+            stamp = stamp or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            target = root / f"{prefix}-{stamp}-{os.getpid()}"
+            temporary = root / f".{target.name}.tmp"
+            if target.exists() or temporary.exists():
+                raise BackupError(f"backup path already exists: {target}")
+            temporary.mkdir(mode=0o700)
+            return _write_backup(
+                root=root,
+                target=target,
+                temporary=temporary,
+                state_db=state_db,
+                intake_db=intake_db,
+                portal_db=portal_db,
+                spool_dir=spool_dir,
+                config=config,
+                config_dir=config_dir,
+                portal_enabled=portal_enabled,
+                keep=keep,
+            )
 
 
 def verify_backup(backup_dir: str | Path) -> dict[str, Any]:
@@ -348,16 +472,164 @@ def _systemctl_available() -> bool:
     return os.name == "posix" and shutil.which("systemctl") is not None
 
 
+def _systemd_running() -> bool:
+    if os.name != "posix":
+        return False
+    # INVOCATION_ID is set by systemd for our own backup service even if the
+    # runtime directory is hidden by a container namespace.
+    return Path("/run/systemd/system").is_dir() or bool(os.environ.get("INVOCATION_ID"))
+
+
+def _should_quiesce(quiesce: bool) -> bool:
+    """Whether this host has a systemd instance whose units must be stopped.
+
+    Windows and minimal containers have no Citespec units to quiesce.  On a
+    real systemd host a missing ``systemctl`` is a hard error, not a reason to
+    take an inconsistent backup.
+    """
+
+    if not quiesce or not _systemd_running():
+        return False
+    if not _systemctl_available():
+        raise BackupError(
+            "systemd is running but systemctl is unavailable; install it or pass --no-quiesce"
+        )
+    return True
+
+
+@contextmanager
+def _backup_lock(root: Path) -> Iterator[None]:
+    """Prevent overlapping backup/restore runs in the same backup root."""
+
+    lock_path = root / BACKUP_LOCK_NAME
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise BackupError(
+                    "another backup or restore is already running in this backup root"
+                ) from exc
+        elif msvcrt is not None:  # pragma: no cover - Windows development only
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BackupError(
+                    "another backup or restore is already running in this backup root"
+                ) from exc
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        elif msvcrt is not None:  # pragma: no cover - Windows development only
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        os.close(fd)
+        _chmod(lock_path, 0o600)
+
+
+def _stop_unit(unit: str) -> bool:
+    result = subprocess.run(
+        ["systemctl", "stop", unit],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True
+    detail = result.stderr.strip()
+    if "not loaded" in detail or "could not be found" in detail:
+        return False
+    raise BackupError(f"could not stop {unit}: {detail}")
+
+
+def _start_unit(unit: str) -> None:
+    result = subprocess.run(
+        ["systemctl", "start", unit],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BackupError(f"could not start {unit}: {result.stderr.strip()}")
+
+
+def _restart_writer_units(active: tuple[str, ...]) -> None:
+    failed: list[str] = []
+    for unit in QUIESCE_START_ORDER:
+        if unit not in active:
+            continue
+        try:
+            _start_unit(unit)
+        except BackupError as exc:
+            failed.append(str(exc))
+    if failed:
+        raise BackupError("; ".join(failed))
+
+
+@contextmanager
+def _quiesced_writers() -> Iterator[tuple[str, ...]]:
+    """Stop every active writer and restart exactly those units afterwards.
+
+    The body runs only while all writers are inactive.  Any stop failure still
+    attempts to restart the units that were already stopped.
+    """
+
+    if not _systemctl_available():
+        raise BackupError("systemctl is unavailable; cannot quiesce writers")
+    active = tuple(unit for unit in QUIESCE_STOP_ORDER if _unit_is_active(unit))
+    stopped: list[str] = []
+    body_error: BaseException | None = None
+    try:
+        for unit in active:
+            if _stop_unit(unit):
+                stopped.append(unit)
+        still_active = [unit for unit in QUIESCE_STOP_ORDER if _unit_is_active(unit)]
+        if still_active:
+            raise BackupError("writers are still active: " + ", ".join(still_active))
+        yield active
+    except BaseException as exc:
+        body_error = exc
+        raise
+    finally:
+        try:
+            _restart_writer_units(tuple(stopped))
+        except Exception:
+            if body_error is None:
+                raise
+            logger.exception("could not restart writer units after a failed backup")
+
+
 def _unit_is_active(unit: str) -> bool:
     if not _systemctl_available():
         return False
     result = subprocess.run(
-        ["systemctl", "is-active", "--quiet", unit],
+        ["systemctl", "is-active", unit],
         check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    state = (result.stdout or "").strip()
+    if state in {"inactive", "failed", "unknown", "activating", "deactivating"}:
+        return False
+    detail = (result.stderr or "").strip()
+    if detail:
+        raise BackupError(f"cannot query unit {unit}: {detail}")
+    return False
 
 
 def _stop_writer_units() -> None:
@@ -366,19 +638,8 @@ def _stop_writer_units() -> None:
             "systemctl is unavailable; stop broker/intake/provisioning manually "
             "and pass --skip-service-check only after verifying they are inactive"
         )
-    for unit in WRITER_UNITS:
-        result = subprocess.run(
-            ["systemctl", "stop", unit],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip()
-            if "not loaded" in detail or "could not be found" in detail:
-                continue
-            raise BackupError(f"could not stop {unit}: {detail}")
+    for unit in QUIESCE_STOP_ORDER:
+        _stop_unit(unit)
     active = [unit for unit in WRITER_UNITS if _unit_is_active(unit)]
     if active:
         raise BackupError("writers are still active: " + ", ".join(active))
@@ -406,6 +667,19 @@ def _force_maintenance(path: Path) -> bool:
     finally:
         if connection is not None:
             connection.close()
+
+
+def _reconcile_restored_state(path: Path) -> list[dict[str, str]]:
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        from .membership import service as member_service
+
+        reconciled = member_service.reconcile_restored_operations(connection)
+        connection.commit()
+        return reconciled
+    finally:
+        connection.close()
 
 
 def _stage_sqlite(source: Path, destination: Path) -> Path:
@@ -461,36 +735,58 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _swap_in(staged: Path, target: Path, *, sqlite: bool = False) -> Path | None:
-    """Replace one target, returning the old path for rollback."""
-    old = target.with_name(f".{target.name}.pre-restore-{os.getpid()}")
-    _remove_path(old)
+def _swap_in(staged: Path, target: Path, *, sqlite: bool = False) -> _Swap:
+    """Replace one target, returning every old path for rollback.
+
+    For SQLite the main database and its ``-wal``/``-shm`` companions move as a
+    group.  The live database is checkpointed first so the old main file is
+    self-contained; if the checkpoint is busy, nothing is moved at all.
+    """
+
     if sqlite:
-        for suffix in ("-wal", "-shm"):
-            target.with_name(target.name + suffix).unlink(missing_ok=True)
-    had_target = target.exists() or target.is_symlink()
-    if had_target:
-        os.replace(target, old)
+        _checkpoint_sqlite(target)
+        live_paths = [
+            target,
+            target.with_name(target.name + "-wal"),
+            target.with_name(target.name + "-shm"),
+        ]
+    else:
+        live_paths = [target]
+    old_paths = [path.with_name(f".{path.name}.pre-restore-{os.getpid()}") for path in live_paths]
+    for stale in old_paths:
+        _remove_path(stale)
+    members: list[tuple[Path, Path | None]] = []
     try:
+        for live, old in zip(live_paths, old_paths, strict=True):
+            if live.exists() or live.is_symlink():
+                os.replace(live, old)
+                members.append((live, old))
+            else:
+                members.append((live, None))
         os.replace(staged, target)
     except Exception:
-        if had_target and old.exists():
-            os.replace(old, target)
+        for live, old_path in reversed(members):
+            _remove_path(live)
+            if old_path is not None and old_path.exists():
+                os.replace(old_path, live)
         raise
-    return old if had_target else None
+    return _Swap(tuple(members))
 
 
-def _rollback_swaps(swaps: list[tuple[Path, Path | None]]) -> None:
-    for target, old in reversed(swaps):
-        _remove_path(target)
-        if old is not None and old.exists():
-            os.replace(old, target)
+def _rollback_swaps(swaps: list[_Swap]) -> None:
+    for swap in reversed(swaps):
+        for live, _old in swap.members:
+            _remove_path(live)
+        for live, old in swap.members:
+            if old is not None and old.exists():
+                os.replace(old, live)
 
 
-def _cleanup_swaps(swaps: list[tuple[Path, Path | None]]) -> None:
-    for _target, old in swaps:
-        if old is not None:
-            _remove_path(old)
+def _cleanup_swaps(swaps: list[_Swap]) -> None:
+    for swap in swaps:
+        for _live, old in swap.members:
+            if old is not None:
+                _remove_path(old)
 
 
 def restore_backup(
@@ -513,6 +809,35 @@ def restore_backup(
     if not confirmed:
         raise BackupError("restore requires explicit confirmation (--yes)")
     root = Path(backup_dir)
+    if not root.is_dir():
+        raise BackupError(f"backup directory does not exist: {root}")
+    # The standard layout is <backup-root>/<state-...>; use the same lock file
+    # as create_backup so a backup cannot race a restore.
+    with _backup_lock(root.parent):
+        return _restore_backup_locked(
+            root,
+            config_path,
+            state_db=state_db,
+            restore_config=restore_config,
+            confirmed=confirmed,
+            safety_backup=safety_backup,
+            skip_service_check=skip_service_check,
+        )
+
+
+def _restore_backup_locked(
+    backup_dir: Path,
+    config_path: str | Path,
+    *,
+    state_db: str | Path | None,
+    restore_config: bool,
+    confirmed: bool,
+    safety_backup: bool,
+    skip_service_check: bool,
+) -> dict[str, Any]:
+    if not confirmed:
+        raise BackupError("restore requires explicit confirmation (--yes)")
+    root = backup_dir
     payload = verify_backup(root)
     config = Path(config_path)
     (
@@ -531,6 +856,13 @@ def restore_backup(
     if not skip_service_check:
         _stop_writer_units()
 
+    # Checkpoint every live database before any restore write.  This both makes
+    # the old main file self-contained for rollback and fails closed while any
+    # reader/writer still holds a WAL.
+    for live_db in (state_target, intake_target, portal_target):
+        if live_db is not None:
+            _checkpoint_sqlite(live_db)
+
     # Even if a later step fails, the live database must not reopen active.
     _force_maintenance(state_target)
 
@@ -542,10 +874,13 @@ def restore_backup(
             keep=0,
             prefix="pre-restore",
             state_db_override=state_target,
+            quiesce=False,
+            _lock=False,
         )
 
     staged: list[Path] = []
-    swaps: list[tuple[Path, Path | None]] = []
+    swaps: list[_Swap] = []
+    reconciled: list[dict[str, str]] = []
     succeeded = False
     try:
         staged_state = _stage_sqlite(root / "state.db", state_target)
@@ -610,19 +945,19 @@ def restore_backup(
                     "restored config portal.db_path does not match the restore target"
                 )
 
-        swaps.append((state_target, _swap_in(staged_state, state_target, sqlite=True)))
+        swaps.append(_swap_in(staged_state, state_target, sqlite=True))
         staged.remove(staged_state)
         if staged_intake is not None and intake_target is not None:
-            swaps.append((intake_target, _swap_in(staged_intake, intake_target, sqlite=True)))
+            swaps.append(_swap_in(staged_intake, intake_target, sqlite=True))
             staged.remove(staged_intake)
         if staged_portal is not None and portal_target is not None:
-            swaps.append((portal_target, _swap_in(staged_portal, portal_target, sqlite=True)))
+            swaps.append(_swap_in(staged_portal, portal_target, sqlite=True))
             staged.remove(staged_portal)
         if staged_spool is not None and spool_target is not None:
-            swaps.append((spool_target, _swap_in(staged_spool, spool_target)))
+            swaps.append(_swap_in(staged_spool, spool_target))
             staged.remove(staged_spool)
         if staged_config is not None:
-            swaps.append((config_dir, _swap_in(staged_config, config_dir)))
+            swaps.append(_swap_in(staged_config, config_dir))
             staged.remove(staged_config)
 
         if not _force_maintenance(state_target):
@@ -636,6 +971,7 @@ def restore_backup(
             raise BackupError("restored provisioning spool is missing")
         if restore_config and not config_dir.is_dir():
             raise BackupError("restored configuration directory is missing")
+        reconciled = _reconcile_restored_state(state_target)
         succeeded = True
     except Exception:
         _rollback_swaps(swaps)
@@ -654,6 +990,7 @@ def restore_backup(
         "spool_dir": str(spool_target) if spool_target is not None else None,
         "config_restored": restore_config,
         "mode": "maintenance",
+        "reconciled_operations": reconciled,
         "schema": int(payload.get("schema", BACKUP_SCHEMA)),
         "safety_backup": str(safety_path) if safety_path is not None else None,
     }
@@ -671,6 +1008,11 @@ def _parser() -> argparse.ArgumentParser:
     backup.add_argument("--backup-root", default=DEFAULT_BACKUP_ROOT)
     backup.add_argument("--keep", type=int, default=DEFAULT_KEEP)
     backup.add_argument("--state-db", default=None)
+    backup.add_argument(
+        "--no-quiesce",
+        action="store_true",
+        help="copy while writers run; only after stopping them manually",
+    )
     backup.add_argument("--json", action="store_true")
 
     verify = commands.add_parser("verify", help="verify a backup directory")
@@ -698,6 +1040,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.backup_root,
                 keep=args.keep,
                 state_db_override=args.state_db,
+                quiesce=not args.no_quiesce,
             )
             payload = {"backup": str(path), "schema": BACKUP_SCHEMA}
         elif args.command == "verify":

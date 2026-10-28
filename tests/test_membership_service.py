@@ -440,6 +440,61 @@ def test_legacy_import_refuses_conflicts_and_unknown_accounts(dbs):
     assert "account_absent" in absent["conflicts"]
 
 
+def test_legacy_import_refuses_portal_service_group(dbs):
+    connection, intake_db = dbs
+    portal_member = dict(INSPECTION, groups=["citespec-members", "citespec-portal"])
+    report = member_service.import_legacy_member(
+        connection,
+        username="legacy",
+        display_name="Legacy",
+        valid_until="",
+        quota_gb=50,
+        public_keys=[KEY],
+        actor_uid=0,
+        provisioning=FakeExecutor(inspect_result=portal_member),
+        workspace_root="/data1/citespec-users",
+        dry_run=True,
+    )
+    assert "privileged_group:citespec-portal" in report["conflicts"]
+    assert member_store.list_members(connection) == []
+
+
+def test_reconcile_restored_operations_fails_closed(dbs):
+    connection, _ = dbs
+    member_id = member_store.create_member(
+        connection,
+        linux_uid=42424,
+        linux_username="legacy",
+        status="provisioning",
+        display_name="Legacy",
+    )
+    operation_id, _ = member_store.create_operation(
+        connection,
+        action="provision_member",
+        frozen_input={"username": "legacy"},
+        member_id=member_id,
+    )
+    member_store.update_operation(connection, operation_id, status="running")
+    connection.commit()
+
+    reconciled = member_service.reconcile_restored_operations(connection)
+
+    assert reconciled == [
+        {
+            "operation_id": operation_id,
+            "action": "provision_member",
+            "previous_status": "running",
+            "status": "failed",
+        }
+    ]
+    operation = member_store.get_operation(connection, operation_id)
+    assert operation["status"] == "failed"
+    assert operation["stage"] == "restore"
+    member = member_store.get_member(connection, member_id)
+    assert member["member"]["status"] == "provision_failed"
+    assert member_service.reconcile_restored_operations(connection) == []
+
+
 def test_admin_key_add_and_revoke_project_to_host(dbs):
     connection, intake_db = dbs
     submitted = _submit(connection, intake_db)

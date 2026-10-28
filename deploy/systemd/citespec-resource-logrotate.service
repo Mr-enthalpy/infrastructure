@@ -12,4 +12,4 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/home/data1/citespec-users
+ReadWritePaths=-/home/data1/citespec-users

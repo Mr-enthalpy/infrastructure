@@ -1,17 +1,145 @@
 #!/usr/bin/env bash
-# Read-only deployment preflight. This script must not change host state.
+# Read-only deployment preflight.  The default mode does not invoke nvidia-smi:
+# a root query can reset /dev/nvidia* unless the wrapper is installed.  Pass
+# --probe-nvidia only after the wrapper/shim are installed.
 set -u
 set -o pipefail
 
 FAIL=0
 WARN=0
 CONFIG_FILE=""
+PROBE_NVIDIA=0
+NVIDIA_ONLY=0
+
+NVIDIA_SMI=/usr/bin/nvidia-smi
+NVIDIA_SMI_REAL=/usr/bin/nvidia-smi.real
+NVIDIA_MODPROBE=/usr/bin/nvidia-modprobe
+NVIDIA_MODPROBE_REAL=/usr/bin/nvidia-modprobe.real
+NVIDIA_SHIM=/usr/local/lib/citespec-resource/libcitespec-nvidia-chmod.so
+GPU_ISOLATION_MARKER=${CITESPEC_GPU_ISOLATION_MARKER:-/etc/citespec-resource/gpu-isolation.ok}
 
 section() { printf '\n== %s ==\n' "$1"; }
 ok() { printf '[ok]   %s\n' "$1"; }
+note() { printf '[note] %s\n' "$1"; }
 warn() { printf '[warn] %s\n' "$1"; WARN=$((WARN + 1)); }
 fail() { printf '[fail] %s\n' "$1"; FAIL=$((FAIL + 1)); }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+run_nvidia_section() {
+    section "nvidia"
+    audit_nvidia_helpers
+    if [ "$PROBE_NVIDIA" -eq 0 ]; then
+        note "nvidia-smi probe skipped by default; static wrapper/shim/device audits only"
+        note "pass --probe-nvidia after the wrapper is installed to query the GPUs"
+    elif ! have nvidia-smi; then
+        fail "nvidia-smi is not installed"
+    elif [ ! -e "$NVIDIA_SMI_REAL" ]; then
+        fail "refusing --probe-nvidia: $NVIDIA_SMI_REAL is absent; install the wrapper first"
+    else
+        NVIDIA_DEVICES_BEFORE=$(nvidia_device_state)
+        if nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv,noheader; then
+            ok "nvidia-smi query succeeded"
+        else
+            fail "nvidia-smi query failed"
+        fi
+        NVIDIA_DEVICES_AFTER=$(nvidia_device_state)
+        if [ "$NVIDIA_DEVICES_BEFORE" != "$NVIDIA_DEVICES_AFTER" ]; then
+            fail "nvidia-smi changed /dev/nvidia* mode/ownership despite the wrapper"
+            printf '  before: %s\n' "${NVIDIA_DEVICES_BEFORE:-no devices}"
+            printf '  after:  %s\n' "${NVIDIA_DEVICES_AFTER:-no devices}"
+        else
+            ok "nvidia-smi did not change /dev/nvidia* mode/ownership"
+        fi
+        COMPUTE_APPS=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null)
+        COMPUTE_QUERY=$?
+        if [ "$COMPUTE_QUERY" -ne 0 ]; then
+            fail "could not query GPU compute processes"
+        elif [ -n "$COMPUTE_APPS" ]; then
+            if [ "${MODE:-monitor}" = "active" ]; then
+                fail "active mode requires no GPU compute processes; stop training first"
+            else
+                warn "one or more GPUs currently have compute processes; do not deploy during training"
+            fi
+        else
+            ok "no compute processes currently reported"
+        fi
+    fi
+    for tool in stat su getent udevadm getfacl; do
+        if have "$tool"; then
+            ok "GPU audit tool available: $tool"
+        else
+            fail "$tool is required for the GPU permission audit"
+        fi
+    done
+    if have nvidia-container-cli; then
+        ok "nvidia-container-cli: $(nvidia-container-cli --version 2>/dev/null | head -n 1 || true)"
+    else
+        warn "nvidia-container-cli is not installed"
+    fi
+}
+
+
+nvidia_device_state() {
+    local device
+    for device in /dev/nvidia*; do
+        [ -e "$device" ] || continue
+        printf '%s %s\n' "$device" "$(stat -c '%a %u:%g' "$device" 2>/dev/null || printf 'unknown')"
+    done
+}
+
+mode_has_special_bits() {
+    # GNU stat prints a fourth digit only when setuid/setgid/sticky is present.
+    local mode=$1
+    [ "${#mode}" -eq 4 ] && [ "$((8#$mode & 8#6000))" -ne 0 ]
+}
+
+# nvidia-smi chmods /dev/nvidia* to 0666 root:root every time it runs as root,
+# and the stock nvidia-modprobe can recreate nodes with the same mode.  Record
+# the state around the query so preflight reports what its own probe did instead
+# of checking permissions before the probe and calling them clean.
+audit_wrapped_helper() {
+    local label=$1 wrapper=$2 real=$3 token=$4
+    local real_installed=0 mode
+    if [ -e "$real" ]; then
+        real_installed=1
+    fi
+    if [ -e "$wrapper" ] && [ ! -L "$wrapper" ] \
+        && grep -Iq -- "$token" "$wrapper" 2>/dev/null; then
+        ok "$label is the citespec wrapper and execs $real"
+    elif [ -e "$wrapper" ] && [ "$real_installed" -eq 1 ]; then
+        fail "$label is not the citespec wrapper while $real exists"
+    elif [ -e "$wrapper" ]; then
+        warn "$label is not wrapped yet; running it can reset /dev/nvidia* permissions"
+    else
+        warn "$label is missing"
+    fi
+    if [ "$real_installed" -eq 1 ]; then
+        mode=$(stat -c '%a' "$real" 2>/dev/null || printf 'unknown')
+        if [ "$mode" = "unknown" ]; then
+            fail "could not read the mode of $real"
+        elif mode_has_special_bits "$mode"; then
+            fail "$real has setuid/setgid bits ($mode); members could create host GPU nodes"
+        else
+            ok "$real has no setuid/setgid bits (mode $mode)"
+        fi
+    else
+        warn "$real is not installed yet; the installer keeps the original helper here"
+    fi
+}
+
+audit_nvidia_helpers() {
+    audit_wrapped_helper "nvidia-smi" "$NVIDIA_SMI" "$NVIDIA_SMI_REAL" \
+        "exec /usr/bin/nvidia-smi.real"
+    audit_wrapped_helper "nvidia-modprobe" "$NVIDIA_MODPROBE" "$NVIDIA_MODPROBE_REAL" \
+        "nvidia-modprobe.real"
+    if [ -r "$NVIDIA_SHIM" ]; then
+        ok "NVIDIA chmod shim is installed: $NVIDIA_SHIM"
+    elif [ -e "$NVIDIA_SMI_REAL" ] || [ -e "$NVIDIA_MODPROBE_REAL" ]; then
+        fail "NVIDIA chmod shim is missing: $NVIDIA_SHIM"
+    else
+        warn "NVIDIA chmod shim is not installed yet: $NVIDIA_SHIM"
+    fi
+}
 
 effective_members() {
     local group=$1 gid user uid
@@ -28,13 +156,36 @@ effective_members() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -h|--help)
-            printf 'usage: %s [--config PATH]\n\nRead-only preflight for the citespec-resource host.\n' "$0"
+            cat <<'EOF'
+usage: preflight.sh [--config PATH] [--probe-nvidia | --skip-nvidia]
+                    [--nvidia-only]
+
+Read-only preflight for the citespec-resource host.
+
+  --config PATH     Inspect a deployment config for profile/quota checks.
+  --probe-nvidia    Invoke nvidia-smi and report device-permission changes.
+                    Refused unless /usr/bin/nvidia-smi.real exists (install the
+                    wrapper first).  This is opt-in because a root query can
+                    reset /dev/nvidia* on an unwrapped host.
+  --skip-nvidia     Explicitly skip the nvidia-smi query (now the default).
+  --nvidia-only     Run only the NVIDIA helper/device checks, then exit.
+  -h, --help        Show this help.
+EOF
             exit 0
             ;;
         --config)
             shift
             [ "$#" -gt 0 ] || { printf 'missing --config value\n' >&2; exit 2; }
             CONFIG_FILE=$1
+            ;;
+        --probe-nvidia)
+            PROBE_NVIDIA=1
+            ;;
+        --skip-nvidia)
+            PROBE_NVIDIA=0
+            ;;
+        --nvidia-only)
+            NVIDIA_ONLY=1
             ;;
         *)
             printf 'unknown argument: %s\n' "$1" >&2
@@ -43,6 +194,17 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$NVIDIA_ONLY" -eq 1 ]; then
+    run_nvidia_section
+    section "summary"
+    if [ "$FAIL" -ne 0 ]; then
+        printf 'preflight found %d blocking problem(s).\n' "$FAIL"
+        exit 1
+    fi
+    printf 'preflight passed (NVIDIA-only, %d warning(s)).\n' "$WARN"
+    exit 0
+fi
 
 section "host"
 if have uname; then
@@ -90,6 +252,7 @@ fi
 
 section "configuration profile"
 CONTAINER_PROFILE=""
+CONTAINER_SUDO=false
 WRITABLE_LAYER_GB=0
 MODE=""
 WORKSPACE_ROOT=""
@@ -119,6 +282,7 @@ with open(sys.argv[1], "rb") as handle:
 policy = data.get("policy", {})
 server = data.get("server", {})
 print(f"container_profile={policy.get('container_profile', 'restricted')}")
+print(f"container_sudo={'true' if policy.get('container_sudo', False) else 'false'}")
 print(f"writable_layer_gb={policy.get('writable_layer_gb', 0)}")
 print(f"mode={policy.get('mode', 'monitor')}")
 print(f"workspace_root={server.get('workspace_root', '/home/data1/citespec-users')}")
@@ -133,6 +297,7 @@ PY
         while IFS='=' read -r key value; do
             case "$key" in
                 container_profile) CONTAINER_PROFILE=$value ;;
+                container_sudo) CONTAINER_SUDO=$value ;;
                 writable_layer_gb) WRITABLE_LAYER_GB=$value ;;
                 mode) MODE=$value ;;
                 workspace_root) WORKSPACE_ROOT=$value ;;
@@ -145,6 +310,10 @@ PY
         ok "container profile: ${CONTAINER_PROFILE:-restricted}"
         if [ "$CONTAINER_PROFILE" = "development" ]; then
             ok "writable-layer quota request: ${WRITABLE_LAYER_GB} GiB"
+        fi
+        if [ "$MODE" = "active" ] && [ "$CONTAINER_PROFILE" = "development" ] \
+            && [ "$CONTAINER_SUDO" = "true" ] && [ ! -f "$GPU_ISOLATION_MARKER" ]; then
+            fail "active development containers with sudo require a passing deploy/verify_gpu_isolation.sh run ($GPU_ISOLATION_MARKER)"
         fi
     fi
 else
@@ -246,41 +415,7 @@ else
     fail "docker is not installed"
 fi
 
-section "nvidia"
-if have nvidia-smi; then
-    if nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv,noheader; then
-        ok "nvidia-smi query succeeded"
-    else
-        fail "nvidia-smi query failed"
-    fi
-    COMPUTE_APPS=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null)
-    COMPUTE_QUERY=$?
-    if [ "$COMPUTE_QUERY" -ne 0 ]; then
-        fail "could not query GPU compute processes"
-    elif [ -n "$COMPUTE_APPS" ]; then
-        if [ "${MODE:-monitor}" = "active" ]; then
-            fail "active mode requires no GPU compute processes; stop training first"
-        else
-            warn "one or more GPUs currently have compute processes; do not deploy during training"
-        fi
-    else
-        ok "no compute processes currently reported"
-    fi
-else
-    fail "nvidia-smi is not installed"
-fi
-for tool in stat su getent udevadm getfacl; do
-    if have "$tool"; then
-        ok "GPU audit tool available: $tool"
-    else
-        fail "$tool is required for the GPU permission audit"
-    fi
-done
-if have nvidia-container-cli; then
-    ok "nvidia-container-cli: $(nvidia-container-cli --version 2>/dev/null | head -n 1 || true)"
-else
-    warn "nvidia-container-cli is not installed"
-fi
+run_nvidia_section
 
 section "groups and users"
 for group in citespec-members citespec-cli citespec-admins citespec-gpu; do
@@ -306,7 +441,7 @@ if compgen -G '/dev/nvidia*' >/dev/null; then
         if [ "$MODE" = "660" ] && [ "$GROUP" = "citespec-gpu" ]; then
             ok "$device is 0660 and owned by group citespec-gpu"
         else
-            warn "$device mode/group is ${MODE:-unknown}/${GROUP:-unknown}; udev rule may not be installed"
+            warn "$device mode/group is ${MODE:-unknown}/${GROUP:-unknown}; existing device nodes are not at the member-safe 0660:citespec-gpu state"
         fi
     done
 else

@@ -5,6 +5,13 @@ nginx vhost overwrites ``X-Citespec-Client-IP`` with the real peer address; the
 application may only trust that header when the immediate peer is inside one of
 the configured proxy networks.  Never trust ``X-Forwarded-For`` here: it can be
 supplied by the client and would make rate limits and audit logs spoofable.
+
+Known boundary (P2): a loopback peer is not proof of a proxy.  Another local
+host user can connect directly to ``127.0.0.1:8770``/``8765`` and supply the
+header themselves, so the header only separates remote clients, not local ones.
+Before the browser entry is exposed, the listener should move to a
+permission-restricted Unix socket (or carry an equivalent verifiable proxy
+identity) so the application can authenticate its reverse proxy.
 """
 
 from __future__ import annotations

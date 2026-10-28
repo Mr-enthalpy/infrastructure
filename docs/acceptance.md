@@ -58,8 +58,14 @@ Before starting, verify the read-only prerequisites in
 
 ## 3. Read-only prerequisites
 
-The following checks must pass before authorizing active mode. They do not
-modify host state and must be retained as evidence:
+The following checks must pass before authorizing active mode. They must be
+retained as evidence. They are read-only: `preflight.sh` does not invoke
+`nvidia-smi` by default, because on an unwrapped host that probe can reset
+`/dev/nvidia*` to `0666 root:root`. Pass `--probe-nvidia` only after the wrapper
+is installed; the script then compares device mode/owner before and after.
+`--skip-nvidia` is the explicit default and also skips the compute-process
+query. The installer runs the NVIDIA-only probe itself after wrapper and
+permission setup.
 
 - `preflight.sh --config <config>` reports the selected container profile as
   valid.
@@ -67,11 +73,15 @@ modify host state and must be retained as evidence:
   with `prjquota` or `pquota`; `xfs_quota` is available; workspace project quotas
   are enabled; and the workspace filesystem is mounted `nosuid`.
 - Confirm the `nosuid` mount directly with
-  `findmnt -no OPTIONS -T /home/data1/citespec-users`. Without a user namespace, container
-  root is host root; a setuid file written through the workspace bind must not
+  `findmnt -no OPTIONS -T "$(python -c 'from citespec_resource.config import load_config; print(load_config("<config>").server.workspace_root)')"`.
+  Without a user namespace, container root is host root; a setuid file written through the workspace bind must not
   be honored by the host.
 - The GPU audit prerequisites `stat`, `su`, `getent`, `udevadm`, and `getfacl`
   are installed.
+- If a Portal/apply vhost is installed, `verify_portal_network.sh` reports a
+  specific private `listen` address, `allow <vpn-source-cidr>; ... deny all;`,
+  and a loopback-only upstream. A wildcard listener or missing allow rule is a
+  blocking failure.
 - After `configure_quotas.sh`, or after adding a member, confirm that the test
   member's workspace has the configured project hard limit. Use
   `xfs_quota -x -c 'report -p -b -h' <mount>` on XFS or
@@ -236,30 +246,54 @@ other members' access — cannot be proven by CI and must be verified on an
 approved test machine or an explicitly approved test GPU, during the approved
 maintenance window, with the host device state recorded before and after.
 
-Procedure (one allocated test GPU, one test member):
+Procedure (one allocated test GPU, one test member, one non-allocated bystander):
 
-1. On the host, record the full pre-state:
-   `stat -c '%n %t:%T %a %u:%g' /dev/nvidia* /dev/nvidia-caps/nvidia* > before.txt`.
-2. Inside the container, as the member via sudo, attempt (in this order, on
-   the allocated GPU's node only):
-   `sudo stat /dev/nvidia<allocated>`,
-   `sudo chmod 0666 /dev/nvidia<allocated>`,
-   `sudo chown 1000:1000 /dev/nvidia<allocated>`.
-3. On the host, repeat the `stat` capture into `after.txt` and diff. If the
-   host inode changed, the container root can mutate host device state.
-4. As a second (non-allocated) test member on the host, attempt to read the
-   device before and after the change and record the difference.
-5. Restore the original mode/owner on the host node immediately and verify
-   with `diff before.txt after-restored.txt`.
+1. The installer places the test at
+   `/usr/local/libexec/citespec-resource/verify_gpu_isolation.sh` (source:
+   `deploy/verify_gpu_isolation.sh`). Run it on the host during the approved
+   window, against a running development-profile container:
 
-Record the complete transcript. If container root can mutate host device
-nodes, member rollout of the development profile is BLOCKED: the periodic
-GPU audit is a compensating detection-and-admission control only — it cannot
-protect tasks that are already running on an affected node. In that case a
-stronger isolation mechanism (user namespace remapping or equivalent) must be
-implemented and re-verified before the development profile is opened, and the
-absence of host mounts, Docker socket, and workspace `nosuid` remain
-load-bearing requirements regardless.
+   ```bash
+   sudo /usr/local/libexec/citespec-resource/verify_gpu_isolation.sh \
+     --confirm --gpu <allocated-index> \
+     --container <container-id-or-name> \
+     --member <test-member> --bystander <other-member> \
+     --write-marker
+   ```
+
+   The script records `/dev/nvidia*` inode, mode, and owner, then runs
+   `stat`, `chmod 0666`, and `chown 1000:1000` as the member through container
+   sudo on the allocated node only. It diffs the host state, restores the
+   original mode/owner if it changed, checks that the bystander cannot read or
+   write the node, and writes evidence under
+   `/var/log/citespec-resource/gpu-isolation-<UTC>/`.
+
+2. PASS requires: no inode/mode/owner change on any host device, both
+   `chmod` and `chown` refused (or accepted without host effect), and the
+   bystander denied read and write. Only a full PASS with `--bystander` may
+   write `/etc/citespec-resource/gpu-isolation.ok`.
+
+3. `[policy].mode = "active"` with `container_profile = "development"` and
+   `container_sudo = true` is refused by config loading, the broker, and
+   preflight until that marker exists. The marker records the GPU, device,
+   container, members, and evidence path; it is not a substitute for removing
+   the marker after any later kernel/driver/user-namespace change.
+
+If the test fails, do not write the marker and do not open the development
+profile. Prefer implementing user-namespace remapping and re-running the test;
+if that is not acceptable, disable the development profile and container sudo
+before member rollout. The periodic GPU audit is a compensating
+detection-and-admission control only — it cannot protect tasks that are already
+running on an affected node. Absence of host mounts, the Docker socket, and
+workspace `nosuid` remain load-bearing requirements regardless.
+
+To revoke after a passing test, remove the marker and reload the broker:
+
+```bash
+sudo rm -f /etc/citespec-resource/gpu-isolation.ok
+sudo systemctl restart citespec-resource-broker.service
+```
+
 
 ### 5.7 Closed gates
 
@@ -267,6 +301,13 @@ load-bearing requirements regardless.
   TOCTOU-safe handling and quota tests pass.
 - A failed GPU audit, workspace quota check, or storage preflight must block new
   allocations while existing tasks continue and remain releasable.
+- The browser-facing Portal and apply intake stay loopback-only and closed to
+  members until the proxy trust boundary is no longer "source address is
+  loopback". A local host user can connect directly to `127.0.0.1:8770`/`8765`
+  and spoof `X-Citespec-Client-IP`, which affects audit attribution and
+  IP-based rate limits. Before exposing either vhost, move the upstream to a
+  permission-restricted Unix socket or add an equivalent verifiable proxy
+  identity; the nginx `$remote_addr` overwrite alone is not sufficient.
 
 ### 5.8 Member onboarding, central keys, and browser intake
 
@@ -303,6 +344,8 @@ separate checks.
    cannot read the broker socket, member database, Docker socket, or GPU nodes.
 5. **Browser and workstation UX.** Publish the loopback intake service through
    the lab TLS reverse proxy and verify request-size, rate, and network policy.
+   Do not treat "the peer is loopback" as proxy authentication; complete the
+   §5.7 Unix-socket/verifiable-proxy prerequisite before exposing the vhost.
    In a real browser, complete the application form, confirm receipt is shown
    once, then query status with only the receipt secret. The repository includes
    `tests/test_intake_browser.py` for this path:

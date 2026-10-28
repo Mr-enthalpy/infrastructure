@@ -38,12 +38,19 @@ The following conditions must be satisfied before installation:
   not be used as the production runtime.
 - `lab/resources.local.toml` contains the target host inventory and remains
   excluded from Git.
-- `server.workspace_root` must resolve to `/home/data1/citespec-users`, the path
-  baked into the static systemd units. The installer fails closed on a different
-  path instead of installing units with mismatched write permissions; update
-  `deploy/systemd/` first if the workspace must move.
+- `server.workspace_root` may differ from the static amax path. The installer
+  generates `10-workspace.conf` drop-ins for the broker, log-rotation,
+  disk-check, and provisioning units so every sandbox path list, `ExecStart`,
+  and the provisioning `CITESPEC_RESOURCE_WORKSPACE_ROOT` use the configured
+  root. Stale drop-ins are removed when the configured root matches the static
+  path again.
 - The read-only checks in Section 3 pass. For the development profile, the
   storage, quota, and `nosuid` requirements in Section 5 are mandatory.
+- An existing `citespec-portal` account is reused only when it is a system
+  account (UID 1-999) with the `citespec-portal` primary group, a nologin/false
+  shell, the portal state directory as home, a locked password, no sudo rule,
+  and no supplementary groups other than `citespec-cli`. Anything else stops the
+  installation before any group or account is changed.
 - For the portal, the internal DNS, campus VPN route/DNS, TLS certificate, and
   443 firewall answers in
   [`docs/server-network-request.md`](../docs/server-network-request.md) are
@@ -62,7 +69,24 @@ bash deploy/audit_legacy.sh --production
 groups, cgroup configuration, disk capacity, `/dev/nvidia*` permissions, and the
 development-profile storage requirements. `audit_legacy.sh` inventories legacy
 root, sudo, SSH, Docker, GPU, and privileged-container access. Both scripts are
-read-only.
+read-only: `preflight.sh` does not invoke `nvidia-smi` by default, because as root
+it resets `/dev/nvidia*` to `0666 root:root` unless the Citespec wrapper is
+installed. Pass `--probe-nvidia` only after the wrapper exists; the script then
+records device mode/owner before and after and fails if the probe changes them.
+`--skip-nvidia` is the explicit form of the default. The installer runs
+`preflight.sh --probe-nvidia --nvidia-only` itself after installing the wrapper
+and applying the GPU permission policy.
+
+After installing a Portal/apply vhost, run the read-only network audit:
+
+```bash
+bash deploy/verify_portal_network.sh --nginx-root /etc/nginx
+```
+
+It fails on a wildcard `listen` address, a vhost without
+`allow <vpn-source-cidr>; ... deny all;`, a non-loopback upstream, or a
+client-supplied `X-Citespec-Client-IP`. It warns when the vhosts or Portal unit
+are not installed yet.
 
 The GPU permission gate also requires `stat`, `su`, `getent`, `udevadm`, and
 `getfacl` (provided by the `acl` package). `preflight.sh` must fail if any of
@@ -226,21 +250,34 @@ these tools is unavailable.
    installer creates the low-privilege `citespec-portal` account (member of
    `citespec-cli`, never `citespec-admins`), its state directory, `portal.db`, the
    root-owned `/etc/citespec-resource/portal-secret.key` (mode `0640`), and
-   `citespec-resource-portal.service`. It enables the unit only when
-   `[portal].enabled = true`, and it never starts it.
+   `citespec-resource-portal.service`. It never enables or starts the unit, even
+   when `[portal].enabled = true`; the unit also has
+   `ConditionPathExists=/etc/citespec-resource/portal-network-accepted`.
 
    The portal binds `127.0.0.1:8770`; host nginx terminates TLS on the private
    campus/VPN listener. Example vhosts live in `deploy/nginx/` — they are not
    installed automatically and contain no certificate, DNS, or firewall changes.
    Confirm the certificate covers the chosen names and that nginx overwrites
-   `X-Citespec-Client-IP` with `$remote_addr`. Then, after a local activation and
-   admin review test:
+   `X-Citespec-Client-IP` with `$remote_addr`, then run
+   `bash deploy/verify_portal_network.sh --nginx-root /etc/nginx` and require a
+   zero exit before exposing the vhost. Then, after a local activation and
+   admin review test, enable the unit through the only supported gate:
 
    ```bash
-   systemctl start citespec-resource-portal.service
+   bash deploy/enable_portal.sh --yes --approved-cidr <vpn-source-cidr>
    curl -fsS http://127.0.0.1:8770/healthz
    systemctl status citespec-resource-portal.service
    ```
+
+   `enable_portal.sh` runs the fail-closed acceptance audit, writes
+   `/etc/citespec-resource/portal-network-accepted` only on success, and then
+   enables/starts the unit. A failed re-run rolls back only the state it added.
+
+   Do not expose the vhost while the upstream trusts `X-Citespec-Client-IP`
+   solely because the peer is loopback: any local host user can connect to
+   `127.0.0.1:8770` directly and spoof audit/rate-limit attribution. Complete
+   the `docs/acceptance.md` §5.7 Unix-socket (or verifiable-proxy) prerequisite
+   before opening the browser entry.
 
    Portal scope is deliberately narrow: registration, activation, local
    password/TOTP login, own member/status view, and admin approval/member-state
@@ -354,6 +391,8 @@ container must not mount the host Docker socket.
 - `verify_gpu_permissions.sh`: read-only GPU/NVIDIA device permission
   verification; supports `--json` and no-member mode.
 - `verify_monitor_only.sh`: read-only monitor-only security acceptance.
+- `verify_portal_network.sh`: read-only nginx/Portal listener, allow/deny, and
+  loopback-upstream audit.
 - `check_disk.sh`: workspace free-space alert; exits 0, 1, or 2.
 - `configure_quotas.sh`: XFS/ext4 project quota setup; dry-run by default.
 - `rotate_job_logs.py`: symlink-safe job-log rotation.
@@ -374,7 +413,9 @@ container must not mount the host Docker socket.
 - `systemd/citespec-resource-portal.service`: unprivileged VPN-only membership
   portal; binds loopback and may use only the broker's narrow portal commands.
 - `nginx/citespec-portal.conf.example` and `nginx/citespec-apply.conf.example`:
-  example VPN-only vhosts; certificates, DNS, and firewall rules are external.
+  example VPN-only vhosts with a private `listen` address,
+  `allow <vpn-source-cidr>; ... deny all;`, and a loopback upstream;
+  certificates, DNS, and firewall rules are external.
 - `systemd/citespec-resource-provision.service` and `.path`: root executor triggered
   by fixed JSON requests in the provisioning spool.
 - `udev/99-citespec-gpu.rules`: NVIDIA device-node ownership rule.

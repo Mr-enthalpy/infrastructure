@@ -15,3 +15,11 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/backups/citespec-resource
+# The default backup checkpoints every live SQLite database with
+# wal_checkpoint(TRUNCATE).  ProtectSystem=strict makes /var read-only, so the
+# state, intake, and portal directories must be writable for the checkpoint and
+# for the -wal/-shm truncation.  The intake/portal paths are optional because a
+# monitor-only host may not have created those databases yet.
+ReadWritePaths=/var/lib/citespec-resource
+ReadWritePaths=-/var/lib/citespec-resource-intake
+ReadWritePaths=-/var/lib/citespec-resource-portal

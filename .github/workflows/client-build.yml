@@ -41,14 +41,32 @@ jobs:
           if (-not $zip) { throw "full zip not found" }
           Expand-Archive -LiteralPath $zip.FullName -DestinationPath smoke
           & .\smoke\citespec-resource.exe version --json
+
+          # The installer must refuse to run without the manifest hash.
+          try {
+            & .\smoke\install.ps1
+            throw "install.ps1 accepted a missing -Verify"
+          } catch {
+            if ($_.Exception.Message -notmatch '-Verify SHA256 is required') { throw }
+          }
+
+          $installerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath .\smoke\install.ps1).Hash
+          & .\smoke\install.ps1 -InstallDir "$env:RUNNER_TEMP\citespec-client" -Verify $installerHash
+          & "$env:RUNNER_TEMP\citespec-client\citespec-resource.exe" version --json
       - name: Smoke test install and launcher (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           unzip -q dist/citespec-resource-*-${{ matrix.platform }}-full.zip -d smoke
+          # The installer must refuse to run without the manifest hash.
+          if bash smoke/install.sh >/dev/null 2>&1; then
+            echo "install.sh accepted a missing --verify" >&2
+            exit 1
+          fi
+          INSTALLER_SHA256=$(sha256sum -- smoke/install.sh | awk '{print $1}')
           CITESPEC_CLIENT_HOME="$RUNNER_TEMP/citespec-client" \
             CITESPEC_CLIENT_BIN="$RUNNER_TEMP/citespec-bin" \
-            bash smoke/install.sh
+            bash smoke/install.sh --verify "$INSTALLER_SHA256"
           "$RUNNER_TEMP/citespec-bin/citespec-resource" version --json
       - uses: actions/upload-artifact@v4
         with:
