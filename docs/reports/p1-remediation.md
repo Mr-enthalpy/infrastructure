@@ -345,6 +345,8 @@ stub 回滚测试继续覆盖备份/恢复与回滚状态。
    `enable_portal.sh --yes --approved-cidr <CIDR>` 写标记并启用。
 5. development profile + container sudo 保持关闭；先运行
    `verify_gpu_isolation.sh --write-marker` 取得真机 PASS，再评估是否开放。
+6. 开放 Portal/apply 浏览器入口前，完成 loopback 代理信任边界改造（权限受限
+   Unix socket 或可验证代理身份），见 `docs/acceptance.md` §5.7。
 
 ## 5. 结论
 
