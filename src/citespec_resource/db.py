@@ -22,7 +22,7 @@ from typing import Final
 # user_version. Fresh installs therefore run the same migration path as
 # existing deployments.
 BASE_SCHEMA_VERSION: Final = 2
-SCHEMA_VERSION: Final = 6
+SCHEMA_VERSION: Final = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -374,6 +374,183 @@ def _apply_portal_admin_auth_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+def _apply_environment_memory_migration(connection: sqlite3.Connection) -> None:
+    """Add research projects, immutable environment versions, builds, and claims.
+
+    Additive only: existing allocations and queue rows keep working with NULL
+    environment references. A version's content columns are protected by
+    triggers so a captured environment can never be rewritten in place; only
+    the recorded verification result and visibility may change afterwards.
+    """
+
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS research_projects (
+            project_id TEXT PRIMARY KEY,
+            owner_member_id TEXT NOT NULL REFERENCES members(member_id),
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'archived')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (owner_member_id, name)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_research_projects_owner "
+        "ON research_projects(owner_member_id, status)",
+        """
+        CREATE TABLE IF NOT EXISTS environment_profiles (
+            profile_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES research_projects(project_id),
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (project_id, name)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS environment_versions (
+            version_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL REFERENCES environment_profiles(profile_id),
+            version INTEGER NOT NULL CHECK (version > 0),
+            manifest TEXT NOT NULL,
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            origin TEXT NOT NULL
+                CHECK (origin IN ('capture', 'legacy_claim', 'manual')),
+            capture_fidelity TEXT NOT NULL DEFAULT 'partial'
+                CHECK (capture_fidelity IN ('complete', 'partial', 'missing')),
+            verification TEXT NOT NULL DEFAULT 'unverified'
+                CHECK (verification IN (
+                    'unverified', 'built', 'functional_passed', 'functional_failed'
+                )),
+            visibility TEXT NOT NULL DEFAULT 'private'
+                CHECK (visibility IN ('private', 'project', 'admin_shared')),
+            created_by_member_id TEXT NOT NULL REFERENCES members(member_id),
+            created_at TEXT NOT NULL,
+            UNIQUE (profile_id, version)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_environment_versions_profile "
+        "ON environment_versions(profile_id, version DESC)",
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_environment_versions_immutable
+        BEFORE UPDATE OF version_id, profile_id, version, manifest, sha256, origin,
+                         capture_fidelity, created_by_member_id, created_at
+        ON environment_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'environment version content is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_environment_versions_no_delete
+        BEFORE DELETE ON environment_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'environment versions are immutable');
+        END
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS environment_artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            version_id TEXT NOT NULL REFERENCES environment_versions(version_id),
+            kind TEXT NOT NULL
+                CHECK (kind IN (
+                    'lockfile', 'requirements', 'conda', 'pyproject',
+                    'package_list', 'probe'
+                )),
+            name TEXT NOT NULL,
+            sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (version_id, kind, name)
+        )
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_environment_artifacts_immutable
+        BEFORE UPDATE ON environment_artifacts
+        BEGIN
+            SELECT RAISE(ABORT, 'environment artifacts are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_environment_artifacts_no_delete
+        BEFORE DELETE ON environment_artifacts
+        BEGIN
+            SELECT RAISE(ABORT, 'environment artifacts are immutable');
+        END
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS environment_builds (
+            build_id TEXT PRIMARY KEY,
+            version_id TEXT NOT NULL REFERENCES environment_versions(version_id),
+            server_id TEXT NOT NULL,
+            base_image TEXT NOT NULL,
+            base_image_id TEXT NOT NULL DEFAULT '',
+            image_tag TEXT NOT NULL,
+            image_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'running', 'built', 'verified', 'failed')),
+            detail TEXT NOT NULL DEFAULT '',
+            evidence TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT '',
+            finished_at TEXT NOT NULL DEFAULT ''
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_environment_builds_tag "
+        "ON environment_builds(image_tag)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_environment_builds_active "
+        "ON environment_builds(version_id) WHERE status IN ('pending', 'running')",
+        "CREATE INDEX IF NOT EXISTS idx_environment_builds_version "
+        "ON environment_builds(version_id, created_at DESC)",
+        """
+        CREATE TABLE IF NOT EXISTS legacy_sources (
+            source_id TEXT PRIMARY KEY,
+            server_id TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            image_ref TEXT NOT NULL DEFAULT '',
+            image_id TEXT NOT NULL DEFAULT '',
+            container_name TEXT NOT NULL DEFAULT '',
+            state_at_scan TEXT NOT NULL DEFAULT '',
+            container_created_at TEXT NOT NULL DEFAULT '',
+            sanitized_metadata TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'available'
+                CHECK (status IN ('available', 'claimed', 'dismissed')),
+            scanned_at TEXT NOT NULL,
+            UNIQUE (server_id, container_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS legacy_claims (
+            claim_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES legacy_sources(source_id),
+            member_id TEXT NOT NULL REFERENCES members(member_id),
+            project_id TEXT NOT NULL REFERENCES research_projects(project_id),
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN (
+                    'pending', 'approved', 'rejected', 'conflict', 'withdrawn'
+                )),
+            reviewer TEXT NOT NULL DEFAULT '',
+            review_note TEXT NOT NULL DEFAULT '',
+            reviewed_at TEXT NOT NULL DEFAULT '',
+            version_id TEXT REFERENCES environment_versions(version_id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_legacy_claims_member "
+        "ON legacy_claims(source_id, member_id) WHERE status IN ('pending', 'approved')",
+        "CREATE INDEX IF NOT EXISTS idx_legacy_claims_status ON legacy_claims(status, created_at)",
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+    for table in ("allocations", "queue_requests"):
+        for column in ("env_version_id", "env_build_id", "image_id"):
+            if not _column_exists(connection, table, column):
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a connection with the PRAGMAs required on every connection."""
     path = Path(path)
@@ -391,6 +568,7 @@ MIGRATIONS: Final[dict[int, Callable[[sqlite3.Connection], object]]] = {
     4: _apply_lifecycle_migration,
     5: _apply_key_projection_migration,
     6: _apply_portal_admin_auth_migration,
+    7: _apply_environment_memory_migration,
 }
 
 
