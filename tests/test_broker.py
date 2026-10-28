@@ -743,6 +743,7 @@ async def test_admin_mode_switch(tmp_path, active_config):
         ALICE,
     )
     assert blocked["error"]["code"] == "monitor_only"
+    assert "admin mode active" in blocked["error"]["message"]
     switched_back = await _call(broker, "admin_mode", {"mode": "active"}, ADMIN)
     assert switched_back["ok"] is True
     applied = await _call(
@@ -1375,6 +1376,40 @@ async def test_file_transfer_is_disabled_by_default(tmp_path, active_config):
     assert response["ok"] is False
     assert response["error"]["code"] == "forbidden"
     assert "disabled" in response["error"]["message"]
+
+
+async def test_released_allocation_rejects_uploads(tmp_path, active_config):
+    """C4-6: released workspaces are readable, never writable."""
+
+    class Writer:
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        def write(self, data: bytes) -> None:
+            self.data.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+    broker, _ = _broker(tmp_path, active_config)
+    applied = await _call(broker, "apply", {"gpus": [0], "cpus": 8, "memory_gb": 32}, ALICE)
+    assert applied["ok"] is True, applied
+    allocation_id = applied["data"]["id"]
+    released = await _call(broker, "release", {"id": allocation_id}, ALICE)
+    assert released["ok"] is True
+
+    writer = Writer()
+    await broker._handle_file(
+        {"cmd": "file_put", "args": {"id": allocation_id, "path": "later.bin"}},
+        reader=asyncio.StreamReader(),
+        writer=writer,  # type: ignore[arg-type]
+        uid=ALICE.uid,
+        gid=ALICE.gid,
+    )
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    assert "released" in response["error"]["message"]
 
 
 async def test_list_enriches_public_member_identity_and_note(tmp_path, active_config):

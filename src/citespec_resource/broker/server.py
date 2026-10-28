@@ -2059,7 +2059,12 @@ class Broker:
                 allocation = store.get_allocation(connection, allocation_id, now=self._now())
             if allocation["owner_uid"] != identity.uid and not identity.is_admin:
                 raise Forbidden("only the owner or an admin may transfer files")
-            if allocation["status"] != "active":
+            # Released workspaces remain on disk. Their owner may still fetch
+            # non-log artifacts (checkpoints, metrics) without holding the GPU,
+            # but uploads and every other state keep requiring a live
+            # allocation.
+            released_read = command == "file_get" and allocation["status"] == "released"
+            if allocation["status"] != "active" and not released_read:
                 raise Conflict(f"allocation is {allocation['status']}, not active")
             parts = workspace_io.relative_parts(args.get("path"))
             relative = PurePosixPath(*parts).as_posix()
@@ -4054,9 +4059,16 @@ class Broker:
 
     def _require_active(self) -> None:
         if self._mode == "maintenance":
-            raise MonitorOnly("broker is in maintenance mode; new allocations are disabled")
+            raise MonitorOnly(
+                "broker is in maintenance mode; new allocations are disabled until an "
+                "administrator finishes maintenance"
+            )
         if self._mode != "active":
-            raise MonitorOnly("broker is in monitor-only mode")
+            raise MonitorOnly(
+                "broker is in monitor-only mode; an administrator must run "
+                "'citespec-resource admin mode active' (and allow deployment in the server "
+                "configuration) before new allocations are accepted"
+            )
 
     @staticmethod
     def _parse_gpus(raw: Any) -> list[int]:

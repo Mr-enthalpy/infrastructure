@@ -70,9 +70,16 @@ def check_for_mode(
     if command in NON_ACTIVE_MEMBER_ALLOWED:
         return None
     if mode == "maintenance":
-        message = "broker is in maintenance mode; new work and interactive sessions are disabled"
+        message = (
+            "broker is in maintenance mode; new work and interactive sessions are disabled "
+            "until an administrator finishes maintenance"
+        )
     else:
-        message = "broker is in monitor-only mode; new work and interactive sessions are disabled"
+        message = (
+            "broker is in monitor-only mode; an administrator must run "
+            "'citespec-resource admin mode active' (and allow deployment in the server "
+            "configuration) before new work is accepted"
+        )
     return {
         "code": "monitor_only",
         "message": message,

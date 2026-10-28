@@ -1019,6 +1019,7 @@ def app_callback(
         help="Force the local broker socket even when it is absent.",
     ),
 ) -> None:
+    _configure_output_encoding()
     ctx.obj = _config_path(config)
     rest = _strip_local_options(sys.argv[1:], {"--config", "--remote", "--local"})
     # Help and no-argument invocations are local UX, not remote requests.
@@ -1100,6 +1101,33 @@ START_UNSUPPORTED_MARKERS = (
     'no such command "start"',
     "unsupported subcommand start",
 )
+
+
+def _configure_output_encoding() -> None:
+    """Keep member output readable and crash-free on non-UTF-8 consoles.
+
+    Windows consoles default to the ANSI code page (GBK on Chinese systems),
+    which cannot encode symbols such as the warning sign and makes redirected
+    output hard to read as UTF-8 (C4-8). An interactive console keeps its native
+    encoding so Chinese text renders normally, with undecodable characters
+    replaced; redirected streams become UTF-8. Test doubles and other
+    non-file streams are left alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            stream.fileno()
+        except (OSError, ValueError):
+            continue
+        try:
+            if stream.isatty():
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
 
 
 def _relay_bytes(stream: Any, data: bytes) -> None:
@@ -1382,10 +1410,14 @@ def list_command(
         typer.echo("")
         typer.echo("allocations:")
         for allocation in allocations:
+            remaining = (
+                f"  remaining={_format_remaining(allocation.get('remaining_seconds'))}"
+                if allocation.get("status") == "active"
+                else ""
+            )
             typer.echo(
                 f"  {allocation['id']}  owner={allocation['owner']}  "
-                f"status={allocation['status']}  gpus={allocation['gpus']}  "
-                f"remaining={_format_remaining(allocation.get('remaining_seconds'))}"
+                f"status={allocation['status']}  gpus={allocation['gpus']}{remaining}"
             )
     queued = data.get("queue", [])
     if queued:
@@ -1453,8 +1485,10 @@ def _print_allocation(allocation: dict[str, Any]) -> None:
     typer.echo(f"memory: {allocation['memory_gb']} GiB")
     typer.echo(f"workspace: {allocation['workspace']}")
     typer.echo(f"starts: {allocation['starts_at']}")
-    remaining = _format_remaining(allocation.get("remaining_seconds"))
-    typer.echo(f"expires: {allocation['expires_at']} ({remaining})")
+    expires = str(allocation["expires_at"])
+    if allocation.get("status") == "active":
+        expires = f"{expires} ({_format_remaining(allocation.get('remaining_seconds'))})"
+    typer.echo(f"expires: {expires}")
     if allocation.get("container_name"):
         typer.echo(f"container: {allocation['container_name']}")
 

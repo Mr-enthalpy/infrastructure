@@ -210,6 +210,92 @@ def test_queue_list_and_cancel_commands(monkeypatch):
     assert "cancelled: q-1" in result.output
 
 
+def test_list_hides_remaining_time_for_released_allocations(monkeypatch):
+    """Regression (C4-7): released work must not look like it is still running."""
+    released = {
+        "id": "alloc-released",
+        "owner": "alice",
+        "status": "released",
+        "gpus": [0],
+        "cpus": 8.0,
+        "memory_gb": 32,
+        "workspace": "/home/data1/citespec-users/alice",
+        "starts_at": "2026-10-28T04:05:55+00:00",
+        "expires_at": "2026-10-28T08:05:54+00:00",
+        "remaining_seconds": 8303,
+        "container_name": "citespec-alice-old",
+    }
+    active = dict(
+        released,
+        id="alloc-active",
+        status="active",
+        remaining_seconds=3600,
+        container_name="citespec-alice-new",
+    )
+    fake = FakeClient(
+        {
+            "ok": True,
+            "data": {
+                "server": "example-gpu",
+                "mode": "active",
+                "gpus": [],
+                "allocations": [released, active],
+                "queue": [],
+                "unmanaged": {},
+            },
+        }
+    )
+    result = _invoke(monkeypatch, fake, ["list"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    released_line = next(line for line in lines if "alloc-released" in line)
+    active_line = next(line for line in lines if "alloc-active" in line)
+    assert "remaining=" not in released_line
+    assert "remaining=" in active_line
+
+    fake.response = {"ok": True, "data": {"allocation": released, "events": []}}
+    result = _invoke(monkeypatch, fake, ["status", "alloc-released"])
+    assert result.exit_code == 0, result.output
+    expires_line = next(line for line in result.output.splitlines() if line.startswith("expires:"))
+    assert "(" not in expires_line
+
+
+def test_configure_output_encoding_uses_utf8_for_redirected_streams(monkeypatch):
+    """Regression (C4-8): redirected output must be UTF-8 and never crash."""
+    import sys as sys_module
+
+    class Stream:
+        def __init__(self, *, tty: bool, has_fileno: bool = True) -> None:
+            self._tty = tty
+            self._has_fileno = has_fileno
+            self.calls: list[dict] = []
+
+        def fileno(self) -> int:
+            if not self._has_fileno:
+                raise OSError("no file descriptor")
+            return 1
+
+        def isatty(self) -> bool:
+            return self._tty
+
+        def reconfigure(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    redirected = Stream(tty=False)
+    console = Stream(tty=True)
+    detached = Stream(tty=False, has_fileno=False)
+    monkeypatch.setattr(sys_module, "stdout", redirected)
+    monkeypatch.setattr(sys_module, "stderr", console)
+    cli._configure_output_encoding()
+    assert redirected.calls == [{"encoding": "utf-8", "errors": "replace"}]
+    assert console.calls == [{"errors": "replace"}]
+
+    monkeypatch.setattr(sys_module, "stdout", detached)
+    monkeypatch.setattr(sys_module, "stderr", detached)
+    cli._configure_output_encoding()
+    assert detached.calls == []
+
+
 def test_broker_error_maps_to_exit_code(monkeypatch):
     fake = FakeClient({"ok": False, "error": {"code": "gpu_busy", "message": "GPU 3 is busy"}})
     result = _invoke(
