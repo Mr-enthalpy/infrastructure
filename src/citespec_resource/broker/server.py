@@ -3338,7 +3338,12 @@ class Broker:
                 )
         if busy_reason is not None:
             if not (self.config.policy.queue_enabled and queue_requested):
-                raise GpuBusy(busy_reason)
+                detail = busy_reason
+                if self.config.policy.queue_enabled and not queue_requested:
+                    detail = (
+                        f"{busy_reason}; drop --no-queue to wait in the queue instead of failing"
+                    )
+                raise GpuBusy(detail)
             return await self._enqueue_allocation(
                 identity,
                 gpus=[] if auto_request else gpus,
@@ -3802,6 +3807,16 @@ class Broker:
             owner_gid=owner_gid,
         )
 
+    @staticmethod
+    def _existing_job_log_size(allocation: dict[str, Any], name: str) -> int:
+        if not workspace_io.supported():
+            raise InternalError("descriptor-relative job-log access is unavailable")
+        size = workspace_io.regular_file_size(
+            str(allocation["workspace"]),
+            (".citespec-logs", f"{name}.log"),
+        )
+        return size or 0
+
     async def _job_start(self, identity: Identity, args: dict[str, Any]) -> dict[str, Any]:
         allocation = self._job_allocation(identity, args)
         name = self._job_name(args.get("name"))
@@ -3832,6 +3847,14 @@ class Broker:
             )
         container_id = str(allocation["container_id"])
         log_path = self._job_log_path(allocation, name)
+        existing_bytes = await asyncio.to_thread(self._existing_job_log_size, allocation, name)
+        if existing_bytes:
+            # Appending to an old log makes `job logs` replay the previous
+            # session, which looks like the new job never wrote anything.
+            raise Conflict(
+                f"job log already exists for '{name}' ({existing_bytes} bytes); "
+                "choose another --name or move the old log out of .citespec-logs"
+            )
         await asyncio.to_thread(self._ensure_job_log, allocation, name)
         await asyncio.to_thread(self.docker.start_job, container_id, name, command_argv)
         with self._connection() as connection:

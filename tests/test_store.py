@@ -120,6 +120,7 @@ def test_activate_and_fail_release_claims(tmp_path):
     store.fail_allocation(connection, allocation_id, reason="test failure", now=NOW)
     failed = store.get_allocation(connection, allocation_id, now=NOW)
     assert failed["status"] == "failed"
+    assert failed["remaining_seconds"] is None
     assert connection.execute("SELECT COUNT(*) FROM active_gpu_claims").fetchone()[0] == 0
     connection.close()
 

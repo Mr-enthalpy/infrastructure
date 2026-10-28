@@ -224,6 +224,9 @@ def test_create_container_uses_expected_isolation(monkeypatch, active_config, tm
     assert kwargs["tmpfs"]["/tmp"].startswith("rw,nosuid,nodev")
     assert kwargs["environment"]["HOME"] == "/workspace"
     assert kwargs["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert kwargs["environment"]["OMP_NUM_THREADS"] == "8"
+    assert kwargs["environment"]["MKL_NUM_THREADS"] == "8"
+    assert kwargs["environment"]["OPENBLAS_NUM_THREADS"] == "8"
     assert kwargs["environment"]["NVIDIA_VISIBLE_DEVICES"] == "GPU-3,GPU-5"
     assert kwargs["environment"]["NVIDIA_DRIVER_CAPABILITIES"] == "compute,utility"
     assert kwargs["user"]

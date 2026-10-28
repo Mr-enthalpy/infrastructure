@@ -633,6 +633,11 @@ class DockerDriver:
         }
         if allocation.gpus:
             volumes.update(_nvidia_smi_mounts())
+        # `nproc` reports the host CPU count even when the lease is capped by
+        # --cpus, so default thread pools oversubscribe the quota and slow
+        # concurrent trainings down. Seed the common thread variables with the
+        # allocation's CPU count; a process may still override them.
+        threads = str(max(1, int(allocation.cpus)))
         kwargs: dict[str, Any] = {
             "command": ["sleep", "infinity"],
             "detach": True,
@@ -647,6 +652,10 @@ class DockerDriver:
             "environment": {
                 "HOME": home,
                 "PYTHONDONTWRITEBYTECODE": "1",
+                "OMP_NUM_THREADS": threads,
+                "MKL_NUM_THREADS": threads,
+                "OPENBLAS_NUM_THREADS": threads,
+                "NUMEXPR_NUM_THREADS": threads,
                 **nvidia_env,
             },
             "cap_drop": ["ALL"],
