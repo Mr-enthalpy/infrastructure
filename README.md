@@ -23,7 +23,7 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 | CI | 完成 | GitHub Actions `40465970858`（测试矩阵）和 `40465970936`（Windows/Linux 打包）通过 |
 | 客户端分发 | 完成 | [v0.1.0](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0) 已发布 Windows/Linux x64；签名清单、自动更新、篡改拒绝和回退已验证。`0.1.1` 是 PR #1 的部署候选版本，尚未发布 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |
-| 真实科研 Agent 端到端（C-4） | 未执行 | 普通成员仅凭正式指南完成受控真实训练并提交体验报告；不阻塞 monitor 升级，向更多成员推广前完成（`docs/acceptance.md` §6） |
+| 真实科研 Agent 端到端（C-4） | 核心通过 | 普通成员仅凭正式指南完成 24,800 步真实训练、断线恢复、跨租约持久化与资源释放；发现 2 个阻塞级上手缺陷和 6 个非阻塞问题，见 [`docs/reports/c4-agent-acceptance.md`](docs/reports/c4-agent-acceptance.md) |
 | 实机运行 | active | Broker、intake、GPU 权限服务、provision path 正常；数据库为空 |
 | 外部 onboarding | 阻塞 | 公共 443 返回 403，等待网络/系统管理员；本地 intake 正常 |
 | VPN Portal | 代码完成、未部署 | 本地账号/TOTP、注册/审批、成员状态、只读状态、审计与备份已实现并测试；安装器不会启用 Portal，需 `enable_portal.sh` 在网络/证书验收后写标记并启动；等待内网 DNS/VPN/证书答复 |
@@ -169,6 +169,8 @@ uv.lock              # 锁定依赖版本
 
 - [docs/acceptance.md](docs/acceptance.md)：active 模式验收、开发容器与 VS Code
   验收、真实科研 Agent 端到端训练（C-4），以及必须保留的证据。
+- [docs/reports/c4-agent-acceptance.md](docs/reports/c4-agent-acceptance.md)：
+  C-4 首次实测结果、通过标准逐项结论、资源系统缺陷与整改清单。
 - [docs/queue.md](docs/queue.md)：排队状态、预算准入、取消/等待和运维语义。
 - [docs/jobs-and-transfer.md](docs/jobs-and-transfer.md)：detached tmux 任务与受限
   文件传输。
@@ -212,8 +214,10 @@ uv.lock              # 锁定依赖版本
   和内嵌 xterm.js 终端。
 - M5 核心完成：active 模式核心验收已在实机通过，覆盖 preflight、真实 SSH
   边界、并发 apply、队列、到期/重启、workspace 保留和一次性成员开户闭环。
-  外部 onboarding、VS Code、文件传输、development profile 和容器 root/宿主 GPU
-  5.6 尚未开放；真实科研 Agent 端到端训练（C-4）尚未执行。验收步骤见
+  C-4 真实科研 Agent 端到端验收也已通过核心项（24,800 步训练、断线恢复、
+  跨租约持久化与释放），但仍有 2 个阻塞级上手缺陷待修（主机指纹算法不符、
+  `setup` 在 Windows 崩溃）。外部 onboarding、VS Code、文件传输、development
+  profile 和容器 root/宿主 GPU 5.6 尚未开放；验收步骤见
   [docs/acceptance.md](docs/acceptance.md)。
 - 后续安全加固已完成本地实现与测试并部署：active 启动/切换强制 legacy 审计、
   全局/每分配/每用户预算拆分、全 NVIDIA 节点与有效组验收、队列准入/取消/等待、

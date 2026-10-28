@@ -349,7 +349,9 @@ stub 回滚测试继续覆盖备份/恢复与回滚状态。
    Unix socket 或可验证代理身份），见 `docs/acceptance.md` §5.7。
 7. 向更多成员推广前，完成 `docs/acceptance.md` §6 的真实科研 Agent 端到端训练
    验收（C-4）：普通成员仅凭正式指南完成受控真实训练并提交体验报告；不阻塞
-   本次 monitor 升级。
+   本次 monitor 升级。首次 C-4（2026-10-28）核心项通过，但仍有阻塞级上手缺陷，
+   修复 C4-1/C4-2 并重跑后再推广；结果见
+   `docs/reports/c4-agent-acceptance.md`。
 
 ## 5. 结论
 

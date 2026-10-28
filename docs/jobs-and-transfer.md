@@ -100,6 +100,12 @@ existing regular file atomically and use a unique temporary file with mode
 Directories, symlinks, FIFOs, devices, and recursive transfers are not supported;
 use a tar archive for directory trees.
 
+`push` and `pull` require an active allocation. After `release`, workspace files
+remain on disk and the persistent job logs are still available through
+`job files`/`job logs`, but `pull` returns `conflict: allocation is released, not
+active`. Retrieve checkpoints, metrics, and any other non-log artifact before
+releasing the allocation.
+
 The remote-side primitives are available for diagnostics:
 
 ```bash
