@@ -85,6 +85,27 @@ Observed but not a defect: `HOME` is `/workspace` in the restricted profile, so
 `pip install --user` persists in `/workspace/.local` across leases. This is
 consistent with workspace persistence but was not documented.
 
+### 5.1 Remediation status (2026-10-28)
+
+All eight items below are fixed on `main` and the server was upgraded to the
+same 0.1.1 package as the client. Rows marked "verified" were re-checked on the
+test instance; the remaining confirmation comes from the acceptance rerun.
+
+| Item | Status |
+|---|---|
+| C4-1, C4-2 | Fixed (#4). `setup` probes the key types the endpoint offers, reports the observed fingerprint, key type, and next step on mismatch, and returns 0 when the profile is valid. Verified against the endpoint: RSA fingerprint announced, no decode crash. |
+| C4-3 | Fixed (#5). The broker mounts the wrapper's target read-only into GPU containers. Verified on a real GPU container: `nvidia-smi -L` exited 0 and named the allocated GPU; the container was removed afterwards. |
+| C4-4 | Fixed (#5). When the server does not advertise `start`, the client falls back to `apply`. Server and packaged client now run 0.1.1. |
+| C4-5 | Fixed (#6). `monitor`/`maintenance` rejections state that an administrator must run `admin mode active` (and allow deployment). Verified live as a member while the broker was in `monitor`. |
+| C4-6 | Fixed (#6). The owner or an administrator can `pull` files from a released allocation; uploads and every other state still require `active`. Verified live: a released allocation returned its metrics file, and `file put` returned `conflict: allocation is released, not active`. |
+| C4-7 | Fixed (#6). `list`/`status` only render remaining time for active allocations. |
+| C4-8 | Fixed (#6). The CLI configures its output streams at startup: redirected output becomes UTF-8, an interactive console keeps its native encoding, both with replacement instead of an exception. |
+
+The upgrade also required three installer fixes found during the maintenance
+window: the stale `uv.lock` that omitted the `portal` extra (#7), the portal
+sudo check that treated `sudo -l`'s exit status as a privilege grant (#8), and
+the staged-venv rename that left dead shebangs in the console scripts (#9).
+
 ## 6. Project-side findings
 
 1. The best checkpoint can land on an epoch that `eval_every` does not sample,
