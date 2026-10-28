@@ -20,10 +20,24 @@
   构建成功也不代表项目还能训练；验证状态只能向前推进。
 - 构建不依赖 `docker commit`/`export`：CPU-only 构建容器以成员 UID 安装 venv，
   再生成无 `RUN` 的最小 Dockerfile，`docker build --network none`。基础镜像 digest
-  与采集记录不一致时停止；V1 拒绝自动 apt，缺失系统包记录为未满足需求。
+  与采集记录不一致时停止；V1 不执行 apt，记录的系统包作为构建提示返回。
+- 实机验收后修正的采集/构建问题（#26、#28、#29）：探针按解释器实际顺序读取
+  用户 site-packages，并区分 pip/uv 与 conda 安装的发行包（conda-only 包由基础
+  镜像提供，不再写进 requirements）；构建 venv 使用 `--system-site-packages`，
+  只叠加 pip/uv 层；PyTorch 的 `+cuNNN`/`+cpu` 本地版本从对应的 PyTorch 索引
+  解析。没有修改 conda 环境本身，也没有把 conda 包当作 PyPI 依赖。
 - 旧容器认领（#22）：管理员扫描非托管容器，成员提交申请，管理员批准后才做只读
   采集。运行中容器以 nobody 执行固定探针；已停止容器只读固定归档路径，不启动、
-  不 exec。同一来源存在待处理申请时批准返回冲突，不自动替管理员选择。
+  不 exec。同一来源存在待处理申请时批准返回冲突，不自动替管理员选择。已停止容器
+  读取 `/etc/os-release` 与 `/usr/lib/os-release`（Ubuntu 上前者是指向后者的符号
+  链接，见 #30），`capture_fidelity` 记为 `partial`。
+- 长耗时命令的等待（#27）：`env build` 是同步请求，CLI 默认等待 3600 秒并可用
+  `--timeout` 调整；GUI 的 SSH 代理对构建用 3600 秒、对功能验证与旧容器采集用
+  900 秒，避免在 broker 仍在工作时误报失败。
+- 实机验收（维护窗口内，门控打开后）：真实 conda 环境采集到 42 个 pip/uv 发行包、
+  126 个 conda 包、286 个 dpkg 包；构建约 9 分钟成功；`apply --env` 启动后成员作业
+  读到 `torch 2.7.1+cu128`、`torchaudio 2.7.1+cu128`、CUDA 可用，`env verify` 置为
+  `functional_passed`；已停止容器的认领流程走通，容器保持退出状态、未重启。
 - GUI（#24）：新增“环境”标签页（项目、版本、对比、构建、功能验证、认领申请），
   `apply` 表单支持 `--env`；管理员标签页可扫描、审核与采集旧容器。GUI 仍是 CLI
   本地代理，权限与门控由服务端执行。
@@ -617,7 +631,7 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
 | P1 | 安装器可复现性 | 待加强 | 固定镜像 digest；干净主机 dry-run/重复执行/回滚通过 |
 | P1 | CI 覆盖 | 测试矩阵和 Windows/Linux 打包 smoke 通过；Playwright 浏览器 job 仍待接入 | Playwright 浏览器 job 和必要 Linux 集成项进入 CI |
 | P1 | 客户端打包/自动更新 | `v0.1.1` 已发布（release run `40682337169`，Windows/Linux full/精简资产 + 签名 manifest，`v0.1.0` 未动）；本地资产校验与 `update --check` 通过 | 试点成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
-| P1 | 科研环境记忆（0.2.0） | 代码与测试完成（#18/#20/#21，旧容器 #22）；门控默认关闭，待部署与实机验收 | 部署后行为不变；维护窗口打开门控完成 capture→build→start --env→train→verify→release→pull；发布 0.2.0 签名客户端 |
+| P1 | 科研环境记忆（0.2.0） | 代码完成（#18/#20/#21/#22，实机修正 #26–#30）；门控已在维护窗口打开，capture→build→`apply --env`→作业→verify→release 与旧容器认领均实机通过；待发布 0.2.0 客户端与试点反馈 | 1–2 名试点成员用 0.2.0 客户端跑通一次采集/构建/`--env`；无高优问题 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
 | P1 | 真实科研 Agent 端到端（C-4） | 0.1.1 签名客户端复测通过（2026-10-28，外部协助 0 次，2 卡同租约并行训练 + 断线恢复 + 释放后取件）；C4-9/C4-10/C4-4 提示/C4-7 JSON 已修复并随 `b689797` 上线 | 1–2 名试点成员观察后再决定是否扩大范围 |
