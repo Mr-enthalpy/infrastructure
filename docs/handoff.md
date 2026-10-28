@@ -41,7 +41,7 @@
   成功，发布 Windows/Linux 的 full/精简资产与签名 manifest；`v0.1.0` tag 和资产
   未改动。本地用 `packaging/verify_release.py` 校验 Windows full 包通过
   （`sha256 3bc6ee26…`），已装客户端 `update --check` 返回 `already up to date`。
-- 推广范围：首批 1–2 名试点成员，`udcagent` 与两个 workspace/checkpoint 暂保留；
+- 推广范围：首批 1–2 名试点成员；C-4 测试账号与两个 workspace/checkpoint 暂保留，
   观察后再决定是否扩大。
 
 ## 0.4 2026-10-27 部署阻断项与测试服务器准备（PR #1）
