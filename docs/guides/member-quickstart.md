@@ -96,15 +96,16 @@
 | 等待队列 | `citespec-resource queue list` / `queue cancel <id>` |
 | 训练任务 | `citespec-resource job start <工作环境> --name train -- python train.py` |
 | 查看任务持久日志 | `citespec-resource job logs <工作环境> --name train` |
-| 取回要保留的产物 | 在 `release` 之前 `citespec-resource pull <工作环境> <路径> <本地路径>` |
+| 取回要保留的产物 | `citespec-resource pull <工作环境> <路径> <本地路径>`（`release` 前后都可以） |
 | 结束环境并释放资源 | `citespec-resource release <工作环境>` |
 | 公钥轮换 | `citespec-resource me keys add ~/.ssh/new.pub` → `me keys revoke <key-id>` |
 
 注意：结束环境会停止训练并销毁容器临时环境（容器 rootfs、`/tmp` 中的修改）；
 `/workspace` 数据保留，包括 `pip install --user` 写入的 `/workspace/.local`，需要
-干净环境时自行清理。释放后 `job files`/`job logs` 仍可读取持久日志，但 `pull`
-只接受 active 的工作环境——要带回本地的 checkpoint、指标等必须在 `release`
-之前取走。排队不是失败——保留等待或取消均可；重复提交同一个申请（相同幂等键）
+干净环境时自行清理。释放后 `job files`/`job logs` 仍可读取持久日志；`/workspace`
+也仍归你所有，因此 `release` 之后仍可用 `pull` 取回 checkpoint、指标等产物（已释放
+的环境只允许下载，不再接受上传）。排队不是失败——保留等待或取消均可；重复提交
+同一个申请（相同幂等键）
 不会重复创建。
 添加公钥会立即同步到服务器中央公钥文件；撤销公钥会立即关闭该成员的 Broker
 连接，并让旧 SSH ControlMaster 不能继续建立新的受管连接。撤销前确认自己还有
