@@ -378,6 +378,13 @@ def _write_text(path: Path, text: str, *, mode: int) -> None:
 def _chown(path: Path, uid: int, gid: int) -> None:
     if os.name != "posix":
         return
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid) or geteuid() != 0:
+        # Only a root broker has to hand ownership to the member UID. When the
+        # broker runs unprivileged (tests, a non-root install) the files are
+        # already owned by the account that will read them, and chown would
+        # fail with EPERM for no benefit.
+        return
     try:
         os.chown(path, uid, gid)
     except OSError as exc:

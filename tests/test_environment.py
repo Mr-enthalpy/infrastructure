@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -460,3 +461,14 @@ def test_build_inputs_are_deterministic():
     assert tag.startswith("citespec-env:")
     assert env_builder.image_tag_for("ver_abc123", "bld_0123456789abcdef") == tag
     assert env_builder.image_tag_for("ver_abc123", "bld_fedcba9876543210") != tag
+
+
+@pytest.mark.skipif(os.name != "posix", reason="chown is POSIX-only")
+def test_chown_is_skipped_when_the_broker_is_not_root(monkeypatch, tmp_path):
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(env_builder.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(env_builder.os, "chown", lambda *args: calls.append(args))
+
+    env_builder._chown(tmp_path, 1000, 1000)
+
+    assert calls == []
