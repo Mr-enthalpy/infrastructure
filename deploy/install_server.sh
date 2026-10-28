@@ -367,6 +367,62 @@ effective_members() {
     done
 }
 
+# An existing account with the portal service name is reused by the installer,
+# and the broker then treats its UID as the portal machine identity.  Fail closed
+# unless it still looks like the system account the installer would create:
+# system UID, dedicated primary group, non-interactive shell, locked password,
+# no sudo and no supplementary groups other than citespec-cli.
+validate_existing_portal_account() {
+    local passwd_entry uid gid home shell primary_group group status shell_ok=0
+    passwd_entry=$(getent passwd "$PORTAL_USER" 2>/dev/null || true)
+    [ -n "$passwd_entry" ] || fail "could not read the existing $PORTAL_USER account"
+    IFS=: read -r _ _ uid gid _ home shell <<<"$passwd_entry"
+    case "$uid" in
+        ''|*[!0-9]*) fail "existing $PORTAL_USER has a non-numeric UID: $uid" ;;
+    esac
+    if [ "$uid" -eq 0 ]; then
+        fail "existing $PORTAL_USER has UID 0; remove it and let the installer create the service account"
+    fi
+    if [ "$uid" -ge 1000 ]; then
+        fail "existing $PORTAL_USER has UID $uid outside the system range (1-999); remove or rename the interactive account before installing"
+    fi
+    primary_group=$(getent group "$gid" 2>/dev/null | cut -d: -f1 || true)
+    if [ "$primary_group" != "$PORTAL_USER" ]; then
+        fail "existing $PORTAL_USER has primary group '${primary_group:-<missing>}', expected '$PORTAL_USER'"
+    fi
+    case "$shell" in
+        /bin/false|/usr/bin/false|/sbin/false|/usr/sbin/false|/bin/nologin|/usr/bin/nologin|/sbin/nologin|/usr/sbin/nologin)
+            shell_ok=1
+            ;;
+    esac
+    if [ "$shell_ok" -ne 1 ]; then
+        fail "existing $PORTAL_USER has interactive login shell '$shell'; use a non-interactive system account"
+    fi
+    if [ "$home" != "$PORTAL_STATE_DIR" ]; then
+        fail "existing $PORTAL_USER has home '$home', expected '$PORTAL_STATE_DIR'; fix it before installing"
+    fi
+    for group in $(id -nG "$PORTAL_USER" 2>/dev/null); do
+        case "$group" in
+            "$PORTAL_USER"|citespec-cli) ;;
+            *)
+                fail "existing $PORTAL_USER is in group '$group'; only its primary group and citespec-cli are allowed"
+                ;;
+        esac
+    done
+    if have passwd; then
+        status=$(passwd -S "$PORTAL_USER" 2>/dev/null | awk 'NR == 1 {print $2}')
+        case "$status" in
+            L|LK) ;;
+            *)
+                fail "existing $PORTAL_USER has password status '${status:-unknown}'; lock the password before installing"
+                ;;
+        esac
+    fi
+    if have sudo && sudo -n -l -U "$PORTAL_USER" >/dev/null 2>&1; then
+        fail "existing $PORTAL_USER has sudo privileges; remove them before installing"
+    fi
+}
+
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] %s\n' "$*"
@@ -818,12 +874,19 @@ if [ "$CONFIG_DEPLOYMENT_ALLOWED" = "true" ] && [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
+    # The maintenance-window refusal must leave the host untouched.  Capture
+    # the read-only unit state first and fail before the backup directory,
+    # rollback trap, or any service is stopped.
+    capture_unit_state
+    if { [ "${#UNIT_WAS_ACTIVE[@]}" -gt 0 ] || [ "${#TIMER_WAS_ACTIVE[@]}" -gt 0 ]; } \
+        && [ "$MAINTENANCE_WINDOW" -ne 1 ]; then
+        fail "existing Citespec units are active; re-run with --maintenance-window to stop writers and take a consistent snapshot (no host changes were made)"
+    fi
     install -d -o root -g root -m 0700 "$BACKUP_ROOT" \
         || fail "could not secure backup root: $BACKUP_ROOT"
     BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
     mkdir -p "$BACKUP_DIR" || fail "could not create backup directory: $BACKUP_DIR"
     chmod 0700 "$BACKUP_DIR" || fail "could not secure backup directory: $BACKUP_DIR"
-    capture_unit_state
     NVIDIA_STATE_FILE="$BACKUP_DIR/nvidia-state.tsv"
     record_nvidia_state
     ROLLBACK_ARMED=1
@@ -841,6 +904,38 @@ note "repo: $REPO_ROOT"
 note "config source: $CONFIG_SOURCE"
 note "python: $PYTHON_BIN ($PY_VERSION)"
 note "venv: $VENV"
+
+# Read-only checks come before any host mutation.  A refused upgrade must not
+# leave new groups, accounts, or group memberships behind.
+if getent passwd "$PORTAL_USER" >/dev/null 2>&1; then
+    validate_existing_portal_account
+    ok "existing $PORTAL_USER matches the service-account policy"
+fi
+
+PORTAL_GROUP_MEMBERS=$(getent group "$PORTAL_USER" 2>/dev/null | cut -d: -f4 || true)
+if [ -n "$PORTAL_GROUP_MEMBERS" ]; then
+    fail "group $PORTAL_USER has human members: $PORTAL_GROUP_MEMBERS; remove them before installing"
+fi
+
+if [ -n "$(effective_members citespec-gpu)" ]; then
+    fail "citespec-gpu has effective members; remove them before installing"
+fi
+ok "citespec-gpu has no effective members"
+
+while IFS= read -r username; do
+    [ -n "$username" ] || continue
+    for forbidden in sudo docker citespec-gpu video render citespec-admins; do
+        if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "$forbidden"; then
+            fail "member $username is in forbidden group $forbidden"
+        fi
+    done
+done < <(effective_members citespec-members)
+while IFS= read -r username; do
+    [ -n "$username" ] || continue
+    if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-members; then
+        fail "admin $username is also in citespec-members; ForceCommand would apply"
+    fi
+done < <(effective_members citespec-admins)
 
 for group in "${CITESPEC_RESOURCE_GROUPS[@]}"; do
     if getent group "$group" >/dev/null 2>&1; then
@@ -879,42 +974,12 @@ else
     note "adding $PORTAL_USER to citespec-cli for broker socket access"
     run usermod -aG citespec-cli "$PORTAL_USER"
 fi
-if id -nG "$PORTAL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-admins; then
-    fail "$PORTAL_USER must not be a member of citespec-admins"
-fi
-PORTAL_GROUP_MEMBERS=$(getent group "$PORTAL_USER" 2>/dev/null | cut -d: -f4 || true)
-if [ -n "$PORTAL_GROUP_MEMBERS" ]; then
-    fail "group $PORTAL_USER has human members: $PORTAL_GROUP_MEMBERS; remove them before installing"
-fi
-
-if [ -n "$(effective_members citespec-gpu)" ]; then
-    fail "citespec-gpu has effective members; remove them before installing"
-fi
-ok "citespec-gpu has no effective members"
-
-while IFS= read -r username; do
-    [ -n "$username" ] || continue
-    for forbidden in sudo docker citespec-gpu video render citespec-admins; do
-        if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "$forbidden"; then
-            fail "member $username is in forbidden group $forbidden"
-        fi
-    done
-done < <(effective_members citespec-members)
-while IFS= read -r username; do
-    [ -n "$username" ] || continue
-    if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx citespec-members; then
-        fail "admin $username is also in citespec-members; ForceCommand would apply"
-    fi
-done < <(effective_members citespec-admins)
 
 if [ "$DRY_RUN" -eq 0 ]; then
     # An upgrade replaces the interpreter and migrates databases.  Refuse to do
     # that behind the back of a running broker: the operator must acknowledge a
     # maintenance window, and every writer is stopped before the snapshot.
     if [ "${#UNIT_WAS_ACTIVE[@]}" -gt 0 ] || [ "${#TIMER_WAS_ACTIVE[@]}" -gt 0 ]; then
-        if [ "$MAINTENANCE_WINDOW" -ne 1 ]; then
-            fail "existing Citespec units are active; re-run with --maintenance-window to stop writers and take a consistent snapshot"
-        fi
         note "maintenance window: stopping managed writers before replacing the environment"
         stop_managed_units
         SERVICES_STOPPED=1

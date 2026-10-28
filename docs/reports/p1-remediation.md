@@ -2,7 +2,7 @@
 
 - 分支：`fix/p1-pre-deploy`，基于 `main@e987c7e`
 - 范围：仅修复审计确认的 P1 项；未连接、未修改生产主机
-- 本地验证：**557 passed / 27 skipped**；Ruff check/format、mypy、`bash -n deploy/*.sh` 通过
+- 本地验证：**563 passed / 27 skipped**；Ruff check/format、mypy、`bash -n deploy/*.sh` 通过
 - 客户端版本：`0.1.1`（部署候选）；`v0.1.0` 已发布内容不变，未替换、未重发
 - 真实主机验证：**未执行**（按本轮要求，P1 阶段不触碰目标机）
 - Git 历史：未改写；未替换或重新发布 `v0.1.0`
@@ -276,11 +276,49 @@ stub 回滚测试继续覆盖备份/恢复与回滚状态。
 - GPU 隔离结论只能在真实 NVIDIA 主机上得出；标记是验收记录，不是隔离机制本身。
 - 版本化 venv 会保留旧环境；需要后续保留/清理策略，磁盘不足应在维护窗口前检查。
 
+### 复审追加硬化
+
+**R-1 已有 Portal 账号 fail-closed 校验**
+
+- 安装器在复用同名 `citespec-portal` 账号前校验：UID 属于系统范围（1–999）、
+  主组必须是 `citespec-portal`、登录 shell 必须是 nologin/false、home 必须是
+  `/var/lib/citespec-resource-portal`、密码必须锁定、无 sudo 规则，且除主组和
+  `citespec-cli` 外不得属于任何其他组（`sudo`、`docker`、`adm`、`wheel`、
+  `citespec-admins`、`citespec-members`、`citespec-gpu` 等一律拒绝）。
+- 任一不符即停止安装，要求管理员删除或重建账号；不会把普通成员或交互式账号
+  收编为 Portal 服务身份。
+- Broker 启动时用同一套规则复核服务账号（`portal_account_issues`），账号形态
+  漂移时 Portal 能力保持禁用并在日志中给出具体原因。
+
+**R-2 维护窗口检查前置**
+
+- `--maintenance-window` 检查移到备份目录创建、回滚 trap、所有组/账号/组成员
+  变更之前；拒绝时不会停止任何 unit、不写备份目录，并明确提示
+  “no host changes were made”。
+- 只读校验（Portal 账号形态、`citespec-gpu` 空成员、成员/管理员禁止组、
+  Portal 组人类成员）全部先于写入执行，校验失败不会留下新建账号或组。
+
+**R-3 GPU 隔离脚本中断恢复**
+
+- 在第一次可能修改设备节点的 `chmod` 之前设置 `MUTATION_STARTED=1`；任何
+  非正常退出（包括 INT/TERM/HUP）都会按预录状态恢复 `/dev/nvidia*`，并用
+  `restore_device_state_verified` 重新比对 mode/owner/inode。
+- 恢复失败时明确打印 CRITICAL 并保留 `after-restored-interrupted.txt` 证据；
+  正常 PASS/FAIL 路径同样复核恢复结果。
+
+**P2 残余边界：loopback 代理信任**
+
+- 应用仍把来自 loopback 的 `X-Citespec-Client-IP` 视为可信代理头；宿主机上的
+  其他本地用户可直接连接 127.0.0.1:8770/8765 伪造审计 IP 并影响按 IP 的限流。
+- 这不会绕过 Portal 管理员权限，也不是本 PR 引入的回归；已记录为开放浏览器
+  入口前的门禁：需要改为权限受限的 Unix socket，或引入可验证的代理身份。
+  Portal 当前保持禁用，因此不阻塞 monitor 升级。
+
 ## 3. 验证汇总
 
 | 检查 | 结果 |
 |---|---|
-| `python -m pytest -q` | 557 passed, 27 skipped（Windows 本地） |
+| `python -m pytest -q` | 563 passed, 27 skipped（Windows 本地） |
 | `python -m ruff check .` | 通过 |
 | `python -m ruff format --check .` | 通过 |
 | `python -m mypy src` | 通过（45 个源文件） |

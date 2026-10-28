@@ -41,6 +41,7 @@ from ..identity import (
     IdentityResolver,
     IdentityResolverProtocol,
     peer_credentials,
+    portal_account_issues,
     portal_group_extra_members,
     resolve_portal_account,
 )
@@ -131,12 +132,16 @@ class Broker:
         self.socket_path = Path(socket_path or config.server.broker_socket)
         self.docker = docker or DockerDriver(config)
         if identity_resolver is None:
-            portal_account = resolve_portal_account(config.portal.service_account)
+            portal_issues = portal_account_issues(config.portal.service_account)
+            portal_account = (
+                None if portal_issues else resolve_portal_account(config.portal.service_account)
+            )
             if portal_account is None:
                 logger.warning(
-                    "portal service account %r is not resolvable; portal broker "
-                    "commands will be denied",
+                    "portal service account %r is not a usable machine identity "
+                    "(%s); portal broker commands will be denied",
                     config.portal.service_account,
+                    "; ".join(portal_issues) or "account is not resolvable",
                 )
                 portal_uid: int | None = None
                 portal_username: str | None = None

@@ -19,7 +19,7 @@ monitor/maintenance 模式、重启对账、仅绑定回环地址的本地 Web G
 | 范围 | 状态 | 证据 |
 |---|---|---|
 | 代码实现 | 完成 | 成员接入、审批、开户、密钥、撤权、队列、GUI、部署单元均已实现 |
-| 自动化验证 | 完成 | 本地 `557 passed, 27 skipped`；Ruff、mypy、JS、Bash 通过 |
+| 自动化验证 | 完成 | 本地 `563 passed, 27 skipped`；Ruff、mypy、JS、Bash 通过 |
 | CI | 完成 | GitHub Actions `40465970858`（测试矩阵）和 `40465970936`（Windows/Linux 打包）通过 |
 | 客户端分发 | 完成 | [v0.1.0](https://github.com/Mr-enthalpy/infrastructure/releases/tag/v0.1.0) 已发布 Windows/Linux x64；签名清单、自动更新、篡改拒绝和回退已验证。`0.1.1` 是 PR #1 的部署候选版本，尚未发布 |
 | 实机核心验收 | 完成 | active 验收 PASSED；审计 0 failures；GPU 审计 0 failures |

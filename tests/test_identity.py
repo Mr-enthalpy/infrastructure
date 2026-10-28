@@ -9,6 +9,7 @@ import pytest
 from citespec_resource import identity as identity_module
 from citespec_resource.identity import (
     IdentityResolver,
+    portal_account_issues,
     portal_group_extra_members,
     resolve_portal_account,
 )
@@ -54,8 +55,20 @@ class _FakeGrp:
 
 @pytest.fixture
 def fake_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
-    portal = _Account(pw_uid=PORTAL_UID, pw_gid=PORTAL_GID, pw_name="citespec-portal")
-    human = _Account(pw_uid=HUMAN_UID, pw_gid=HUMAN_GID, pw_name="alice")
+    portal = _Account(
+        pw_uid=PORTAL_UID,
+        pw_gid=PORTAL_GID,
+        pw_name="citespec-portal",
+        pw_shell="/usr/sbin/nologin",
+        pw_dir="/var/lib/citespec-resource-portal",
+    )
+    human = _Account(
+        pw_uid=HUMAN_UID,
+        pw_gid=HUMAN_GID,
+        pw_name="alice",
+        pw_shell="/bin/bash",
+        pw_dir="/home/alice",
+    )
     portal_group = _Group(gr_name="citespec-portal", gr_gid=PORTAL_GID, gr_mem=[])
     cli_group = _Group(gr_name="citespec-cli", gr_gid=CLI_GID, gr_mem=["citespec-portal", "alice"])
     admin_group = _Group(gr_name="citespec-admins", gr_gid=995, gr_mem=[])
@@ -83,6 +96,82 @@ def fake_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_portal_account_resolves_to_uid(fake_accounts: None) -> None:
     assert resolve_portal_account("citespec-portal") == (PORTAL_UID, "citespec-portal")
+    assert portal_account_issues("citespec-portal") == ()
+
+
+def test_portal_account_rejects_an_interactive_shell(fake_accounts: None) -> None:
+    account = identity_module.pwd.getpwnam("citespec-portal")  # type: ignore[union-attr]
+    account.pw_shell = "/bin/bash"
+
+    issues = portal_account_issues("citespec-portal")
+
+    assert any("interactive" in issue for issue in issues)
+    assert resolve_portal_account("citespec-portal") is None
+
+
+def test_portal_account_rejects_a_non_system_uid(fake_accounts: None) -> None:
+    account = identity_module.pwd.getpwnam("citespec-portal")  # type: ignore[union-attr]
+    account.pw_uid = 4242
+
+    issues = portal_account_issues("citespec-portal")
+
+    assert any("system range" in issue for issue in issues)
+    assert resolve_portal_account("citespec-portal") is None
+
+
+def test_portal_account_rejects_a_foreign_primary_group(fake_accounts: None) -> None:
+    account = identity_module.pwd.getpwnam("citespec-portal")  # type: ignore[union-attr]
+    account.pw_gid = HUMAN_GID
+
+    issues = portal_account_issues("citespec-portal")
+
+    assert any("primary group" in issue for issue in issues)
+
+
+def test_portal_account_rejects_privileged_supplementary_groups(
+    fake_accounts: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        identity_module.os,
+        "getgrouplist",
+        lambda name, gid: [PORTAL_GID, CLI_GID, 994] if name == "citespec-portal" else [gid],
+        raising=False,
+    )
+    original = identity_module.grp.getgrgid  # type: ignore[union-attr]
+
+    def getgrgid(gid: int) -> _Group:
+        if gid == 994:
+            return _Group(gr_name="docker", gr_gid=994, gr_mem=[])
+        return original(gid)
+
+    monkeypatch.setattr(identity_module.grp, "getgrgid", getgrgid)
+
+    issues = portal_account_issues("citespec-portal")
+
+    assert any("privileged group" in issue for issue in issues)
+
+
+def test_portal_account_rejects_unexpected_supplementary_groups(
+    fake_accounts: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        identity_module.os,
+        "getgrouplist",
+        lambda name, gid: [PORTAL_GID, CLI_GID, 997] if name == "citespec-portal" else [gid],
+        raising=False,
+    )
+    original = identity_module.grp.getgrgid  # type: ignore[union-attr]
+
+    def getgrgid(gid: int) -> _Group:
+        if gid == 997:
+            return _Group(gr_name="users", gr_gid=997, gr_mem=[])
+        return original(gid)
+
+    monkeypatch.setattr(identity_module.grp, "getgrgid", getgrgid)
+
+    issues = portal_account_issues("citespec-portal")
+
+    assert any("unexpected supplementary group" in issue for issue in issues)
 
 
 def test_portal_capability_requires_matching_uid(fake_accounts: None) -> None:

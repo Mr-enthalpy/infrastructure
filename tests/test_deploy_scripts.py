@@ -659,7 +659,8 @@ def test_portal_deploy_assets_are_vpn_only_and_least_privilege():
     assert "ConditionPathExists=/etc/citespec-resource/portal-network-accepted" in unit
     assert "ENABLE_PORTAL_INSTALL" in installer
     assert "enable_portal.sh" in installer
-    assert "must not be a member of citespec-admins" in installer
+    assert "validate_existing_portal_account" in installer
+    assert "only its primary group and citespec-cli are allowed" in installer
 
 
 def test_development_container_image_has_sshd_sudo_and_bootstrap():
@@ -731,9 +732,22 @@ def test_installer_requires_a_maintenance_window_and_consistent_snapshot():
     source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
     assert "--maintenance-window" in source
     assert "existing Citespec units are active; re-run with --maintenance-window" in source
+    assert "(no host changes were made)" in source
     assert "take_preupgrade_snapshot" in source
     assert "restore_preupgrade_snapshot" in source
     assert 'SNAPSHOT_PYTHON="$VENV/bin/python"' in source
+    # The maintenance-window refusal must happen before any group, account, or
+    # membership mutation, not after partial host changes.
+    gate = source.index("(no host changes were made)")
+    first_groupadd = source.index('run groupadd --system "$group"')
+    first_useradd = source.index("run useradd --system --gid")
+    first_usermod = source.index('run usermod -aG citespec-cli "$PORTAL_USER"')
+    assert gate < first_groupadd < first_useradd < first_usermod
+    # It also runs before the backup directory, rollback trap, and any service
+    # stop, so a refused upgrade leaves running units alone.
+    assert gate < source.index('BACKUP_DIR="$BACKUP_ROOT/')
+    assert gate < source.index("ROLLBACK_ARMED=1")
+    assert gate < source.index("trap on_exit EXIT")
     # Reuse backup.py instead of copying SQLite files while writers run.
     assert "-m citespec_resource.backup backup" in source
     assert "--no-quiesce" in source
@@ -745,6 +759,33 @@ def test_installer_requires_a_maintenance_window_and_consistent_snapshot():
     rollback = source.index("restore_venv\n    cleanup_venv_staging")
     restore = source.index("restore_preupgrade_snapshot", rollback)
     assert rollback < restore
+
+
+def test_installer_verifies_an_existing_portal_account_before_reuse():
+    source = (ROOT / "deploy/install_server.sh").read_text(encoding="utf-8")
+    assert "validate_existing_portal_account()" in source
+    assert "validate_existing_portal_account\n" in source
+    call = source.index(
+        'if getent passwd "$PORTAL_USER" >/dev/null 2>&1; then\n'
+        "    validate_existing_portal_account"
+    )
+    groupadd = source.index('run groupadd --system "$group"')
+    usermod = source.index('run usermod -aG citespec-cli "$PORTAL_USER"')
+    assert call < groupadd < usermod
+    # The existing account must look like the system account the installer
+    # would create; any human/privileged shape fails closed before mutation.
+    for token in (
+        "outside the system range",
+        "interactive login shell",
+        "primary group",
+        "password status",
+        "has sudo privileges",
+        "only its primary group and citespec-cli are allowed",
+        'if [ "$home" != "$PORTAL_STATE_DIR" ]',
+        'id -nG "$PORTAL_USER"',
+        'sudo -n -l -U "$PORTAL_USER"',
+    ):
+        assert token in source
 
 
 def test_backup_service_can_checkpoint_every_live_database():
@@ -793,6 +834,16 @@ def test_gpu_isolation_helper_is_fail_closed():
     assert "cannot see $DEVICE" in script
     assert "could not record host device state before the test" in script
     assert "restore_device_state" in script
+    # The destructive window starts before the first possible chmod; any exit,
+    # including an interrupt, restores and verifies the recorded device state.
+    mutation = script.index("MUTATION_STARTED=1\n{")
+    chmod = script.index("sudo -n chmod 0666")
+    assert mutation < chmod
+    assert 'if [ "$MUTATION_STARTED" -eq 1 ]' in script
+    assert "restore_device_state_verified" in script
+    assert "after-restored-interrupted.txt" in script
+    assert "trap 'exit 130' INT" in script
+    assert "trap 'exit 143' TERM" in script
     assert "container root could not change host device mode/owner/inode" in script
     assert "non-allocated member $BYSTANDER can read $DEVICE" in script
     assert 'install -o root -g root -m 0600 "$MARKER_TMP" "$MARKER"' in script

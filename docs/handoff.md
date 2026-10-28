@@ -30,7 +30,14 @@
   container sudo 在 `/etc/citespec-resource/gpu-isolation.ok` 缺失时被 config、
   preflight 和 broker 拒绝。preflight 默认不调用 `nvidia-smi`，安装器在 wrapper
   完成后执行一次 `--probe-nvidia --nvidia-only`。
-- 本地验证：`557 passed, 27 skipped`；Ruff、mypy、`bash -n deploy/*.sh` 通过。
+- 复审追加硬化：复用已有 `citespec-portal` 账号前 fail-closed 校验系统 UID、主组、
+  nologin shell、锁定密码、无 sudo、仅 `citespec-cli` 附加组；Broker 启动时复核
+  同一规则。维护窗口检查移到所有组/账号变更之前。GPU 隔离脚本在首次 chmod 前
+  设置 `MUTATION_STARTED`，中断或异常退出也恢复并复核设备状态。
+- 已知残余边界（P2）：应用仍信任来自 loopback 的 `X-Citespec-Client-IP`，宿主机
+  本地用户可直接连接 127.0.0.1 伪造审计 IP/限流键；开放 Portal 浏览器入口前需改为
+  权限受限 Unix socket 或可验证代理身份。Portal 保持禁用，不阻塞 monitor 升级。
+- 本地验证：`563 passed, 27 skipped`；Ruff、mypy、`bash -n deploy/*.sh` 通过。
   尚未连接真实主机；一次性 VM 回滚演练、测试服务器 monitor 部署、备份/恢复、
   Portal 网络验收和 GPU 5.6 真机测试仍需维护窗口。
 

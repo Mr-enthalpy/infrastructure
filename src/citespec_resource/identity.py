@@ -16,6 +16,47 @@ except ImportError:  # pragma: no cover - Windows development only
     pwd = None  # type: ignore[assignment]
 
 
+# The portal account is a machine identity that the broker trusts to submit
+# administrator actors.  Reusing an interactive or privileged account with the
+# same name would hand that capability to a human, so resolution is fail closed
+# unless the account still matches the service-account shape created by the
+# installer.
+PORTAL_NON_INTERACTIVE_SHELLS = frozenset(
+    {
+        "/bin/false",
+        "/usr/bin/false",
+        "/sbin/false",
+        "/usr/sbin/false",
+        "/bin/nologin",
+        "/usr/bin/nologin",
+        "/sbin/nologin",
+        "/usr/sbin/nologin",
+    }
+)
+PORTAL_ALLOWED_SUPPLEMENTARY_GROUPS = frozenset({"citespec-cli"})
+PORTAL_FORBIDDEN_GROUPS = frozenset(
+    {
+        "root",
+        "sudo",
+        "wheel",
+        "admin",
+        "adm",
+        "docker",
+        "lxd",
+        "disk",
+        "kvm",
+        "libvirt",
+        "shadow",
+        "video",
+        "render",
+        "citespec-admins",
+        "citespec-members",
+        "citespec-gpu",
+    }
+)
+PORTAL_MAX_SYSTEM_UID = 999
+
+
 @dataclass(frozen=True)
 class Identity:
     uid: int
@@ -30,19 +71,67 @@ class IdentityResolverProtocol(Protocol):
     def resolve(self, uid: int, gid: int) -> Identity: ...
 
 
-def resolve_portal_account(service_account: str) -> tuple[int, str] | None:
-    """Resolve the dedicated portal service account to ``(uid, name)``.
+def portal_account_issues(service_account: str) -> tuple[str, ...]:
+    """Return why ``service_account`` is not a safe portal machine identity.
 
-    Returns ``None`` when the account cannot be resolved.  Callers must treat
-    that as "portal capability disabled" (fail closed), never as "allow".
+    An empty tuple means the account is acceptable.  Callers must treat a
+    non-empty result as "portal capability disabled" (fail closed).
     """
 
-    if pwd is None or not service_account:
-        return None
+    if pwd is None or grp is None or not service_account:
+        return ("account lookup is unavailable",)
     try:
         account = pwd.getpwnam(service_account)
     except KeyError:
+        return (f"account {service_account!r} does not exist",)
+
+    issues: list[str] = []
+    uid = int(account.pw_uid)
+    if uid == 0:
+        issues.append("account is root")
+    elif uid > PORTAL_MAX_SYSTEM_UID:
+        issues.append(f"UID {uid} is outside the system range (1-{PORTAL_MAX_SYSTEM_UID})")
+    try:
+        primary = grp.getgrgid(account.pw_gid)
+    except KeyError:
+        issues.append("primary group does not exist")
+    else:
+        if primary.gr_name != service_account:
+            issues.append(f"primary group is {primary.gr_name!r}, expected {service_account!r}")
+    shell = str(getattr(account, "pw_shell", ""))
+    if shell not in PORTAL_NON_INTERACTIVE_SHELLS:
+        issues.append(f"login shell {shell!r} is interactive")
+    try:
+        group_ids = set(os.getgrouplist(account.pw_name, account.pw_gid))
+    except OSError:
+        issues.append("supplementary groups could not be read")
+    else:
+        for group_id in sorted(group_ids):
+            try:
+                group = grp.getgrgid(group_id)
+            except KeyError:
+                continue
+            if group.gr_name == service_account:
+                continue
+            if group.gr_name in PORTAL_FORBIDDEN_GROUPS:
+                issues.append(f"member of privileged group {group.gr_name!r}")
+            elif group.gr_name not in PORTAL_ALLOWED_SUPPLEMENTARY_GROUPS:
+                issues.append(f"unexpected supplementary group {group.gr_name!r}")
+    return tuple(issues)
+
+
+def resolve_portal_account(service_account: str) -> tuple[int, str] | None:
+    """Resolve the dedicated portal service account to ``(uid, name)``.
+
+    Returns ``None`` when the account cannot be resolved or no longer matches
+    the service-account policy.  Callers must treat that as "portal capability
+    disabled" (fail closed), never as "allow".
+    """
+
+    if portal_account_issues(service_account):
         return None
+    assert pwd is not None
+    account = pwd.getpwnam(service_account)
     return int(account.pw_uid), account.pw_name
 
 

@@ -22,6 +22,7 @@ DEVICE=""
 MARKER=/etc/citespec-resource/gpu-isolation.ok
 EVIDENCE_DIR=""
 WRITE_MARKER=0
+MUTATION_STARTED=0
 
 usage() {
     cat <<'EOF'
@@ -159,7 +160,18 @@ restore_device_state() {
     done < "$BEFORE"
 }
 
-CHANGED=0
+# Restore and prove that every recorded device matches its pre-test state again.
+# Returns 1 when any mode/owner/inode still differs.
+restore_device_state_verified() {
+    local restored=$1
+    restore_device_state
+    record_state > "$restored" || return 1
+    if diff -u "$BEFORE" "$restored" >> "$EVIDENCE_DIR/diff.txt" 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 FINISHED=0
 cleanup_on_error() {
     local code=$?
@@ -167,9 +179,19 @@ cleanup_on_error() {
         return "$code"
     fi
     trap - EXIT
-    if [ "$CHANGED" -eq 1 ]; then
+    trap - INT TERM HUP
+    if [ "$MUTATION_STARTED" -eq 1 ]; then
+        # MUTATION_STARTED is set before the first chmod, so an interrupt that
+        # lands between the container command and the host comparison still
+        # restores the recorded device state.
         printf '[rollback] restoring original host device mode/owner\n' >&2
-        restore_device_state
+        if restore_device_state_verified \
+            "$EVIDENCE_DIR/after-restored-interrupted.txt"; then
+            printf '[rollback] host device state verified restored\n' >&2
+        else
+            printf '[rollback] CRITICAL: device state differs after restore; inspect /dev/nvidia* and %s\n' \
+                "$EVIDENCE_DIR" >&2
+        fi
     fi
     rm -f -- "${MARKER_TMP:-}" || true
     printf '[rollback] evidence retained: %s\n' "$EVIDENCE_DIR" >&2
@@ -181,6 +203,12 @@ record_state > "$BEFORE"
 ok "recorded pre-test host device state: $BEFORE"
 
 trap cleanup_on_error EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+# From here on the container can mutate the host node; any exit path restores
+# the recorded state, even when the script is interrupted mid-command.
+MUTATION_STARTED=1
 {
     printf 'timestamp=%s\n' "$TIMESTAMP"
     printf 'gpu=%s device=%s container=%s member=%s bystander=%s\n' \
@@ -198,13 +226,12 @@ trap cleanup_on_error EXIT
 record_state > "$AFTER"
 [ -s "$AFTER" ] || fail "could not record host device state after the test"
 if diff -u "$BEFORE" "$AFTER" > "$EVIDENCE_DIR/diff.txt"; then
+    MUTATION_STARTED=0
     ok "container root could not change host device mode/owner/inode"
 else
-    CHANGED=1
     cat "$EVIDENCE_DIR/diff.txt" >&2
-    restore_device_state
-    record_state > "$EVIDENCE_DIR/after-restored.txt"
-    if diff -u "$BEFORE" "$EVIDENCE_DIR/after-restored.txt" >> "$EVIDENCE_DIR/diff.txt"; then
+    if restore_device_state_verified "$EVIDENCE_DIR/after-restored.txt"; then
+        MUTATION_STARTED=0
         warn "original mode/owner restored; the test still FAILS because host state changed"
     else
         warn "could not fully restore the original host device state; inspect $EVIDENCE_DIR"

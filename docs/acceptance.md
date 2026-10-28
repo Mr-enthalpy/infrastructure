@@ -301,6 +301,13 @@ sudo systemctl restart citespec-resource-broker.service
   TOCTOU-safe handling and quota tests pass.
 - A failed GPU audit, workspace quota check, or storage preflight must block new
   allocations while existing tasks continue and remain releasable.
+- The browser-facing Portal and apply intake stay loopback-only and closed to
+  members until the proxy trust boundary is no longer "source address is
+  loopback". A local host user can connect directly to `127.0.0.1:8770`/`8765`
+  and spoof `X-Citespec-Client-IP`, which affects audit attribution and
+  IP-based rate limits. Before exposing either vhost, move the upstream to a
+  permission-restricted Unix socket or add an equivalent verifiable proxy
+  identity; the nginx `$remote_addr` overwrite alone is not sufficient.
 
 ### 5.8 Member onboarding, central keys, and browser intake
 
@@ -337,6 +344,8 @@ separate checks.
    cannot read the broker socket, member database, Docker socket, or GPU nodes.
 5. **Browser and workstation UX.** Publish the loopback intake service through
    the lab TLS reverse proxy and verify request-size, rate, and network policy.
+   Do not treat "the peer is loopback" as proxy authentication; complete the
+   §5.7 Unix-socket/verifiable-proxy prerequisite before exposing the vhost.
    In a real browser, complete the application form, confirm receipt is shown
    once, then query status with only the receipt secret. The repository includes
    `tests/test_intake_browser.py` for this path:

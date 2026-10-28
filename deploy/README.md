@@ -46,6 +46,11 @@ The following conditions must be satisfied before installation:
   path again.
 - The read-only checks in Section 3 pass. For the development profile, the
   storage, quota, and `nosuid` requirements in Section 5 are mandatory.
+- An existing `citespec-portal` account is reused only when it is a system
+  account (UID 1-999) with the `citespec-portal` primary group, a nologin/false
+  shell, the portal state directory as home, a locked password, no sudo rule,
+  and no supplementary groups other than `citespec-cli`. Anything else stops the
+  installation before any group or account is changed.
 - For the portal, the internal DNS, campus VPN route/DNS, TLS certificate, and
   443 firewall answers in
   [`docs/server-network-request.md`](../docs/server-network-request.md) are
@@ -267,6 +272,12 @@ these tools is unavailable.
    `enable_portal.sh` runs the fail-closed acceptance audit, writes
    `/etc/citespec-resource/portal-network-accepted` only on success, and then
    enables/starts the unit. A failed re-run rolls back only the state it added.
+
+   Do not expose the vhost while the upstream trusts `X-Citespec-Client-IP`
+   solely because the peer is loopback: any local host user can connect to
+   `127.0.0.1:8770` directly and spoof audit/rate-limit attribution. Complete
+   the `docs/acceptance.md` §5.7 Unix-socket (or verifiable-proxy) prerequisite
+   before opening the browser entry.
 
    Portal scope is deliberately narrow: registration, activation, local
    password/TOTP login, own member/status view, and admin approval/member-state
