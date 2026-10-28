@@ -537,6 +537,8 @@ systemctl stop citespec-resource-logrotate.timer \
 - 成功：在验收记录中写明提交、构建来源、备份路径、`pip freeze`、DB schema、unit/
   timer 状态、容器基线对比和未启用项（Portal、active、timers）。
 - 失败：执行第 8 节，记录触发原因；不要把半升级状态留到窗口结束。
+- 真实科研 Agent 端到端验收（`docs/acceptance.md` §6，C-4）在窗口外由管理员
+  独立安排；本窗口只保留 workspace 和日志供复核，不把它当作升级的前置条件。
 - 不在公开报告中写真实主机名、地址、SSH 端口、管理员账号或密钥。
 - 备份至少保留到下一次成功备份或一次完整验收之后（以较晚者为准）；不要在同一
   窗口删除。

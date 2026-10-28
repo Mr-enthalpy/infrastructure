@@ -347,6 +347,9 @@ stub 回滚测试继续覆盖备份/恢复与回滚状态。
    `verify_gpu_isolation.sh --write-marker` 取得真机 PASS，再评估是否开放。
 6. 开放 Portal/apply 浏览器入口前，完成 loopback 代理信任边界改造（权限受限
    Unix socket 或可验证代理身份），见 `docs/acceptance.md` §5.7。
+7. 向更多成员推广前，完成 `docs/acceptance.md` §6 的真实科研 Agent 端到端训练
+   验收（C-4）：普通成员仅凭正式指南完成受控真实训练并提交体验报告；不阻塞
+   本次 monitor 升级。
 
 ## 5. 结论
 

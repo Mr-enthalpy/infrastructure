@@ -20,7 +20,10 @@ the portal network/certificate changes, and the optional VS Code, file-transfer,
 and container-root/host-GPU 5.6 gates remain pending; see
 [`docs/handoff.md`](../docs/handoff.md) and
 [`docs/server-network-request.md`](../docs/server-network-request.md) for current
-status and evidence.
+status and evidence. The real research-agent end-to-end phase (C-4) in
+[`docs/acceptance.md`](../docs/acceptance.md) §6 is not required for the first
+monitor-mode installation, but must pass before offering the service to
+additional lab members.
 
 All verification scripts marked as read-only must be executed before any
 state-changing step. A read-only script must be reviewed before execution; it
