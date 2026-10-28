@@ -5,6 +5,18 @@ on:
   pull_request:
 
 jobs:
+  lockfile:
+    name: lockfile / uv.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: uv.lock matches pyproject.toml
+        # deploy/install_server.sh installs with `uv sync --frozen`, so a stale
+        # lock (missing an extra or a dependency) blocks deployment even though
+        # every test passes with pip.
+        run: uv lock --check
+
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
