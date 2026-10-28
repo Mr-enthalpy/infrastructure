@@ -499,6 +499,16 @@ training artifacts.
 - A core pass is host-specific. Re-run after storage, GPU driver, container
   profile, or member entry-point changes.
 
+### 6.9 First measured run
+
+The first C-4 run (2026-10-28, 4 x RTX 3090, restricted profile) was a core
+pass: a real training run completed 24,800 steps over two leases, the detached
+job survived a three-minute client disconnect, checkpoints and metrics persisted
+across releases, and resources were reclaimed. It also produced blocking
+onboarding findings (host-key algorithm mismatch, `setup` crash) and five
+non-core defects. Details and the remediation list are in
+[`docs/reports/c4-agent-acceptance.md`](reports/c4-agent-acceptance.md).
+
 ## 7. Evidence to retain
 
 Retain the complete command output and the following artifacts:

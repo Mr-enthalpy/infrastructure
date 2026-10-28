@@ -542,6 +542,8 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
   自动中继与幂等键。
 - `docs/acceptance.md`：目标机验收清单，5.8 是成员闭环，§6 是真实科研
   Agent 端到端训练验收（C-4）。
+- `docs/reports/c4-agent-acceptance.md`：C-4 首次实测结果、逐项结论、
+  资源系统缺陷（C4-1…C4-8）与项目侧问题。
 - `docs/queue.md`：队列状态和公平性语义。
 - `docs/jobs-and-transfer.md`：job 和受限文件传输。
 - `docs/legacy-access-revocation.md`：legacy 管理员权限撤销。
@@ -562,7 +564,12 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
 | P1 | 客户端打包/自动更新 | `v0.1.0` 已发布；Windows/Linux 构建和发布资产校验通过 | 成员完成安装/更新验收，并记录首个 Linux 运行与更新结果 |
 | P1 | GPU 验收脚本 | 默认按 8 卡 | 自动发现或显式传入实际 GPU 数 |
 | P1 | Docker 存储路线 | ext4 + restricted | 保持 restricted，或迁移到 XFS + prjquota |
-| P1 | 真实科研 Agent 端到端（C-4） | 未执行 | 普通成员仅凭正式指南完成受控真实训练并提交体验报告；不阻塞 monitor，向更多成员推广前完成 |
+| P1 | 真实科研 Agent 端到端（C-4） | 核心通过（2026-10-28） | 阻塞项 C4-1/C4-2 修复后重跑；见 `docs/reports/c4-agent-acceptance.md` |
+| P0 | 主机指纹/`setup` 闭环（C4-1/C4-2） | 阻塞级：端点只提供 RSA 主机密钥，公布指纹算法不符；Windows 上 `setup` 写成功后 GBK 解码崩溃 | 公布实际算法指纹；`setup` 打印观察到的指纹与密钥类型并给出下一步；成功即 0 退出 |
+| P1 | 容器内 `nvidia-smi`（C4-3） | 宿主 wrapper exec 的 `nvidia-smi.real` 未注入容器 | 容器内 `nvidia-smi` 可用，且仍不能改动宿主设备节点 |
+| P1 | 客户端/服务端版本一致性（C4-4） | 客户端 0.1.1 有 `start`，服务端 0.1.0 无 | 部署同版本，或 `start` 在服务端不支持时回退到 `apply` |
+| P2 | 成员错误提示与展示（C4-5/C4-6/C4-7） | `monitor_only` 无下一步；释放后 `pull` 被拒但指南未提示；`list` 对已释放分配仍显示剩余时间 | 错误附带管理员动作；文档要求先取件；非 active 不显示剩余时间 |
+| P2 | CLI 编码（C4-8） | Windows 控制台按 GBK 输出中文 | UTF-8 输出，JSON 作为自动化主路径 |
 | P2 | VS Code / 文件传输 | 关闭 | 5.6、容器 sshd、隧道、配额和 TOCTOU 验收通过 |
 | P2 | `setup` 图形化密钥配置 | CLI only | GUI 首屏可选择/生成密钥 |
 | P2 | 历史容器、备份归档、扫描噪声 | 待清理 | 资源标注清楚，扫描输出可读 |
@@ -583,3 +590,9 @@ GPU 审计、`nosuid` 或配额检查失败，停止，不得继续安装或切�
 - 示例配置的 `ssh_user = "admin"` 是管理员示例；成员使用
   `setup --user <自己的Linux用户名>`。
 - `vscode_enabled` 和 `file_transfer_enabled` 当前为 `false`。
+- 图形登录管理器会在每张 GPU 上常驻约 15 MiB（Xorg），Broker 将超过 8 MiB 且无
+  计算进程的卡判为 `unmanaged`，导致全部 GPU 无法分配。GPU 主机应使用
+  `multi-user.target`；该主机已改为此默认 target。
+- Broker 重启后可能停在 `monitor`（fail-safe）。每次重启/开机后先确认
+  `admin mode active`，再宣布服务可用；成员侧只会看到缺少下一步的
+  `monitor_only`。
