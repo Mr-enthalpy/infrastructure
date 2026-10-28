@@ -1062,9 +1062,15 @@ _BASE_CONFIG = cli.load_config(CONFIG)
 def _no_socket_config(tmp_path):
     from dataclasses import replace
 
+    # A member workstation has no broker runtime directory at all; keep the
+    # socket under a directory that does not exist so the CLI treats it as a
+    # remote relay instead of a server whose broker is down.
     return replace(
         _BASE_CONFIG,
-        server=replace(_BASE_CONFIG.server, broker_socket=str(tmp_path / "absent.sock")),
+        server=replace(
+            _BASE_CONFIG.server,
+            broker_socket=str(tmp_path / "runtime" / "absent.sock"),
+        ),
     )
 
 
@@ -1187,6 +1193,38 @@ def test_workstation_defaults_to_relay_without_socket(tmp_path, monkeypatch):
     assert recorded["argv"][-1] == "citespec-resource list"
 
 
+def test_missing_socket_on_the_server_does_not_relay(tmp_path, monkeypatch):
+    """A broker restart briefly removes the socket; the server must not SSH to
+    itself (it fails with "Could not resolve hostname <alias>" instead of saying
+    the broker is unavailable)."""
+
+    import subprocess as subprocess_module
+    import sys as sys_module
+    from dataclasses import replace
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess_module.CompletedProcess(argv, 0)
+
+    runtime = tmp_path / "run" / "citespec-resource"
+    runtime.mkdir(parents=True)
+    config = replace(
+        _BASE_CONFIG,
+        server=replace(_BASE_CONFIG.server, broker_socket=str(runtime / "broker.sock")),
+    )
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(sys_module, "argv", ["citespec-resource", "list"])
+
+    result = runner.invoke(cli.app, ["list"])
+
+    assert calls == []
+    assert result.exit_code == 6
+    assert "broker_unavailable" in (result.output + result.stderr)
+
+
 def test_local_flag_forces_socket_mode(tmp_path, monkeypatch):
     import subprocess as subprocess_module
     import sys as sys_module
@@ -1222,7 +1260,9 @@ def test_no_relay_when_socket_exists(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     config = _no_socket_config(tmp_path)
-    Path(config.server.broker_socket).write_bytes(b"")
+    socket_path = Path(config.server.broker_socket)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path.write_bytes(b"")
     monkeypatch.setattr(cli, "load_config", lambda path: config)
     monkeypatch.setattr(
         sys_module,
