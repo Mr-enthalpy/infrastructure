@@ -22,7 +22,7 @@ DEFAULT_MAX_PACKAGES = 2000
 DEFAULT_MAX_NOTES = 32
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 _APT_PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,127}(:[a-z0-9-]{1,16})?$")
 _APT_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+~:_-]{0,127}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}$")
@@ -99,7 +99,11 @@ def normalize_manifest(
     )
 
     python = _mapping(payload.get("python", {}), "python")
-    _reject_unknown(python, {"version", "manager", "packages", "lockfiles"}, "python")
+    _reject_unknown(
+        python,
+        {"version", "manager", "packages", "conda_packages", "lockfiles"},
+        "python",
+    )
     python_version = _text(python.get("version", ""), "python.version", 32, allow_empty=True)
     python_manager = _text(python.get("manager", "none"), "python.manager", 16)
     if python_manager not in _PYTHON_MANAGERS:
@@ -107,6 +111,11 @@ def normalize_manifest(
     python_packages = _package_list(
         python.get("packages", []),
         max_items=max_packages,
+    )
+    conda_packages = _package_list(
+        python.get("conda_packages", []),
+        max_items=max_packages,
+        field="python.conda_packages",
     )
     lockfiles = _lockfile_list(python.get("lockfiles", []), max_items=max_packages)
 
@@ -138,6 +147,7 @@ def normalize_manifest(
             "version": python_version,
             "manager": python_manager,
             "packages": python_packages,
+            "conda_packages": conda_packages,
             "lockfiles": lockfiles,
         },
         "gpu": {"framework": gpu_framework, "cuda_userspace": cuda_userspace},
@@ -228,21 +238,23 @@ def _string_list(
     return items
 
 
-def _package_list(value: Any, *, max_items: int) -> list[dict[str, str]]:
+def _package_list(
+    value: Any, *, max_items: int, field: str = "python.packages"
+) -> list[dict[str, str]]:
     if not isinstance(value, list):
-        _fail("python.packages 必须是数组")
+        _fail(f"{field} 必须是数组")
     if len(value) > max_items:
-        _fail(f"python.packages 超过 {max_items} 项")
+        _fail(f"{field} 超过 {max_items} 项")
     packages: list[dict[str, str]] = []
     seen: set[str] = set()
     for index, item in enumerate(value):
         if not isinstance(item, dict):
-            _fail(f"python.packages[{index}] 必须是对象")
-        _reject_unknown(item, {"name", "version"}, f"python.packages[{index}]")
-        name = _text(item.get("name"), f"python.packages[{index}].name", 128, _PACKAGE_RE)
+            _fail(f"{field}[{index}] 必须是对象")
+        _reject_unknown(item, {"name", "version"}, f"{field}[{index}]")
+        name = _text(item.get("name"), f"{field}[{index}].name", 128, _PACKAGE_RE)
         version = _text(
             item.get("version", ""),
-            f"python.packages[{index}].version",
+            f"{field}[{index}].version",
             64,
             _VERSION_RE,
             allow_empty=True,

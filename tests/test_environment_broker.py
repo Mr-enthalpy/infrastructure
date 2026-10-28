@@ -312,19 +312,22 @@ async def test_build_then_start_and_verify(tmp_path, build_config):
     assert verified["data"]["version"]["verification"] == "functional_passed"
 
 
-async def test_build_refuses_system_packages(tmp_path, build_config):
+async def test_build_warns_about_system_packages(tmp_path, build_config):
+    """V1 cannot run apt; the build proceeds and reports the recorded packages."""
+
     broker, docker = _broker(tmp_path, build_config)
     _provision(tmp_path)
     await _captured_version(broker, docker, build_config, probe=PROBE)
 
-    failed = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
-    assert failed["ok"] is False
-    assert failed["error"]["code"] == "conflict"
-    assert "apt" in failed["error"]["message"]
+    built = await _call(broker, "env_build", {"ref": "reconstruction@v1"}, ALICE)
+    assert built["ok"] is True, built
+    build = built["data"]["build"]
+    assert build["status"] == "built"
+    assert "1 个系统包" in build["detail"]
+    assert "apt" not in build["detail"]
 
     shown = await _call(broker, "env_show", {"ref": "reconstruction@v1"}, ALICE)
-    assert shown["data"]["builds"][0]["status"] == "failed"
-    assert shown["data"]["version"]["verification"] == "unverified"
+    assert shown["data"]["version"]["verification"] == "built"
 
 
 async def test_apply_with_env_requires_a_successful_build(tmp_path, build_config):
@@ -627,5 +630,6 @@ async def test_legacy_stopped_capture_reads_archives_without_exec(tmp_path, lega
 
     shown = await _call(broker, "env_show", {"ref": "alice-proj@v1"}, ALICE)
     manifest = shown["data"]["manifest"]
-    assert manifest["python"]["packages"] == [{"name": "numpy", "version": "1.26.4"}]
+    assert manifest["python"]["packages"] == []
+    assert manifest["python"]["conda_packages"] == [{"name": "numpy", "version": "1.26.4"}]
     assert manifest["origin"]["type"] == "legacy_claim"
