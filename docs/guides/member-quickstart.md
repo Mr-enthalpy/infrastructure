@@ -18,6 +18,11 @@
 启动器会自动检查并安装签名更新；也可以手动运行
 `citespec-resource update --check` 或 `citespec-resource update`。
 客户端只更新本机 payload，不会修改服务器、Portal 或实验室网络。
+
+若旧版客户端更新时报 `another update is already in progress`，且确认没有更新进程，
+删除客户端目录下的 `updates/.update.lock` 后重试（Windows 默认在
+`%LOCALAPPDATA%\CitespecResource`，Linux 默认在 `~/.local/opt/citespec-resource`）。
+0.2.1 起会按 PID 自动回收已退出进程留下的锁。
 完整的构建、签名、镜像和回滚说明见 `docs/client-distribution.md`。
 
 ## 1. 新成员：从申请到首次使用
