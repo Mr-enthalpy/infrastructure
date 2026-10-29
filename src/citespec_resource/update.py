@@ -451,30 +451,89 @@ def _ensure_payload_executable(payload: Path) -> None:
     payload.chmod(0o755)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True when a process with ``pid`` is still running."""
+
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # ``os.kill`` cannot probe a PID on Windows; use the Win32 API instead.
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _lock_stale_reason(lock: Path) -> str:
+    """Classify a lock as stale (empty string when it is still held)."""
+
+    try:
+        raw = lock.read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+    pid = int(raw) if raw.isdigit() else 0
+    if pid and not _pid_alive(pid):
+        return f"pid {pid} is no longer running"
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return ""
+    if age > UPDATE_LOCK_STALE_SECONDS:
+        return "lock is older than six hours"
+    return ""
+
+
 def _acquire_update_lock(lock: Path) -> Any:
     """Create the update lock, recovering from a crashed updater.
 
-    A hard kill or power loss can leave the lock file behind.  Treat a lock
-    older than six hours as stale so the client can recover without manual
-    cleanup; an active download remains protected by the lock.
+    A hard kill, a dropped download or a power loss can leave the lock file
+    behind.  The lock records the updater's PID, so a lock whose process is
+    gone is reclaimed immediately; an active download keeps the lock until it
+    finishes or the six-hour safety threshold is reached.
     """
 
     for attempt in range(2):
         try:
             return lock.open("x", encoding="utf-8")
         except FileExistsError as exc:
-            try:
-                stale = time.time() - lock.stat().st_mtime > UPDATE_LOCK_STALE_SECONDS
-            except OSError:
-                stale = False
-            if stale and attempt == 0:
+            if attempt == 0 and _lock_stale_reason(lock):
                 try:
                     lock.unlink()
                 except OSError:
                     pass
-                continue
-            raise UpdateError("another update is already in progress") from exc
-    raise UpdateError("another update is already in progress")
+                else:
+                    continue
+            raw = ""
+            try:
+                raw = lock.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            owner = f"pid {raw}" if raw.isdigit() else "unknown owner"
+            raise UpdateError(
+                f"another update is already in progress ({owner}); "
+                f"if no update process is running, delete {lock} and retry"
+            ) from exc
+    raise UpdateError(f"another update is already in progress; delete {lock} and retry")
 
 
 def _download_artifact(

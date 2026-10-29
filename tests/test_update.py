@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -325,6 +326,62 @@ def test_install_update_recovers_from_stale_lock(tmp_path):
     update.install_update(info, app_root=root, allow_insecure=True)
     assert update.resolve_payload(root) is not None
     assert not lock.exists()
+
+
+def test_install_update_reclaims_a_lock_whose_process_is_gone(tmp_path):
+    private, public = _keypair()
+    root = tmp_path / "app"
+    lock = root / "updates" / ".update.lock"
+    lock.parent.mkdir(parents=True)
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    lock.write_text(str(finished.pid), encoding="utf-8")
+    assert update._pid_alive(finished.pid) is False
+    archive = tmp_path / "payload.zip"
+    _payload_zip(archive)
+    manifest = _signed_manifest(
+        private,
+        version="0.2.0",
+        artifacts={"test": _artifact(archive)},
+    )
+    info = update.check_for_update(
+        current_version="0.1.0",
+        platform="test",
+        manifest_payload=manifest,
+        public_key_b64=public,
+    )
+
+    update.install_update(info, app_root=root, allow_insecure=True)
+
+    assert update.resolve_payload(root) is not None
+    assert not lock.exists()
+
+
+def test_install_update_refuses_a_lock_held_by_a_live_process(tmp_path):
+    private, public = _keypair()
+    root = tmp_path / "app"
+    lock = root / "updates" / ".update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    archive = tmp_path / "payload.zip"
+    _payload_zip(archive)
+    manifest = _signed_manifest(
+        private,
+        version="0.2.0",
+        artifacts={"test": _artifact(archive)},
+    )
+    info = update.check_for_update(
+        current_version="0.1.0",
+        platform="test",
+        manifest_payload=manifest,
+        public_key_b64=public,
+    )
+
+    with pytest.raises(update.UpdateError, match="already in progress") as caught:
+        update.install_update(info, app_root=root, allow_insecure=True)
+
+    assert str(lock) in str(caught.value)
+    assert lock.exists()
 
 
 def test_install_update_rejects_zip_slip_and_sha_mismatch(tmp_path):
