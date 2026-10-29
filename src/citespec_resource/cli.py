@@ -933,7 +933,7 @@ async def _serve_vscode_tunnel(
             typer.echo("verifying container SSH connection…")
             await _probe_container_ssh(host, ssh_config, probe_timeout)
         except (RuntimeError, OSError, TimeoutError) as exc:
-            message = f"container SSH probe failed: {exc}"
+            message = f"容器 SSH 探测失败：{exc}"
             _write_readiness(readiness_file, "error", code="probe_failed", message=message)
             raise RuntimeError(str(exc)) from exc
         typer.echo("container SSH verified")
@@ -949,7 +949,7 @@ async def _serve_vscode_tunnel(
                     "tunnel_verified",
                     port=port,
                     uri=remote_uri,
-                    message="VS Code CLI not found; open the URI manually",
+                    message="未找到 VS Code CLI，请手动打开 URI",
                 )
                 typer.echo(
                     f"VS Code CLI not found. Open this folder URI manually:\n  {remote_uri}",
@@ -967,7 +967,7 @@ async def _serve_vscode_tunnel(
                 )
                 if result.returncode != 0:
                     # A failed launcher must not be reported as "ready".
-                    message = f"VS Code CLI exited with status {result.returncode}"
+                    message = f"VS Code CLI 已退出，状态码 {result.returncode}"
                     _write_readiness(
                         readiness_file,
                         "tunnel_verified",

@@ -28,6 +28,93 @@
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
+  const statusLabels = {
+    allocation: {
+      pending: "待启动",
+      active: "运行中",
+      released: "已释放",
+      expired: "已过期",
+      failed: "失败",
+    },
+    queue: {
+      queued: "排队中",
+      admitted: "已分配",
+      cancelled: "已取消",
+      expired: "已过期",
+      failed: "失败",
+    },
+    project: { active: "进行中", archived: "已归档" },
+    gpu: { free: "空闲", allocated: "已分配", unmanaged: "未纳管", unknown: "未知" },
+    fidelity: { complete: "完整", partial: "部分", missing: "缺失" },
+    verification: {
+      unverified: "未验证",
+      built: "已构建",
+      functional_passed: "功能验证通过",
+      functional_failed: "功能验证失败",
+    },
+    build: {
+      pending: "等待构建",
+      running: "构建中",
+      built: "已构建",
+      verified: "已验证",
+      failed: "构建失败",
+    },
+    source: { available: "可认领", claimed: "已认领", dismissed: "已下架" },
+    claim: {
+      pending: "待审核",
+      approved: "已批准",
+      rejected: "已驳回",
+      conflict: "冲突",
+      withdrawn: "已撤回",
+    },
+    request: {
+      pending_review: "待审核",
+      needs_info: "需补充",
+      approved: "已批准",
+      rejected: "已拒绝",
+      cancelled: "已取消",
+    },
+    visibility: { private: "私有", project: "项目内", admin_shared: "管理员共享" },
+    origin: { capture: "现场采集", legacy_claim: "旧容器认领", manual: "人工登记" },
+    key: { active: "有效", revoked: "已撤销" },
+    operation: {
+      provision_member: "开户",
+      set_keys: "设置公钥",
+      disable_member: "停用成员",
+      enable_member: "启用成员",
+      pending: "等待中",
+      running: "执行中",
+      succeeded: "成功",
+      failed: "失败",
+    },
+    member: {
+      provisioning: "开户中",
+      active: "有效",
+      suspended: "已暂停",
+      suspend: "已暂停",
+      expired: "已到期",
+      revoked: "已撤销",
+      revoke: "已撤销",
+      resume: "已恢复",
+      provision_failed: "开户失败",
+    },
+    role: { admin: "管理员", member: "成员" },
+    docker: {
+      running: "运行中",
+      exited: "已停止",
+      created: "已创建",
+      paused: "已暂停",
+      restarting: "重启中",
+      dead: "已退出",
+      removing: "删除中",
+    },
+  };
+
+  function labelOf(kind, value) {
+    const key = String(value ?? "");
+    return statusLabels[kind]?.[key] || key;
+  }
+
   function esc(value) {
     return String(value ?? "")
       .replaceAll("&", "&amp;")
@@ -53,12 +140,12 @@
   function formatRemaining(seconds) {
     if (seconds === null || seconds === undefined) return "—";
     const total = Math.max(0, Math.floor(Number(seconds)));
-    if (total <= 0) return "expired";
+    if (total <= 0) return "已到期";
     const hours = Math.floor(total / 3600);
     const minutes = Math.floor((total % 3600) / 60);
-    if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+    if (hours > 0) return `${hours} 小时 ${String(minutes).padStart(2, "0")} 分`;
     const secs = total % 60;
-    return `${minutes}m ${String(secs).padStart(2, "0")}s`;
+    return `${minutes} 分 ${String(secs).padStart(2, "0")} 秒`;
   }
 
   function flash(message, kind = "ok", duration = 5000) {
@@ -84,10 +171,10 @@
     try {
       payload = await response.json();
     } catch {
-      throw new Error(`HTTP ${response.status}: invalid response`);
+      throw new Error(`服务返回了无效响应（HTTP ${response.status}）`);
     }
     if (response.status === 403) {
-      throw new Error(payload?.error?.message || "forbidden");
+      throw new Error(payload?.error?.message || "没有权限");
     }
     return payload;
   }
@@ -95,14 +182,15 @@
   function setConnection(online) {
     state.offline = !online;
     const pill = $("#connection-pill");
-    pill.textContent = online ? "online" : "offline";
+    pill.textContent = online ? "已连接" : "离线";
     pill.className = `pill ${online ? "online" : "offline"}`;
     $("#offline-banner").hidden = online;
   }
 
   function setMode(mode) {
     const pill = $("#mode-pill");
-    pill.textContent = `mode ${mode || "?"}`;
+    const text = labelOf("mode", mode);
+    pill.textContent = mode ? `模式 ${text}${text === mode ? "" : `（${mode}）`}` : "模式 未知";
     pill.className = `pill ${mode === "active" ? "active" : mode === "maintenance" ? "maintenance" : mode === "monitor" ? "monitor" : "unknown"}`;
   }
 
@@ -119,7 +207,7 @@
 
   async function loadConfig() {
     const payload = await api("/api/config");
-    if (!payload.ok) throw new Error(payload?.error?.message || "config failed");
+    if (!payload.ok) throw new Error(payload?.error?.message || "读取配置失败");
     state.config = payload.data;
     $("#server-name").textContent = payload.data.server_name;
     const compatBanner = $("#compat-banner");
@@ -144,7 +232,7 @@
   async function refresh() {
     try {
       const payload = await api("/api/overview");
-      if (!payload.ok) throw new Error(payload?.error?.message || "list failed");
+      if (!payload.ok) throw new Error(payload?.error?.message || "读取总览失败");
       state.overview = payload.data;
       setConnection(true);
       setMode(payload.data.mode);
@@ -164,7 +252,7 @@
         api("/api/status"),
         api("/api/queue"),
       ]);
-      if (!statusPayload.ok) throw new Error(statusPayload?.error?.message || "status failed");
+      if (!statusPayload.ok) throw new Error(statusPayload?.error?.message || "读取状态失败");
       state.my = statusPayload.data;
       state.queue = queuePayload.ok ? (queuePayload.data.queue || []) : [];
       renderMyAllocations();
@@ -177,7 +265,7 @@
       }
     } catch (error) {
       $("#my-allocations").className = "allocation-list empty";
-      $("#my-allocations").textContent = `Unable to load: ${error.message || error}`;
+      $("#my-allocations").textContent = `无法加载：${error.message || error}`;
     }
   }
 
@@ -187,7 +275,7 @@
     if (!allocations.length) {
       state.jobs = [];
       target.className = "allocation-list empty";
-      target.textContent = "No active allocations.";
+      target.textContent = "没有运行中的租约。";
       return;
     }
     const results = await Promise.all(
@@ -211,7 +299,7 @@
     const requests = state.queue || [];
     if (!requests.length) {
       target.className = "allocation-list empty";
-      target.textContent = "No queued requests.";
+      target.textContent = "暂无排队申请。";
       return;
     }
     target.className = "allocation-list";
@@ -219,12 +307,12 @@
       <div class="allocation-item">
         <div>
           <div class="id">${esc(request.queue_id)}</div>
-          <div class="muted">position ${esc(request.position)} · ${statusBadge(request.status || "queued")}</div>
+          <div class="muted">排队位置 ${esc(request.position)} · ${statusBadge("queue", request.status || "queued")}</div>
         </div>
-        <div class="muted">GPU: <b>${esc((request.gpus || []).join(",") || "CPU-only")}</b><br>CPU/RAM: ${esc(request.cpus)} / ${esc(request.memory_gb)} GiB</div>
-        <div class="muted">remaining ${formatRemaining(request.remaining_seconds)}</div>
+        <div class="muted">GPU：<b>${esc((request.gpus || []).join(",") || "仅 CPU")}</b><br>CPU/内存：${esc(request.cpus)} / ${esc(request.memory_gb)} GiB</div>
+        <div class="muted">剩余 ${formatRemaining(request.remaining_seconds)}</div>
         <div class="row-actions">
-          <button data-action="queue-cancel" data-id="${esc(request.queue_id)}">cancel</button>
+          <button data-action="queue-cancel" data-id="${esc(request.queue_id)}">取消</button>
         </div>
       </div>
     `).join("");
@@ -240,9 +328,12 @@
       (item) => item.status === "active",
     );
     const current = select.value;
-    select.innerHTML = allocations.map((allocation) => `
-      <option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))} · GPU ${esc((allocation.gpus || []).join(",") || "cpu")}</option>
-    `).join("");
+    select.innerHTML = allocations.map((allocation) => {
+      const gpus = (allocation.gpus || []).join(",");
+      return `
+      <option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))} · ${gpus ? `GPU ${esc(gpus)}` : "仅 CPU"}</option>
+    `;
+    }).join("");
     if (allocations.some((allocation) => allocation.id === current)) {
       select.value = current;
     }
@@ -253,7 +344,7 @@
     const jobs = state.jobs || [];
     if (!jobs.length) {
       target.className = "allocation-list empty";
-      target.textContent = "No jobs.";
+      target.textContent = "暂无任务。";
       return;
     }
     target.className = "allocation-list";
@@ -261,11 +352,11 @@
       <div class="allocation-item">
         <div><div class="id">${esc(job.name)}</div><div class="muted">${esc(job.allocation_id)}</div></div>
         <div class="muted">${esc(job.session)}<br>${esc(job.log || "")}</div>
-        <div class="muted">${esc(job.log_bytes ?? 0)} bytes</div>
+        <div class="muted">${esc(job.log_bytes ?? 0)} 字节</div>
         <div class="row-actions">
-          <button data-action="job-attach" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">attach</button>
-          <button data-action="job-logs" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">logs</button>
-          <button data-action="job-stop" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">stop</button>
+          <button data-action="job-attach" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">接入</button>
+          <button data-action="job-logs" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">日志</button>
+          <button data-action="job-stop" data-id="${esc(job.allocation_id)}" data-job="${esc(job.name)}">停止</button>
         </div>
       </div>
     `).join("");
@@ -288,12 +379,12 @@
     const unknown = gpus.filter((gpu) => gpu.state === "unknown").length;
     const processes = data.unmanaged?.processes?.length || 0;
     $("#summary").innerHTML = `
-      <div class="stat"><strong>${gpus.length}</strong><span>GPUs</span></div>
-      <div class="stat"><strong>${free}</strong><span>free</span></div>
-      <div class="stat"><strong>${allocated}</strong><span>allocated</span></div>
-      <div class="stat"><strong>${unmanaged}</strong><span>unmanaged</span></div>
-      <div class="stat"><strong>${unknown}</strong><span>unknown</span></div>
-      <div class="stat"><strong>${processes}</strong><span>unmanaged processes</span></div>
+      <div class="stat"><strong>${gpus.length}</strong><span>GPU 总数</span></div>
+      <div class="stat"><strong>${free}</strong><span>空闲</span></div>
+      <div class="stat"><strong>${allocated}</strong><span>已分配</span></div>
+      <div class="stat"><strong>${unmanaged}</strong><span>未纳管</span></div>
+      <div class="stat"><strong>${unknown}</strong><span>未知</span></div>
+      <div class="stat"><strong>${processes}</strong><span>未纳管进程</span></div>
     `;
     renderGpuGrid(gpus);
     renderApplyChoices(gpus);
@@ -304,7 +395,7 @@
   function renderGpuGrid(gpus) {
     const grid = $("#gpu-grid");
     if (!gpus.length) {
-      grid.innerHTML = '<div class="allocation-list empty">No GPU inventory is available.</div>';
+      grid.innerHTML = '<div class="allocation-list empty">暂无 GPU 清单。</div>';
       return;
     }
     grid.innerHTML = gpus.map((gpu) => {
@@ -315,24 +406,24 @@
       const deadline = gpu.remaining_seconds !== null && gpu.remaining_seconds !== undefined
         ? Date.now() + Number(gpu.remaining_seconds) * 1000
         : null;
-      let detail = '<span>available for apply</span>';
+      let detail = '<span>可申请</span>';
       if (gpuState === "allocated") {
-        detail = `<span>owner <b>${esc(ownerLabel(gpu) || "?")}</b></span>
-                  <span>alloc <b>${esc((gpu.allocation_id || "").slice(0, 12))}</b></span>
-                  ${ownerContact(gpu) ? `<span>contact ${esc(ownerContact(gpu))}</span>` : ""}`;
+        detail = `<span>使用人 <b>${esc(ownerLabel(gpu) || "?")}</b></span>
+                  <span>租约 <b>${esc((gpu.allocation_id || "").slice(0, 12))}</b></span>
+                  ${ownerContact(gpu) ? `<span>联系人 ${esc(ownerContact(gpu))}</span>` : ""}`;
       } else if (!isFree) {
-        detail = `<span>${esc(gpu.state_reason || gpuState)}</span>`;
+        detail = `<span>${esc(gpu.state_reason || labelOf("gpu", gpuState))}</span>`;
       }
       return `
         <article class="gpu-card ${gpuState} ${stale} ${clickable}" data-gpu-index="${gpu.index}">
           <div class="gpu-head">
             <span class="gpu-index">GPU ${gpu.index}</span>
-            <span class="gpu-state ${gpuState}">${esc(gpuState)}</span>
+            <span class="gpu-state ${gpuState}">${esc(labelOf("gpu", gpuState))}</span>
           </div>
           <div class="gpu-meta">
             <span>${esc(gpu.name || "")} · ${esc(gpu.memory_mib || "")} MiB</span>
             ${detail}
-            ${gpu.compute_pids?.length ? `<span>compute PIDs: <b>${esc(gpu.compute_pids.join(","))}</b></span>` : ""}
+            ${gpu.compute_pids?.length ? `<span>计算进程 PID：<b>${esc(gpu.compute_pids.join(","))}</b></span>` : ""}
           </div>
           ${deadline !== null
             ? `<div class="gpu-remaining" data-deadline="${deadline}">${formatRemaining(gpu.remaining_seconds)}</div>`
@@ -365,7 +456,7 @@
     const freeCount = gpus.filter((gpu) => gpu.state === "free").length;
     const note = freeCount
       ? ""
-      : '<span class="muted">所有 GPU 均被占用：选择 GPU 将创建排队请求（不会插队），留空则申请 CPU-only。</span>';
+      : '<span class="muted">所有 GPU 均被占用：选择 GPU 将创建排队请求（不会插队），留空则只申请 CPU。</span>';
     container.innerHTML = gpus.map((gpu) => {
       const gpuState = String(gpu.state || "unknown");
       const owner = gpuState === "allocated" && gpu.owner_display
@@ -377,7 +468,7 @@
           <input type="checkbox" name="gpu" value="${gpu.index}"
             ${unselectable ? "disabled" : ""}
             ${state.selectedGpus.has(gpu.index) ? "checked" : ""}>
-          GPU ${gpu.index} <span class="muted">${esc(gpuState)}${owner}</span>
+          GPU ${gpu.index} <span class="muted">${esc(labelOf("gpu", gpuState))}${owner}</span>
         </label>
       `;
     }).join("") + note;
@@ -390,12 +481,13 @@
     });
   }
 
-  function statusBadge(status) {
-    return `<span class="badge ${esc(status)}">${esc(status)}</span>`;
+  function statusBadge(kind, status) {
+    const text = labelOf(kind, status);
+    return `<span class="badge ${esc(status)}">${esc(text)}</span>`;
   }
 
   function allocationItem(allocation, actions) {
-    const gpus = (allocation.gpus || []).length ? allocation.gpus.join(",") : "CPU-only";
+    const gpus = (allocation.gpus || []).length ? allocation.gpus.join(",") : "仅 CPU";
     const remainingId = `remaining-${allocation.id}`;
     const contact = ownerContact(allocation);
     const deadline = allocation.remaining_seconds !== null && allocation.remaining_seconds !== undefined
@@ -405,16 +497,16 @@
       <div class="allocation-item" data-allocation="${esc(allocation.id)}">
         <div>
           <div class="id">${esc(allocation.id)}</div>
-          <div class="muted">${esc(ownerLabel(allocation))} · ${statusBadge(allocation.status || "")}
-            ${contact ? `<br>contact: ${esc(contact)}` : ""}</div>
+          <div class="muted">${esc(ownerLabel(allocation))} · ${statusBadge("allocation", allocation.status || "")}
+            ${contact ? `<br>联系人：${esc(contact)}` : ""}</div>
         </div>
-        <div class="muted">GPU: <b>${esc(gpus)}</b><br>CPU/RAM: ${esc(allocation.cpus)} / ${esc(allocation.memory_gb)} GiB</div>
+        <div class="muted">GPU：<b>${esc(gpus)}</b><br>CPU/内存：${esc(allocation.cpus)} / ${esc(allocation.memory_gb)} GiB</div>
         <div class="muted">
           ${deadline !== null
             ? `剩余 <span class="gpu-remaining" id="${esc(remainingId)}" data-deadline="${deadline}">${formatRemaining(allocation.remaining_seconds)}</span>`
             : "—"}
           ${allocation.container_name ? `<br>${esc(allocation.container_name)}` : ""}
-          ${allocation.note ? `<br>note: ${esc(allocation.note)}` : ""}
+          ${allocation.note ? `<br>备注：${esc(allocation.note)}` : ""}
         </div>
         <div class="row-actions">${actions || ""}</div>
       </div>
@@ -425,12 +517,12 @@
     const id = esc(allocation.id);
     const active = allocation.status === "active";
     const release = (allocation.status === "active" || allocation.status === "pending")
-      ? `<button data-action="release" data-id="${id}">release</button>`
+      ? `<button data-action="release" data-id="${id}">释放</button>`
       : "";
-    const shell = active ? `<button data-action="shell" data-id="${id}">shell</button>` : "";
-    const logs = allocation.container_id ? `<button data-action="logs" data-id="${id}">logs</button>` : "";
+    const shell = active ? `<button data-action="shell" data-id="${id}">终端</button>` : "";
+    const logs = allocation.container_id ? `<button data-action="logs" data-id="${id}">日志</button>` : "";
     // Persistent job logs outlive the container; offer them for every status.
-    const history = `<button data-action="history" data-id="${id}">history</button>`;
+    const history = `<button data-action="history" data-id="${id}">历史日志</button>`;
     const vscode = active && state.config?.vscode_enabled
       ? `<button data-action="vscode" data-id="${id}">VS Code</button>`
       : "";
@@ -456,7 +548,7 @@
     const target = $("#all-allocations");
     if (!allocations.length) {
       target.className = "allocation-list empty";
-      target.textContent = "No allocations.";
+      target.textContent = "暂无租约。";
       return;
     }
     target.className = "allocation-list";
@@ -471,7 +563,7 @@
     const allocations = data.allocations || [];
     if (!allocations.length) {
       target.className = "allocation-list empty";
-      target.textContent = "No allocations.";
+      target.textContent = "暂无租约。";
       return;
     }
     target.className = "allocation-list";
@@ -487,30 +579,30 @@
     const containerTarget = $("#unmanaged-containers");
     if (!containers.length) {
       containerTarget.className = "allocation-list empty";
-      containerTarget.textContent = "None.";
+      containerTarget.textContent = "暂无。";
     } else {
       containerTarget.className = "allocation-list";
       containerTarget.innerHTML = containers.map((container) => `
         <div class="allocation-item">
           <div><div class="id">${esc(container.name)}</div><div class="muted">${esc(container.id)}</div></div>
-          <div class="muted">${esc(container.image)}</div>
-          <div class="muted">${esc(container.status)}</div>
-          <div class="muted">${container.gpus?.length ? `GPU ${esc(container.gpus.join(","))}` : "no GPU"} · ${container.owner ? `owner ${esc(ownerLabel(container))}` : "unmanaged"}</div>
+          <div class="muted">镜像：${esc(container.image)}</div>
+          <div class="muted">状态：${esc(container.status)}</div>
+          <div class="muted">${container.gpus?.length ? `GPU ${esc(container.gpus.join(","))}` : "无 GPU"} · ${container.owner ? `使用人 ${esc(ownerLabel(container))}` : "未纳管"}</div>
         </div>
       `).join("");
     }
     const processTarget = $("#unmanaged-processes");
     if (!processes.length) {
       processTarget.className = "allocation-list empty";
-      processTarget.textContent = "None.";
+      processTarget.textContent = "暂无。";
     } else {
       processTarget.className = "allocation-list";
       processTarget.innerHTML = processes.map((process) => `
         <div class="allocation-item">
           <div><div class="id">PID ${esc(process.pid)}</div><div class="muted">GPU ${esc(process.gpu_index ?? "?")}</div></div>
           <div class="muted">${esc(process.process_name || "?")}</div>
-          <div class="muted">${esc(process.used_mib)} MiB<br>${esc(process.owner_display || process.username || process.uid || "unknown")}${process.owner_public_contact ? `<br>contact ${esc(process.owner_public_contact)}` : ""}</div>
-          <div class="muted">${process.container_name ? `container ${esc(process.container_name)}` : "read-only"}${process.container_owner ? `<br>owner ${esc(process.container_owner_display || process.container_owner)}` : ""}</div>
+          <div class="muted">${esc(process.used_mib)} MiB<br>${esc(process.owner_display || process.username || process.uid || "未知")}${process.owner_public_contact ? `<br>联系人 ${esc(process.owner_public_contact)}` : ""}</div>
+          <div class="muted">${process.container_name ? `容器 ${esc(process.container_name)}` : "只读"}${process.container_owner ? `<br>使用人 ${esc(process.container_owner_display || process.container_owner)}` : ""}</div>
         </div>
       `).join("");
     }
@@ -519,7 +611,7 @@
   async function refreshEnvironments() {
     try {
       const payload = await api("/api/projects");
-      if (!payload.ok) throw new Error(payload?.error?.message || "project list failed");
+      if (!payload.ok) throw new Error(payload?.error?.message || "读取项目列表失败");
       state.projects = payload.data.projects || [];
       renderProjects();
       const active = state.projects.filter((project) => project.status === "active");
@@ -551,9 +643,9 @@
       <div class="allocation-item">
         <div>
           <div class="id">${esc(project.name)}</div>
-          <div class="muted">${statusBadge(project.status)} · ${esc(project.versions)} 个版本</div>
+          <div class="muted">${statusBadge("project", project.status)} · ${esc(project.versions)} 个版本</div>
         </div>
-        <div class="muted">latest: ${esc(project.latest || "—")}<br>created ${esc(project.created_at)}</div>
+        <div class="muted">最新版本：${esc(project.latest || "—")}<br>创建时间：${esc(project.created_at)}</div>
         <div class="row-actions">
           <button data-action="project-open" data-name="${esc(project.name)}">查看版本</button>
           ${project.status === "active"
@@ -617,7 +709,7 @@
     }
     try {
       const payload = await api(`/api/environments?project=${encodeURIComponent(project)}`);
-      if (!payload.ok) throw new Error(payload?.error?.message || "env list failed");
+      if (!payload.ok) throw new Error(payload?.error?.message || "读取环境版本失败");
       state.versions = payload.data.versions || [];
       renderVersions();
     } catch (error) {
@@ -634,11 +726,14 @@
       (allocation) => allocation.status === "active",
     );
     const current = select.value;
-    select.innerHTML = allocations.map((allocation) => `
-      <option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))} · GPU ${esc((allocation.gpus || []).join(",") || "cpu")}</option>
-    `).join("");
+    select.innerHTML = allocations.map((allocation) => {
+      const gpus = (allocation.gpus || []).join(",");
+      return `
+      <option value="${esc(allocation.id)}">${esc(allocation.id.slice(0, 12))} · ${gpus ? `GPU ${esc(gpus)}` : "仅 CPU"}</option>
+    `;
+    }).join("");
     if (!allocations.length) {
-      select.innerHTML = '<option value="">没有 active allocation</option>';
+      select.innerHTML = '<option value="">没有运行中的租约</option>';
     } else if (allocations.some((allocation) => allocation.id === current)) {
       select.value = current;
     }
@@ -669,12 +764,12 @@
         <div class="allocation-item">
           <div>
             <div class="id">${esc(version.ref)}</div>
-            <div class="muted">${statusBadge(version.capture_fidelity)} ${statusBadge(version.verification)} · ${esc(version.origin)}</div>
+            <div class="muted">${statusBadge("fidelity", version.capture_fidelity)} ${statusBadge("verification", version.verification)} · ${esc(labelOf("origin", version.origin))}</div>
           </div>
-          <div class="muted">created ${esc(version.created_at)}<br>sha256 ${esc(String(version.sha256 || "").slice(0, 12))}</div>
-          <div class="muted">visibility ${esc(version.visibility)}</div>
+          <div class="muted">创建时间：${esc(version.created_at)}<br>sha256 ${esc(String(version.sha256 || "").slice(0, 12))}</div>
+          <div class="muted">可见性：${esc(labelOf("visibility", version.visibility))}</div>
           <div class="row-actions">
-            <button data-action="env-show" data-ref="${esc(version.ref)}">manifest</button>
+            <button data-action="env-show" data-ref="${esc(version.ref)}">版本清单</button>
             ${previous
               ? `<button data-action="env-diff" data-ref="${esc(version.ref)}" data-other="${esc(previous.ref)}">对比 ${esc(previous.ref)}</button>`
               : ""}
@@ -714,15 +809,15 @@
         `<li>${esc(item.name)}${item.version ? `==${esc(item.version)}` : ""}</li>`
       ).join("");
       const builds = (payload.data.builds || []).map((build) =>
-        `<li>${esc(build.status)} · ${esc(build.image_tag || "")} ${esc(String(build.image_id || "").slice(0, 19))}</li>`
+        `<li>${esc(labelOf("build", build.status))} · ${esc(build.image_tag || "")} ${esc(String(build.image_id || "").slice(0, 19))}</li>`
       ).join("");
       showDetail(`环境 ${version.ref || ref}`, `
-        <p>fidelity <b>${esc(version.capture_fidelity)}</b> · verification <b>${esc(version.verification)}</b> · origin ${esc(version.origin)}</p>
-        <p>base: ${esc(base.image || "")}${base.digest ? `<br>digest ${esc(base.digest)}` : ""}</p>
-        <p>python: ${esc(python.version || "unknown")} (${esc(python.manager || "-")}) ·
-          ${(python.packages || []).length} packages · ${(python.conda_packages || []).length} conda packages ·
-          system ${(system.packages || []).length} packages</p>
-        ${packages ? `<h3>Python packages</h3><ul>${packages}</ul>` : ""}
+        <p>采集完整度 <b>${esc(labelOf("fidelity", version.capture_fidelity))}</b> · 功能验证 <b>${esc(labelOf("verification", version.verification))}</b> · 来源 ${esc(labelOf("origin", version.origin))}</p>
+        <p>基础镜像：${esc(base.image || "")}${base.digest ? `<br>摘要 ${esc(base.digest)}` : ""}</p>
+        <p>Python：${esc(python.version || "未知")}（${esc(python.manager || "-")}） ·
+          ${(python.packages || []).length} 个 Python 包 · ${(python.conda_packages || []).length} 个 conda 包 ·
+          ${(system.packages || []).length} 个系统包</p>
+        ${packages ? `<h3>Python 包</h3><ul>${packages}</ul>` : ""}
         ${builds ? `<h3>构建记录</h3><ul>${builds}</ul>` : ""}
       `);
     } catch (error) {
@@ -754,9 +849,9 @@
         ),
       ].join("");
       showDetail(`${other} → ${ref}`, `
-        ${base ? `<h3>Base</h3><ul>${base}</ul>` : ""}
-        ${python.version ? `<p>python: ${esc(python.version.from)} → ${esc(python.version.to)}</p>` : ""}
-        ${packageLines ? `<h3>Python packages</h3><ul>${packageLines}</ul>` : ""}
+        ${base ? `<h3>基础镜像</h3><ul>${base}</ul>` : ""}
+        ${python.version ? `<p>Python：${esc(python.version.from)} → ${esc(python.version.to)}</p>` : ""}
+        ${packageLines ? `<h3>Python 包</h3><ul>${packageLines}</ul>` : ""}
       `);
     } catch (error) {
       flash(String(error.message || error), "error");
@@ -772,7 +867,7 @@
       });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
       const build = payload.data.build || {};
-      flash(`构建 ${build.status || "完成"}：${build.detail || build.image_tag || ""}`, "ok");
+      flash(`构建 ${labelOf("build", build.status) || "完成"}：${build.detail || build.image_tag || ""}`, "ok");
       await refreshVersions();
     } catch (error) {
       flash(String(error.message || error), "error");
@@ -781,7 +876,7 @@
 
   async function verifyEnvVersion(ref, allocationId) {
     if (!ref || !allocationId) {
-      flash("先选择一个用该环境启动的 active allocation", "error");
+      flash("先选择一个用该环境启动的运行中租约", "error");
       return;
     }
     if (!window.confirm(`确认 ${allocationId} 已用 ${ref} 完成训练，并标记功能验证通过？`)) return;
@@ -806,7 +901,7 @@
         api("/api/legacy/sources"),
         api("/api/legacy/claims"),
       ]);
-      if (!sources.ok) throw new Error(sources?.error?.message || "legacy list failed");
+      if (!sources.ok) throw new Error(sources?.error?.message || "读取旧容器来源失败");
       state.legacySources = sources.data.sources || [];
       state.legacyClaims = claims.ok ? claims.data.claims || [] : [];
       renderLegacySources(sources.ok ? "" : claims?.error?.message || "");
@@ -841,9 +936,9 @@
       const metadata = source.metadata || {};
       return `
         <div class="allocation-item">
-          <div><div class="id">${esc(source.source_id)}</div><div class="muted">${esc(source.container)} · ${statusBadge(source.status)}</div></div>
-          <div class="muted">state ${esc(source.state)} · image ${esc(metadata.image || source.image || "")}</div>
-          <div class="muted">created ${esc(source.created_at || "—")}<br>scanned ${esc(source.scanned_at || "—")}</div>
+          <div><div class="id">${esc(source.source_id)}</div><div class="muted">${esc(source.container)} · ${statusBadge("source", source.status)}</div></div>
+          <div class="muted">状态 ${esc(labelOf("docker", source.state))} · 镜像 ${esc(metadata.image || source.image || "")}</div>
+          <div class="muted">创建时间 ${esc(source.created_at || "—")}<br>扫描时间 ${esc(source.scanned_at || "—")}</div>
         </div>
       `;
     }).join("");
@@ -882,8 +977,8 @@
       const version = claim.version || {};
       return `
         <div class="allocation-item">
-          <div><div class="id">${esc(claim.claim_id)}</div><div class="muted">${statusBadge(claim.status)} · source ${esc(claim.source?.source_id || "")}</div></div>
-          <div class="muted">${esc(claim.reason || "—")}<br>version: ${esc(version.ref || "—")}</div>
+          <div><div class="id">${esc(claim.claim_id)}</div><div class="muted">${statusBadge("claim", claim.status)} · 来源 ${esc(claim.source?.source_id || "")}</div></div>
+          <div class="muted">${esc(claim.reason || "—")}<br>版本：${esc(version.ref || "—")}</div>
           <div class="muted">${esc(claim.review_note || "")}</div>
           <div class="row-actions">
             <button data-action="legacy-show" data-id="${esc(claim.claim_id)}">详情</button>
@@ -905,12 +1000,12 @@
       const source = claim.source || {};
       const version = claim.version || {};
       showDetail(`认领 ${claim.claim_id}`, `
-        <p>status <b>${esc(claim.status)}</b></p>
-        <p>source: ${esc(source.source_id)} · ${esc(source.container)} · state ${esc(source.state)}</p>
-        <p>image: ${esc(source.image || "")}</p>
-        <p>reason: ${esc(claim.reason || "—")}</p>
-        <p>review: ${esc(claim.review_note || "—")}</p>
-        ${version.ref ? `<p>version: ${esc(version.ref)} · fidelity ${esc(version.capture_fidelity)}</p>` : ""}
+        <p>状态 <b>${esc(labelOf("claim", claim.status))}</b></p>
+        <p>来源：${esc(source.source_id)} · ${esc(source.container)} · 容器状态 ${esc(labelOf("docker", source.state))}</p>
+        <p>镜像：${esc(source.image || "")}</p>
+        <p>申请理由：${esc(claim.reason || "—")}</p>
+        <p>审核说明：${esc(claim.review_note || "—")}</p>
+        ${version.ref ? `<p>版本：${esc(version.ref)} · 采集完整度 ${esc(labelOf("fidelity", version.capture_fidelity))}</p>` : ""}
       `);
     } catch (error) {
       flash(String(error.message || error), "error");
@@ -924,7 +1019,7 @@
         api("/api/admin/legacy/sources"),
         api("/api/admin/legacy/claims"),
       ]);
-      if (!sources.ok) throw new Error(sources?.error?.message || "legacy sources failed");
+      if (!sources.ok) throw new Error(sources?.error?.message || "读取旧容器来源失败");
       state.adminLegacySources = sources.data.sources || [];
       state.adminLegacyClaims = claims.ok ? claims.data.claims || [] : [];
       renderAdminLegacySources(sources.ok ? "" : claims?.error?.message || "");
@@ -972,9 +1067,9 @@
     target.className = "allocation-list";
     target.innerHTML = sources.map((source) => `
       <div class="allocation-item">
-        <div><div class="id">${esc(source.container_name || source.container_id)}</div><div class="muted">${esc(String(source.container_id || "").slice(0, 19))} · ${statusBadge(source.status)}</div></div>
-        <div class="muted">state ${esc(source.state)} · image ${esc(source.image || "")}<br>${esc(source.image_id || "")}</div>
-        <div class="muted">created ${esc(source.created_at || "—")}<br>scanned ${esc(source.scanned_at || "—")}</div>
+        <div><div class="id">${esc(source.container_name || source.container_id)}</div><div class="muted">${esc(String(source.container_id || "").slice(0, 19))} · ${statusBadge("source", source.status)}</div></div>
+        <div class="muted">状态 ${esc(labelOf("docker", source.state))} · 镜像 ${esc(source.image || "")}<br>${esc(source.image_id || "")}</div>
+        <div class="muted">创建时间 ${esc(source.created_at || "—")}<br>扫描时间 ${esc(source.scanned_at || "—")}</div>
         <div class="muted">${esc(source.server_id || "")}</div>
       </div>
     `).join("");
@@ -1004,9 +1099,9 @@
             : "");
       return `
         <div class="allocation-item">
-          <div><div class="id">${esc(claim.claim_id)}</div><div class="muted">${statusBadge(claim.status)} · member ${esc(claim.member_id)}</div></div>
-          <div class="muted">source ${esc(claim.source?.source_id || "")} · ${esc(claim.source?.container_name || claim.source?.container || "")}</div>
-          <div class="muted">${esc(claim.reason || "—")}<br>version ${esc(version.ref || "—")}</div>
+          <div><div class="id">${esc(claim.claim_id)}</div><div class="muted">${statusBadge("claim", claim.status)} · 成员 ${esc(claim.member_id)}</div></div>
+          <div class="muted">来源 ${esc(claim.source?.source_id || "")} · ${esc(claim.source?.container_name || claim.source?.container || "")}</div>
+          <div class="muted">${esc(claim.reason || "—")}<br>版本 ${esc(version.ref || "—")}</div>
           <div class="row-actions">${actions}</div>
         </div>
       `;
@@ -1033,7 +1128,7 @@
         body: { id: claimId, approve, note },
       });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash(`认领 ${claimId}：${payload.data.claim?.status || (approve ? "approved" : "rejected")}`, "ok");
+      flash(`认领 ${claimId}：${labelOf("claim", payload.data.claim?.status || (approve ? "approved" : "rejected"))}`, "ok");
       await refreshLegacyAdmin();
       await refreshLegacy();
     } catch (error) {
@@ -1051,7 +1146,7 @@
       });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
       const version = payload.data.version || {};
-      flash(`已生成 ${version.ref} · fidelity ${version.capture_fidelity}`, "ok");
+      flash(`已生成 ${version.ref} · 采集完整度 ${labelOf("fidelity", version.capture_fidelity)}`, "ok");
       await refreshLegacyAdmin();
       await refreshLegacy();
       await refreshEnvironments();
@@ -1061,11 +1156,11 @@
   }
 
   async function releaseAllocation(id) {
-    if (!window.confirm(`Release ${id}?`)) return;
+    if (!window.confirm(`释放租约 ${id}？`)) return;
     try {
       const payload = await api("/api/release", { method: "POST", body: { id } });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash(`Released ${id}`, "ok");
+      flash(`已释放 ${id}`, "ok");
       await refresh();
     } catch (error) {
       flash(String(error.message || error), "error");
@@ -1073,11 +1168,11 @@
   }
 
   async function cancelQueue(id) {
-    if (!window.confirm(`Cancel queued request ${id}?`)) return;
+    if (!window.confirm(`取消排队申请 ${id}？`)) return;
     try {
       const payload = await api("/api/queue/cancel", { method: "POST", body: { id } });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash(`Cancelled ${id}`, "ok");
+      flash(`已取消 ${id}`, "ok");
       await refresh();
     } catch (error) {
       flash(String(error.message || error), "error");
@@ -1085,14 +1180,14 @@
   }
 
   async function stopJob(allocationId, name) {
-    if (!window.confirm(`Stop job ${name}?`)) return;
+    if (!window.confirm(`停止任务 ${name}？`)) return;
     try {
       const payload = await api(`/api/jobs/${encodeURIComponent(allocationId)}/stop`, {
         method: "POST",
         body: { name },
       });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash(`Stopped ${name}`, "ok");
+      flash(`已停止 ${name}`, "ok");
       await refreshJobs();
     } catch (error) {
       flash(String(error.message || error), "error");
@@ -1111,7 +1206,7 @@
     // quotes and spaces survive (e.g. --output "experiment one").
     const command = String(data.get("command") || "").trim();
     if (!allocationId || !name || !command) {
-      errorTarget.textContent = "allocation、任务名和命令都不能为空";
+      errorTarget.textContent = "租约、任务名和命令都不能为空";
       return;
     }
     try {
@@ -1120,7 +1215,7 @@
         body: { name, command },
       });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash(`Job ${payload.data.name} started; log: ${payload.data.log}`, "ok");
+      flash(`任务 ${payload.data.name} 已启动；日志：${payload.data.log}`, "ok");
       form.reset();
       await refreshJobs();
     } catch (error) {
@@ -1135,11 +1230,11 @@
       const uri = String(payload.data?.uri || "");
       const message = String(payload.data?.message || "");
       if (payload.data?.stage === "ready") {
-        flash(`VS Code 已启动${uri ? `: ${uri}` : ""}`, "ok", 15000);
+        flash(`VS Code 已启动${uri ? `：${uri}` : ""}`, "ok", 15000);
       } else {
         // The IDE window is not confirmed; surface the copyable URI instead.
         flash(
-          `隧道已验证（容器 SSH 可达）${message ? ` — ${message}` : ""}${uri ? `。打开: ${uri}` : ""}`,
+          `隧道已验证（容器 SSH 可达）${message ? ` — ${message}` : ""}${uri ? `。打开：${uri}` : ""}`,
           "ok",
           30000,
         );
@@ -1154,12 +1249,12 @@
     $("#terminal-modal").hidden = true;
     $("#logs-modal").hidden = false;
     $("#modal-backdrop").hidden = false;
-    $("#logs-modal-title").textContent = "Logs";
-    $("#logs-content").textContent = "loading…";
+    $("#logs-modal-title").textContent = "日志";
+    $("#logs-content").textContent = "加载中…";
     try {
       const payload = await api(`/api/logs/${encodeURIComponent(id)}?tail=300`);
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      $("#logs-content").textContent = payload.data.logs || "(empty)";
+      $("#logs-content").textContent = payload.data.logs || "（空）";
     } catch (error) {
       $("#logs-content").textContent = String(error.message || error);
     }
@@ -1170,14 +1265,14 @@
     $("#terminal-modal").hidden = true;
     $("#logs-modal").hidden = false;
     $("#modal-backdrop").hidden = false;
-    $("#logs-modal-title").textContent = `Job logs · ${name}`;
-    $("#logs-content").textContent = "loading…";
+    $("#logs-modal-title").textContent = `任务日志 · ${name}`;
+    $("#logs-content").textContent = "加载中…";
     try {
       const payload = await api(
         `/api/job-logs/${encodeURIComponent(id)}?name=${encodeURIComponent(name)}&tail=300`,
       );
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      $("#logs-content").textContent = payload.data.logs || "(empty)";
+      $("#logs-content").textContent = payload.data.logs || "（空）";
     } catch (error) {
       $("#logs-content").textContent = String(error.message || error);
     }
@@ -1189,24 +1284,24 @@
     $("#logs-modal").hidden = true;
     $("#history-modal").hidden = false;
     $("#modal-backdrop").hidden = false;
-    $("#history-modal-title").textContent = "Job history";
+    $("#history-modal-title").textContent = "任务历史";
     const target = $("#history-list");
-    target.textContent = "loading…";
+    target.textContent = "加载中…";
     try {
       const payload = await api(`/api/job-history/${encodeURIComponent(id)}`);
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
       const files = payload.data.files || [];
       if (!files.length) {
         target.className = "allocation-list empty";
-        target.textContent = "No log files.";
+        target.textContent = "暂无日志文件。";
         return;
       }
       target.className = "allocation-list";
       target.innerHTML = files.map((file) => `
         <div class="allocation-item">
           <div><div class="id">${esc(file.name)}</div></div>
-          <div class="muted">${esc(file.bytes ?? 0)} bytes</div>
-          <div class="row-actions"><button data-log="${esc(String(file.name).replace(/\.log$/, ""))}">view</button></div>
+          <div class="muted">${esc(file.bytes ?? 0)} 字节</div>
+          <div class="row-actions"><button data-log="${esc(String(file.name).replace(/\.log$/, ""))}">查看</button></div>
         </div>
       `).join("");
       target.querySelectorAll("button[data-log]").forEach((button) => {
@@ -1244,13 +1339,13 @@
   function openTerminal(id, job = "") {
     closeTerminal();
     if (!window.Terminal || !window.FitAddon) {
-      flash("xterm.js assets are missing", "error");
+      flash("缺少终端组件（xterm.js）", "error");
       return;
     }
     $("#logs-modal").hidden = true;
     $("#terminal-modal").hidden = false;
     $("#modal-backdrop").hidden = false;
-    $("#terminal-status").textContent = "connecting…";
+    $("#terminal-status").textContent = "正在连接…";
     const element = $("#terminal");
     element.innerHTML = "";
     const term = new window.Terminal({
@@ -1286,7 +1381,7 @@
     socket.binaryType = "arraybuffer";
     state.terminal = { term, fit, socket };
     socket.onopen = () => {
-      $("#terminal-status").textContent = "connected · close this window to disconnect";
+      $("#terminal-status").textContent = "已连接 · 关闭此窗口即断开";
       fit.fit();
       term.focus();
     };
@@ -1294,8 +1389,8 @@
       if (typeof event.data === "string") {
         try {
           const message = JSON.parse(event.data);
-          if (message.type === "error") term.write(`\r\n[error] ${message.message}\r\n`);
-          else if (message.type === "exit") term.write(`\r\n[exit ${message.code}]\r\n`);
+          if (message.type === "error") term.write(`\r\n[错误] ${message.message}\r\n`);
+          else if (message.type === "exit") term.write(`\r\n[已退出 ${message.code}]\r\n`);
         } catch {
           term.write(event.data);
         }
@@ -1304,10 +1399,10 @@
       }
     };
     socket.onerror = () => {
-      $("#terminal-status").textContent = "terminal connection error";
+      $("#terminal-status").textContent = "终端连接出错";
     };
     socket.onclose = () => {
-      $("#terminal-status").textContent = "session closed";
+      $("#terminal-status").textContent = "会话已关闭";
     };
     term.onData((data) => {
       if (socket.readyState === WebSocket.OPEN) {
@@ -1356,15 +1451,6 @@
       flash(String(error.message || error), "error");
     }
   }
-
-  const memberStatusLabels = {
-    provisioning: "开户中",
-    active: "有效",
-    suspended: "已暂停",
-    expired: "已到期",
-    revoked: "已撤销",
-    provision_failed: "开户失败",
-  };
 
   function requestVersion(request) {
     return String(request.version || "");
@@ -1426,7 +1512,7 @@
     target.innerHTML = requests.map((request) => `
       <div class="allocation-item">
         <div><div class="id">${esc(request.display_name || request.username)}</div>
-          <div class="muted">${esc(request.request_id)} · ${esc(request.status)}</div>
+          <div class="muted">${esc(request.request_id)} · ${esc(labelOf("request", request.status))}</div>
           <div class="muted">版本 ${esc(requestVersion(request).slice(0, 16))}${requestVersion(request).length > 16 ? "…" : ""}</div>
         </div>
         <div class="muted">${esc(request.affiliation || "")}<br>${esc(request.purpose || "")}</div>
@@ -1464,7 +1550,7 @@
             `申请 · ${request.display_name || request.username || id}`,
             `<div class="allocation-list">
               <div class="allocation-item"><div><div class="id">${esc(request.username || "")}</div></div>
-                <div class="muted">状态 ${esc(request.status || "")} · 版本 ${esc(requestVersion(request))}</div></div>
+                <div class="muted">状态 ${esc(labelOf("request", request.status))} · 版本 ${esc(requestVersion(request))}</div></div>
               <div class="allocation-item"><div class="muted">
                 <strong>姓名：</strong>${esc(request.display_name || "")}<br>
                 <strong>单位：</strong>${esc(request.affiliation || "")}<br>
@@ -1477,7 +1563,7 @@
               <div class="allocation-item"><div><div class="id">公钥</div>
                 <div class="muted">${(request.keys || []).map((key) => esc(key.fingerprint)).join("<br>") || "无"}</div></div></div>
               <div class="allocation-item"><div><div class="id">管理员决定</div>
-                <div class="muted">${decision.status ? `状态 ${esc(decision.status)} · 版本 ${esc(decision.version || "")}<br>${esc(decision.review_note || "")}` : "尚未记录决定"}</div></div></div>
+                <div class="muted">${decision.status ? `状态 ${esc(labelOf("request", decision.status))} · 版本 ${esc(decision.version || "")}<br>${esc(decision.review_note || "")}` : "尚未记录决定"}</div></div></div>
             </div>`,
           );
         } catch (error) {
@@ -1500,7 +1586,7 @@
     if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
     const result = payload.data || {};
     flash(
-      `成员 ${member.member_id}：${result.status || action}${
+      `成员 ${member.member_id}：${labelOf("member", result.status || action)}${
         result.credential_revocation === "pending_retry"
           ? "（访问已阻断；凭据撤销待重试，请到操作详情重试）"
           : ""
@@ -1525,7 +1611,7 @@
       <div class="allocation-item">
         <div><div class="id">${esc(member.display_name || member.linux_username || member.member_id)}</div>
           <div class="muted">${esc(member.member_id)}</div></div>
-        <div class="muted">${esc(memberStatusLabels[member.status] || member.status)} · uid ${esc(member.linux_uid ?? "—")}<br>
+        <div class="muted">${esc(labelOf("member", member.status))} · uid ${esc(member.linux_uid ?? "—")}<br>
           ${member.valid_until ? `至 ${esc(member.valid_until)}` : "无固定期限"} · 版本 ${esc(member.access_version ?? "—")}</div>
         <div class="row-actions">
           <button class="ghost" data-membershow="${esc(member.member_id)}">详情</button>
@@ -1563,7 +1649,7 @@
               <div class="allocation-item"><div class="muted">
                 <strong>ID：</strong>${esc(member.member_id || "")}<br>
                 <strong>Linux：</strong>${esc(member.linux_username || "—")} (uid ${esc(member.linux_uid ?? "—")})<br>
-                <strong>状态：</strong>${esc(memberStatusLabels[member.status] || member.status || "")}<br>
+                <strong>状态：</strong>${esc(labelOf("member", member.status))}<br>
                 <strong>有效期：</strong>${esc(member.valid_until || "无固定期限")}<br>
                 <strong>访问版本：</strong>${esc(member.access_version ?? "—")}<br>
                 <strong>创建/更新：</strong>${esc(member.created_at || "")} / ${esc(member.updated_at || "")}
@@ -1575,7 +1661,7 @@
                 <div class="row-actions"><button id="member-add-key">添加公钥</button></div>
               </div></div>
               <div class="allocation-item"><div><div class="id">操作记录</div>
-                <div class="muted">${operations.map((op) => `${esc(op.action)} · ${esc(op.status)} · 尝试 ${esc(op.attempts)}${op.last_error ? `<br>${esc(op.last_error)}` : ""}`).join("<br><br>") || "无"}</div></div></div>
+                <div class="muted">${operations.map((op) => `${esc(labelOf("operation", op.action))} · ${esc(labelOf("operation", op.status))} · 尝试 ${esc(op.attempts)}${op.last_error ? `<br>${esc(op.last_error)}` : ""}`).join("<br><br>") || "无"}</div></div></div>
               <div class="row-actions" id="member-op-actions"></div>
             </div>`,
           );
@@ -1591,7 +1677,7 @@
               row.className = "allocation-item";
               const label = document.createElement("div");
               label.className = "muted";
-              label.textContent = `${key.status} · ${key.fingerprint}`;
+              label.textContent = `${labelOf("key", key.status)} · ${key.fingerprint}`;
               row.appendChild(label);
               if (key.status === "active") {
                 const revoke = document.createElement("button");
@@ -1646,7 +1732,7 @@
                   body: { operation_id: op.operation_id },
                 });
                 if (!result.ok) throw new Error(`${result.error?.code}: ${result.error?.message}`);
-                flash(`操作 ${op.operation_id}：${result.data?.status || "已提交重试"}`, "ok");
+                flash(`操作 ${op.operation_id}：${result.data?.status ? labelOf("operation", result.data.status) : "已提交重试"}`, "ok");
                 closeModal();
                 refreshMembership();
               } catch (error) {
@@ -1683,7 +1769,7 @@
     const target = $("#admin-users");
     if (!users.length) {
       target.className = "allocation-list empty";
-      target.textContent = "No users.";
+      target.textContent = "暂无用户。";
       return;
     }
     target.className = "allocation-list";
@@ -1691,7 +1777,7 @@
       <div class="allocation-item">
         <div class="id">${esc(user.username)}</div>
         <div class="muted">uid ${esc(user.uid)}</div>
-        <div class="muted">${esc(user.role)}</div>
+        <div class="muted">${esc(labelOf("role", user.role))}</div>
         <div class="muted">${esc(user.created_at)}</div>
       </div>
     `).join("");
@@ -1703,19 +1789,19 @@
     const allocations = data.allocations || [];
     target.className = "allocation-list";
     const gpuLines = gpus.map((gpu) =>
-      `<div class="allocation-item"><div>GPU ${esc(gpu.index)}</div><div class="muted">${esc(gpu.state)}</div><div class="muted">${esc(ownerLabel(gpu) || "—")}</div><div class="muted">${esc(gpu.allocation_id || "")}</div></div>`
+      `<div class="allocation-item"><div>GPU ${esc(gpu.index)}</div><div class="muted">${esc(labelOf("gpu", gpu.state))}</div><div class="muted">${esc(ownerLabel(gpu) || "—")}</div><div class="muted">${esc(gpu.allocation_id || "")}</div></div>`
     ).join("");
     const allocLines = allocations.map((allocation) =>
-      `<div class="allocation-item"><div class="id">${esc(allocation.id)}</div><div class="muted">${esc(allocation.status)}</div><div class="muted">${esc(ownerLabel(allocation))}</div><div class="muted">${esc(allocation.gpus)}</div>${allocation.note ? `<div class="muted">${esc(allocation.note)}</div>` : ""}</div>`
+      `<div class="allocation-item"><div class="id">${esc(allocation.id)}</div><div class="muted">${esc(labelOf("allocation", allocation.status))}</div><div class="muted">${esc(ownerLabel(allocation))}</div><div class="muted">${esc(allocation.gpus)}</div>${allocation.note ? `<div class="muted">${esc(allocation.note)}</div>` : ""}</div>`
     ).join("");
-    target.innerHTML = gpuLines + allocLines || '<div class="allocation-list empty">No data.</div>';
+    target.innerHTML = gpuLines + allocLines || '<div class="allocation-list empty">暂无数据。</div>';
   }
 
   function renderAdminAudit(events) {
     const target = $("#admin-audit-list");
     if (!events.length) {
       target.className = "allocation-list empty";
-      target.textContent = "No events.";
+      target.textContent = "暂无事件。";
       return;
     }
     target.className = "allocation-list";
@@ -1732,11 +1818,12 @@
   async function changeBrokerMode(mode) {
     const target = $("#mode-error");
     target.textContent = "";
-    if (mode === "active" && !window.confirm("Switch broker to active mode? Only do this after approval.")) return;
+    if (mode === "active" && !window.confirm("确认把 Broker 切换到 active 模式？只应在获得批准后操作。")) return;
     try {
       const payload = await api("/api/admin/mode", { method: "POST", body: { mode } });
       if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-      flash(`Mode: ${payload.data.mode}`, "ok");
+      const current = String(payload.data.mode || mode);
+      flash(`模式：${labelOf("mode", current)}（${current}）`, "ok");
       await refresh();
     } catch (error) {
       target.textContent = String(error.message || error);
@@ -1789,9 +1876,9 @@
         const payload = await api("/api/apply", { method: "POST", body });
         if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
         if (payload.data.queue_id) {
-          flash(`Queued: ${payload.data.queue_id} (position ${payload.data.position})`, "ok");
+          flash(`已排队：${payload.data.queue_id}（位置 ${payload.data.position}）`, "ok");
         } else {
-          flash(`Allocation ready: ${payload.data.id}`, "ok");
+          flash(`租约已就绪：${payload.data.id}`, "ok");
         }
         state.selectedGpus.clear();
         delete form.dataset.idempotencyKey;
@@ -1832,7 +1919,7 @@
       const project = $("#env-project")?.value || "";
       const allocation = String(new FormData(form).get("allocation") || "");
       if (!project || !allocation) {
-        target.textContent = "先选择项目和 active allocation";
+        target.textContent = "先选择项目和运行中的租约";
         return;
       }
       try {
@@ -1842,7 +1929,7 @@
         });
         if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
         const version = payload.data.version || {};
-        flash(`已保存 ${version.ref} · fidelity ${version.capture_fidelity}`, "ok");
+        flash(`已保存 ${version.ref} · 采集完整度 ${labelOf("fidelity", version.capture_fidelity)}`, "ok");
         await refreshVersions();
       } catch (error) {
         target.textContent = String(error.message || error);
@@ -1889,7 +1976,7 @@
           body: { id: String(data.get("id") || ""), reason: String(data.get("reason") || "") },
         });
         if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-        flash(`Force-released ${payload.data.id}`, "ok");
+        flash(`已强制释放 ${payload.data.id}`, "ok");
         form.reset();
         await refresh();
       } catch (error) {
@@ -1916,7 +2003,7 @@
       try {
         const payload = await api("/api/admin/reconcile", { method: "POST" });
         if (!payload.ok) throw new Error(`${payload.error?.code}: ${payload.error?.message}`);
-        flash(`Reconcile: ${JSON.stringify(payload.data)}`, "ok");
+        flash(`对账结果：${JSON.stringify(payload.data)}`, "ok");
         await refresh();
       } catch (error) {
         flash(String(error.message || error), "error");
