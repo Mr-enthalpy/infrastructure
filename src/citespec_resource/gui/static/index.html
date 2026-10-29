@@ -14,25 +14,25 @@
       <span class="logo">CITESPEC</span>
       <div>
         <h1>Resource Manager</h1>
-        <p class="muted"><span id="server-name">__SERVER_NAME__</span> · local GUI</p>
+        <p class="muted"><span id="server-name">__SERVER_NAME__</span> · 本机面板</p>
       </div>
     </div>
     <div class="top-status">
-      <span id="mode-pill" class="pill unknown">mode ?</span>
-      <span id="connection-pill" class="pill online">online</span>
+      <span id="mode-pill" class="pill unknown">模式 ?</span>
+      <span id="connection-pill" class="pill online">已连接</span>
     </div>
   </header>
 
   <div id="offline-banner" class="banner error" hidden>
-    Broker/SSH is offline. Showing the last known state; treat it as stale.
+    Broker/SSH 已离线。当前显示最后一次读取到的状态，可能已经过期。
   </div>
   <div id="compat-banner" class="banner error" hidden></div>
   <div id="flash" class="banner" hidden></div>
 
-  <nav class="tabs" aria-label="Sections">
+  <nav class="tabs" aria-label="分区">
     <button class="tab active" data-tab="overview">总览</button>
     <button class="tab" data-tab="apply">申请</button>
-    <button class="tab" data-tab="allocations">我的 allocation</button>
+    <button class="tab" data-tab="allocations">我的租约</button>
     <button class="tab" data-tab="unmanaged">未纳管</button>
     <button class="tab" data-tab="environments">环境</button>
     <button class="tab" data-tab="admin" id="admin-tab" hidden>管理员</button>
@@ -42,8 +42,8 @@
     <section id="tab-overview" class="tab-panel active">
       <div class="summary" id="summary"></div>
       <div id="gpu-grid" class="gpu-grid"></div>
-      <h2>All allocations</h2>
-      <div id="all-allocations" class="allocation-list empty">No data yet.</div>
+      <h2>全部租约</h2>
+      <div id="all-allocations" class="allocation-list empty">暂无数据。</div>
     </section>
 
     <section id="tab-apply" class="tab-panel">
@@ -51,7 +51,7 @@
         <h2>申请资源</h2>
         <form id="apply-form">
           <fieldset>
-            <legend>GPU（不选则为 CPU-only）</legend>
+            <legend>GPU（不选则只申请 CPU）</legend>
             <div id="gpu-choices" class="gpu-choices"></div>
           </fieldset>
           <div class="form-grid">
@@ -88,19 +88,19 @@
 
     <section id="tab-allocations" class="tab-panel">
       <div class="section-head">
-        <h2>我的 allocation</h2>
+        <h2>我的租约</h2>
         <button id="refresh-my" class="ghost">刷新</button>
       </div>
-      <div id="my-allocations" class="allocation-list empty">No allocations.</div>
-      <h2>Queued requests</h2>
-      <div id="my-queue" class="allocation-list empty">No queued requests.</div>
+      <div id="my-allocations" class="allocation-list empty">暂无租约。</div>
+      <h2>排队中的申请</h2>
+      <div id="my-queue" class="allocation-list empty">暂无排队申请。</div>
       <div class="section-head">
-        <h2>Jobs</h2>
+        <h2>任务</h2>
         <button id="refresh-jobs" class="ghost">刷新</button>
       </div>
       <div class="panel">
         <h3>启动训练任务</h3>
-        <p class="muted">在 active allocation 中启动 detached 任务；日志持久写入 /workspace/.citespec-logs/，随 allocation 保留。</p>
+        <p class="muted">在运行中的租约里启动后台任务；日志持久写入 /workspace/.citespec-logs/，随租约保留。</p>
         <form id="job-start-form" class="inline-form">
           <select name="allocation" id="job-start-allocation" required></select>
           <input name="name" placeholder="任务名（字母数字 . _ -）" maxlength="32" required>
@@ -109,17 +109,17 @@
         </form>
         <span id="job-start-error" class="error-text"></span>
       </div>
-      <div id="my-jobs" class="allocation-list empty">No jobs.</div>
+      <div id="my-jobs" class="allocation-list empty">暂无任务。</div>
     </section>
 
     <section id="tab-unmanaged" class="tab-panel">
       <div class="notice">
         只读视图。未纳管容器/进程不会被本系统停止或删除。
       </div>
-      <h2>Containers</h2>
-      <div id="unmanaged-containers" class="allocation-list empty">None.</div>
-      <h2>GPU processes</h2>
-      <div id="unmanaged-processes" class="allocation-list empty">None.</div>
+      <h2>容器</h2>
+      <div id="unmanaged-containers" class="allocation-list empty">暂无。</div>
+      <h2>GPU 进程</h2>
+      <div id="unmanaged-processes" class="allocation-list empty">暂无。</div>
     </section>
 
     <section id="tab-environments" class="tab-panel">
@@ -133,7 +133,7 @@
           <button type="submit" class="primary">创建项目</button>
         </form>
         <span id="project-error" class="error-text"></span>
-        <div id="project-list" class="allocation-list empty">No projects.</div>
+        <div id="project-list" class="allocation-list empty">暂无项目。</div>
       </div>
 
       <div class="panel">
@@ -148,9 +148,9 @@
           <select name="allocation" id="env-capture-allocation"></select>
           <button type="submit" class="ghost">采集当前环境</button>
         </form>
-        <p class="muted">从 active allocation 采集到选中的项目，生成一个新的不可变版本。</p>
+        <p class="muted">从运行中的租约采集到选中的项目，生成一个新的不可变版本。</p>
         <span id="env-capture-error" class="error-text"></span>
-        <div id="version-list" class="allocation-list empty">No versions.</div>
+        <div id="version-list" class="allocation-list empty">暂无环境版本。</div>
       </div>
 
       <div class="panel">
@@ -169,9 +169,9 @@
           <button type="submit" class="ghost">提交认领申请</button>
         </form>
         <span id="legacy-claim-error" class="error-text"></span>
-        <div id="legacy-sources" class="allocation-list empty">No sources.</div>
+        <div id="legacy-sources" class="allocation-list empty">暂无来源。</div>
         <h3>我的认领申请</h3>
-        <div id="legacy-claims" class="allocation-list empty">No claims.</div>
+        <div id="legacy-claims" class="allocation-list empty">暂无认领申请。</div>
       </div>
     </section>
 
@@ -188,33 +188,33 @@
           <p class="muted">
             批准一条认领前请确认同一容器没有其他待处理申请；系统不会自动替管理员选择。
           </p>
-          <div id="legacy-admin-sources" class="allocation-list empty">No sources.</div>
+          <div id="legacy-admin-sources" class="allocation-list empty">暂无来源。</div>
           <h3>认领申请</h3>
-          <div id="legacy-admin-claims" class="allocation-list empty">No claims.</div>
+          <div id="legacy-admin-claims" class="allocation-list empty">暂无认领申请。</div>
         </div>
         <div class="panel" id="membership-panel" hidden>
           <h2>加入申请</h2>
           <div class="actions">
             <button id="membership-refresh" class="ghost">刷新申请</button>
           </div>
-          <div id="membership-requests" class="allocation-list empty">No requests.</div>
+          <div id="membership-requests" class="allocation-list empty">暂无申请。</div>
           <h2>成员</h2>
-          <div id="membership-members" class="allocation-list empty">No members.</div>
+          <div id="membership-members" class="allocation-list empty">暂无成员。</div>
         </div>
         <div class="panel">
-          <h2>Broker mode</h2>
-          <p class="muted">active 需要配置中 deployment_allowed=true，并应由管理员明确批准。</p>
+          <h2>Broker 模式</h2>
+          <p class="muted">active 模式需要配置中 deployment_allowed=true，并应由管理员明确批准。</p>
           <div class="actions">
-            <button id="mode-monitor" class="ghost">切到 monitor</button>
-            <button id="mode-maintenance" class="ghost">切到 maintenance</button>
-            <button id="mode-active" class="danger">切到 active</button>
+            <button id="mode-monitor" class="ghost">切换到 monitor 模式</button>
+            <button id="mode-maintenance" class="ghost">切换到 maintenance 模式</button>
+            <button id="mode-active" class="danger">切换到 active 模式</button>
             <span id="mode-error" class="error-text"></span>
           </div>
         </div>
         <div class="panel">
           <h2>强制释放</h2>
           <form id="admin-release-form" class="inline-form">
-            <input name="id" placeholder="allocation id" required>
+            <input name="id" placeholder="租约 ID" required>
             <input name="reason" placeholder="原因（必填）" required>
             <button type="submit" class="danger">强制释放</button>
           </form>
@@ -228,13 +228,13 @@
               <button id="admin-audit" class="ghost">刷新审计</button>
             </div>
           </div>
-          <div id="admin-audit-list" class="allocation-list empty">No data.</div>
+          <div id="admin-audit-list" class="allocation-list empty">暂无数据。</div>
         </div>
         <div class="panel">
           <h2>用户</h2>
-          <div id="admin-users" class="allocation-list empty">No data.</div>
+          <div id="admin-users" class="allocation-list empty">暂无数据。</div>
           <h2>资源</h2>
-          <div id="admin-resources" class="allocation-list empty">No data.</div>
+          <div id="admin-resources" class="allocation-list empty">暂无数据。</div>
         </div>
       </div>
     </section>
@@ -243,21 +243,21 @@
   <div id="modal-backdrop" class="modal-backdrop" hidden>
     <div id="logs-modal" class="modal" hidden>
       <div class="modal-head">
-        <h2 id="logs-modal-title">Logs</h2>
+        <h2 id="logs-modal-title">日志</h2>
         <button class="icon-button" data-close-modal>×</button>
       </div>
       <pre id="logs-content"></pre>
     </div>
     <div id="history-modal" class="modal" hidden>
       <div class="modal-head">
-        <h2 id="history-modal-title">Job history</h2>
+        <h2 id="history-modal-title">任务历史</h2>
         <button class="icon-button" data-close-modal>×</button>
       </div>
-      <div id="history-list" class="allocation-list empty">No log files.</div>
+      <div id="history-list" class="allocation-list empty">暂无日志文件。</div>
     </div>
     <div id="terminal-modal" class="modal terminal-modal" hidden>
       <div class="modal-head">
-        <h2>Container shell</h2>
+        <h2>容器终端</h2>
         <button class="icon-button" data-close-modal>×</button>
       </div>
       <div id="terminal"></div>

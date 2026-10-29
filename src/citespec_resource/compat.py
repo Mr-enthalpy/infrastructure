@@ -50,10 +50,7 @@ def check_server_handshake(data: Mapping[str, Any] | None) -> Compatibility:
     if server_protocol is None or min_client_protocol is None:
         return Compatibility(
             status="unknown",
-            message=(
-                "Server did not advertise a protocol version; update the server "
-                "before relying on the GUI."
-            ),
+            message="服务器未提供 protocol 版本；在依赖本面板前请先更新服务器。",
             client_version=__version__,
             client_protocol=PROTOCOL_VERSION,
             server_version=server_version,
@@ -63,7 +60,7 @@ def check_server_handshake(data: Mapping[str, Any] | None) -> Compatibility:
 
     base = Compatibility(
         status="ok",
-        message="Client and server protocol versions are compatible.",
+        message="客户端与服务器的 protocol 版本兼容。",
         client_version=__version__,
         client_protocol=PROTOCOL_VERSION,
         server_version=server_version,
@@ -74,8 +71,8 @@ def check_server_handshake(data: Mapping[str, Any] | None) -> Compatibility:
         return Compatibility(
             status="client_update_required",
             message=(
-                "This client is too old for the server. Update it with "
-                "`citespec-resource update`, then restart the GUI."
+                "客户端版本过旧，已无法匹配服务器。请运行 "
+                "`citespec-resource update` 更新后重启本面板。"
             ),
             client_version=base.client_version,
             client_protocol=base.client_protocol,
@@ -87,8 +84,7 @@ def check_server_handshake(data: Mapping[str, Any] | None) -> Compatibility:
         return Compatibility(
             status="server_update_required",
             message=(
-                "The server is older than this client. Ask an administrator to "
-                "update the server package; text commands may still work."
+                "服务器版本低于当前客户端。请联系管理员更新服务器软件包；文本命令可能仍然可用。"
             ),
             client_version=base.client_version,
             client_protocol=base.client_protocol,
