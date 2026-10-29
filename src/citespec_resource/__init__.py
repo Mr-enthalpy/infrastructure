@@ -9,7 +9,7 @@ version string alone.
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 PROTOCOL_VERSION = 1
 MIN_CLIENT_PROTOCOL = 1
 

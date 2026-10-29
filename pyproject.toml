@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "citespec-resource"
-version = "0.2.1"
+version = "0.2.2"
 description = "Timed, non-preemptive shared GPU resource broker for the Citespec lab"
 readme = "README.md"
 requires-python = ">=3.11"
