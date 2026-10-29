@@ -24,6 +24,11 @@ citespec-resource admin requests needs-info --request-id <id> \
 citespec-resource admin requests reject --request-id <id> --review-note "身份尚无法核验"
 ```
 
+> `admin invitations --create` 与 `admin requests import` 直接写 intake 数据库，
+> 需要以能写 `/var/lib/citespec-resource-intake` 的身份执行；部署机上用
+> `sudo citespec-resource ...`。其余命令（`admin requests approve`、
+> `admin members ...` 等）经 broker 执行，**不要**加 sudo，否则会丢失管理员身份。
+
 列表可按状态过滤：`citespec-resource admin requests list --status pending`。批准、
 拒绝、补充材料、重试都要求管理员身份；所有变更写审计事件。
 
@@ -39,6 +44,28 @@ GUI：管理员页新增"加入申请"面板（列表、批准、拒绝、重试
 
 离线场景：申请人无法访问申请服务时，可离线生成申请 JSON 文件，管理员用
 `citespec-resource admin requests import --file <file>` 导入——走同一验证与审批链路。
+申请文件结构（邀请密钥只放在该文件中，导入后删除）：
+
+```json
+{
+  "invite_id": "<邀请编号>",
+  "invite_secret": "<邀请密钥>",
+  "application": {
+    "display_name": "张三",
+    "username": "zhangsan",
+    "affiliation": "某实验室 / 导师姓名",
+    "purpose": "训练 X 模型",
+    "contact": "用于核验的邮箱或电话",
+    "nickname": "",
+    "public_contact": "",
+    "agree_terms": "1",
+    "public_keys": ["ssh-ed25519 AAAA... user@host"]
+  }
+}
+```
+
+导入成功后按 `admin requests show --request-id <id>` 预览，再带
+`--expected-version` 批准。
 
 ## 2. 成员管理
 
